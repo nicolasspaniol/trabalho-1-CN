@@ -2,6 +2,7 @@
 
 import asyncio
 import aiohttp
+import argparse
 
 
 async def update_order_status(
@@ -17,31 +18,38 @@ async def simulate_courier_route(
     api_url: str,
     order_id: str,
     courier_id: str,
-    route_nodes: list,
+    route_to_merchant: list,
+    route_to_client: list,
 ):
-    """
-    Transita o pedido pelos estados finais e envia a telemetria do GPS (DynamoDB)
-    """
-    # 1. Entregador aceita e retira o pedido
-    await update_order_status(session, api_url, order_id, "PICKED_UP")
-    await update_order_status(session, api_url, order_id, "IN_TRANSIT")
+    """Transita o pedido pelos estados através do trajeto duplo."""
 
-    # 2. Simulação física de deslocamento
-    for node in route_nodes:
+    # 1. Deslocamento do entregador até o restaurante
+    for node in route_to_merchant:
         location_payload = {
             "courier_id": courier_id,
             "order_id": order_id,
             "lat": node["lat"],
             "lon": node["lon"],
         }
-
-        # Envia coordenada atual para rastreamento em tempo real
         await session.post(f"{api_url}/locations", json=location_payload)
+        await asyncio.sleep(0.1)  # Telemetria a cada 100ms
 
-        # Reportar a cada 100ms
+    # 2. Entregador retira o pedido no restaurante
+    await update_order_status(session, api_url, order_id, "PICKED_UP")
+    await update_order_status(session, api_url, order_id, "IN_TRANSIT")
+
+    # 3. Deslocamento do restaurante até o cliente
+    for node in route_to_client:
+        location_payload = {
+            "courier_id": courier_id,
+            "order_id": order_id,
+            "lat": node["lat"],
+            "lon": node["lon"],
+        }
+        await session.post(f"{api_url}/locations", json=location_payload)
         await asyncio.sleep(0.1)
 
-    # 3. Finaliza a entrega
+    # 4. Finaliza a entrega
     await update_order_status(session, api_url, order_id, "DELIVERED")
     print(f"Pedido {order_id} entregue com sucesso pelo entregador {courier_id}!")
 
@@ -69,17 +77,21 @@ async def delivery_worker(api_url: str):
                             api_url,
                             order["order_id"],
                             order["courier_id"],
-                            order["route"],
+                            order["route_to_merchant"],
+                            order["route_to_client"],
                         )
                     )
-            except Exception as e:
-                print(f"Erro ao buscar pedidos (A API caiu?): {e}")
+            except Exception:
+                pass  # Silencia erros de timeout passageiros
 
             # polling a cada 2 segundos para não sobrecarregar a API atoa
             await asyncio.sleep(2)
 
 
 if __name__ == "__main__":
-    API_BASE_URL = "http://localhost:8000"  # TODO: Substituir pela URL do ALB
-    print("Iniciando a central de despachos dos entregadores...")
-    asyncio.run(delivery_worker(API_BASE_URL))
+    parser = argparse.ArgumentParser(description="Central de Entregadores DijkFood")
+    parser.add_argument("--api-url", required=True, help="URL base da API (ALB)")
+    args = parser.parse_args()
+
+    print(f"Iniciando a central de despachos conectada em: {args.api_url}")
+    asyncio.run(delivery_worker(args.api_url))

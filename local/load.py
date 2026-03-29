@@ -5,10 +5,10 @@ import pickle
 import asyncio
 import aiohttp
 import osmnx as ox
+import argparse
 from faker import Faker
 
-
-COURIER_PER_USER = 3  # 3 entregadores por cliente
+COURIER_PER_USER = 3  # REGRA: 3 entregadores por cliente
 MERCHANT_PER_USER = 0.1  # 1 restaurante para cada 10 clientes
 fake = Faker("pt_BR")
 
@@ -28,8 +28,8 @@ def load_graph_from_pickle(filepath: str):
 
 def sample_valid_locations(graph_path: str, num_users: int):
     """
-    Carrega o mapa e extrai coordenadas reais dos nós para evitar que
-    entidades sejam criadas fora da malha viária
+    Extrai coordenadas reais dos nós da malha viária
+    para criar entidades com localizações plausíveis
     """
     G = load_graph_from_pickle(graph_path)
     nodes_data = list(G.nodes(data=True))
@@ -49,7 +49,6 @@ def sample_valid_locations(graph_path: str, num_users: int):
     )
 
 
-# TODO: Adicionar tratamento de erros
 async def create_entity(
     session: aiohttp.ClientSession, api_url: str, endpoint: str, payload: dict
 ):
@@ -60,7 +59,7 @@ async def create_entity(
         return await response.json()
 
 
-async def populate_database(api_url: str, graph_path: str, num_users: int = 100):
+async def populate_database(api_url: str, graph_path: str, num_users: int):
     """
     Criação assíncrona de todas as entidades no DB
     """
@@ -82,7 +81,7 @@ async def populate_database(api_url: str, graph_path: str, num_users: int = 100)
             }
             tasks.append(create_entity(session, api_url, "users", payload))
 
-        # Gerar Couriers (3x mais que users)
+        # Gerar Couriers
         for loc in courier_locs:
             payload = {
                 "name": fake.name(),
@@ -108,8 +107,14 @@ async def populate_database(api_url: str, graph_path: str, num_users: int = 100)
 
 
 if __name__ == "__main__":
-    # Teste com Alto de Pinheiros, São Paulo
-    API_BASE_URL = "http://localhost:8000"  # TODO: Colocar URL do ALB depois
-    asyncio.run(
-        populate_database(API_BASE_URL, "sp_altodepinheiros.pkl", num_users=100)
+    parser = argparse.ArgumentParser(description="Populador do Banco de Dados DijkFood")
+    parser.add_argument("--api-url", required=True, help="URL base da API (ALB)")
+    parser.add_argument(
+        "--graph-path", default="sp_altodepinheiros.pkl", help="Caminho do grafo local"
     )
+    parser.add_argument(
+        "--num-users", type=int, default=100, help="Quantidade base de usuários"
+    )
+    args = parser.parse_args()
+
+    asyncio.run(populate_database(args.api_url, args.graph_path, args.num_users))
