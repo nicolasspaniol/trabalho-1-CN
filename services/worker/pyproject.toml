@@ -1,0 +1,11 @@
+[project]
+name = "dijkfood-worker"
+version = "0.1.0"
+dependencies = [
+    "fastapi[standard]",
+    "boto3",
+    "networkx",
+]
+
+[tool.uv]
+managed = true
