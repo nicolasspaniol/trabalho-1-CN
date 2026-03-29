@@ -45,10 +45,10 @@ async def run_load_test(
     para manter o throughput alvo (10, 50 ou 200 req/s).
     """
     latencies = []
-    
+
     # Remove limite local de conexões simultâneas do aiohttp
     connector = aiohttp.TCPConnector(limit=0)
-    
+
     async with aiohttp.ClientSession(connector=connector) as session:
         print(f"Iniciando teste de carga: {rps} RPS por {duration} segundos...")
 
@@ -57,7 +57,9 @@ async def run_load_test(
 
             # Dispara n (rps) requisições concorrentes neste segundo
             tasks = [
-                place_order(session, api_url, random.choice(users), random.choice(merchants))
+                place_order(
+                    session, api_url, random.choice(users), random.choice(merchants)
+                )
                 for _ in range(rps)
             ]
 
@@ -82,12 +84,18 @@ async def run_load_test(
 
 if __name__ == "__main__":
     API_BASE_URL = "http://localhost:8000"  # TODO: Substituir pela URL do ALB
-    
+
     # TODO: Na integração real, carregar essas listas dando um GET /users e GET /merchants
     mock_users = [f"user_{i}" for i in range(10)]
     mock_merchants = [f"merch_{i}" for i in range(1)]
 
     # Executa o cenário "Evento Especial" (200 rps por 30 segundos)
     asyncio.run(
-        run_load_test(API_BASE_URL, rps=200, duration=30, users=mock_users, merchants=mock_merchants)
+        run_load_test(
+            API_BASE_URL,
+            rps=200,
+            duration=30,
+            users=mock_users,
+            merchants=mock_merchants,
+        )
     )
