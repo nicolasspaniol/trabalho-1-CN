@@ -1,7 +1,8 @@
 [project]
-name = "api"
-version = "0.1.0"
-description = "Add your description here"
-readme = "README.md"
+name="api"
+version="0.1.0"
 requires-python = ">=3.13"
-dependencies = []
+dependencies = [
+    "fastapi[standard]>=0.135.2",
+    "psycopg2>=2.9.11",
+]
