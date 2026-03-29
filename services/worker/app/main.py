@@ -13,7 +13,7 @@ GRAPH = None
 # Conexão
 # TODO atualizar os nomes das conexões
 DYNAMODB = boto3.resource('dynamodb', region_name='us-east-1')
-DRIVERS_TABLE = DYNAMODB.Table('Entregadores')
+COURIERS_TABLE = DYNAMODB.Table('Couriers')
 
 @app.on_event("startup")
 async def startup_event():
@@ -33,12 +33,12 @@ async def startup_event():
     with open(local_path, 'rb') as f:
         GRAPH = pickle.load(f)
 
-def try_reserve_driver(driver_id: str) -> bool:
-    '''Tenta fazer uma atualização condicional na tabela dos drivers, mais especificadamente no status deles'''
+def try_reserve_courier(courier_id: str) -> bool:
+    '''Tenta fazer uma atualização condicional na tabela dos couriers, mais especificadamente no status deles'''
     try:
         # TODO verificar as estruturas da conexão com o dynamodb
-        DRIVERS_TABLE.update_item(
-            Key={'id': driver_id},
+        COURIERS_TABLE.update_item(
+            Key={'id': courier_id},
             ConditionExpression="#s = :avail",
             UpdateExpression="SET #s = :busy",
             ExpressionAttributeNames={'#s': 'status'},
@@ -61,16 +61,17 @@ def reconstruct_path(predecessors: dict, target: int) -> list[int]:
 
 @app.post("/calculate-route", response_model=RouteResponse)
 async def calculate_route(request: RouteRequest):
-    origin = request.restaurant_node
-    client = request.client_node
-    drivers_set = set(request.available_drivers)
+    origin = request.merchant_node
+    user = request.user_node
+    # Ler do RDS, e não receber como entrada
+    couriers_set = set(request.available_couriers)
 
     distances = {origin: 0}
     predecessors = {origin: origin}
     p_queue = {origin: 0}
-    selected_driver = None
+    selected_courier = None
 
-    client_visited = False
+    user_visited = False
     while p_queue:
         distance_node, node = heapq.heappop(p_queue)
 
@@ -78,21 +79,22 @@ async def calculate_route(request: RouteRequest):
             continue
 
         # Se ainda não foi encontrado um entregador e o nó atual é um entregador
-        if selected_driver is None and node in drivers_set:
+        if selected_courier is None and node in couriers_set:
             # Tenta reservar o entregador
-            if try_reserve_driver(str(node)): # Se ele estiver disponivel
+            # TODO verificação se está localização
+            if try_reserve_courier(str(node)): # Se ele estiver disponivel
                 # Define o entregador escolido
-                selected_driver = str(node)
+                selected_courier = str(node)
                 # Verifica se o cliente já foi descoberto
-                if client_visited: # Se sim, termina a busca
+                if user_visited: # Se sim, termina a busca
                     break
             else:
-                drivers_set.remove(node)
+                couriers_set.remove(node)
 
         # Se o nó atual é o cliente e o entregador já foi descoberto termina a busca
-        if node==client:
-            client_visited = True
-            if selected_driver:
+        if node==user:
+            user_visited = True
+            if selected_courier:
                 break
 
         # Visita dos os nós conectados no nó atual
@@ -104,16 +106,16 @@ async def calculate_route(request: RouteRequest):
                 heapq.heappush(p_queue, (distances[unvisited_node], unvisited_node))
 
     # Se a busca terminou em nenhum entregador foi encontrado, um erro é chamado
-    if not selected_driver:
-        raise HTTPException(status_code=404, detail="No available drivers found.")
+    if not selected_courier:
+        raise HTTPException(status_code=404, detail="No available couriers found.")
 
     # Retorna na forma esperada
     return RouteResponse(
-        driver_id=selected_driver,
-        distance_to_restaurant=distances[selected_driver],
-        path_to_restaurant=reconstruct_path(predecessors, int(selected_driver))[::-1],
-        distance_to_client= distances[client],
-        path_to_client=reconstruct_path(predecessors, client)
+        courier_id=selected_courier,
+        distance_to_merchant=distances[selected_courier],
+        path_to_merchant=reconstruct_path(predecessors, int(selected_courier))[::-1],
+        distance_to_user= distances[user],
+        path_to_user=reconstruct_path(predecessors, user)
     )
 
 @app.get("/health")
