@@ -8,6 +8,8 @@ import osmnx as ox
 from faker import Faker
 
 
+COURIER_PER_USER = 3  # 3 entregadores por cliente
+MERCHANT_PER_USER = 0.1  # 1 restaurante para cada 10 clientes
 fake = Faker("pt_BR")
 
 
@@ -32,8 +34,8 @@ def sample_valid_locations(graph_path: str, num_users: int):
     G = load_graph_from_pickle(graph_path)
     nodes_data = list(G.nodes(data=True))
 
-    num_couriers = num_users * 3  # 3 entregadores por cliente
-    num_merchants = max(1, num_users // 10)  # 1 restaurante para cada 10 clientes
+    num_couriers = num_users * COURIER_PER_USER
+    num_merchants = max(1, int(num_users * MERCHANT_PER_USER))
     total_entities = num_users + num_couriers + num_merchants
 
     sampled_nodes = random.choices(nodes_data, k=total_entities)
