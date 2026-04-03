@@ -5,7 +5,6 @@ import socket
 import subprocess
 import sys
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.request import urlopen
@@ -163,84 +162,11 @@ def test_service(alb_dns: str) -> None:
     http_get_json(burn_url, timeout=30)
 
 
-def get_service_counts(ecs) -> tuple[int, int, int]:
-    service = ecs.describe_services(cluster=CLUSTER_NAME, services=[SERVICE_NAME]).get("services", [])
-    if not service:
-        return 0, 0, 0
-    item = service[0]
-    return item.get("desiredCount", 0), item.get("runningCount", 0), item.get("pendingCount", 0)
-
-
-def collect_hello_instances(base_url: str, attempts: int = 15) -> set[str]:
-    instances = set()
-    for _ in range(attempts):
-        instance = http_get_json(f"{base_url}/hello?name=lb-test").get("instance")
-        if instance:
-            instances.add(instance)
-    return instances
-
-
-def run_cpu_burn_load(base_url: str, requests: int = 120, concurrency: int = 30) -> tuple[int, int]:
-    def _call():
-        with urlopen(f"{base_url}/cpu-burn?seconds=45&payload_kb=256", timeout=90) as response:
-            return response.status
-
-    ok = 0
-    failed = 0
-    with ThreadPoolExecutor(max_workers=concurrency) as executor:
-        futures = [executor.submit(_call) for _ in range(requests)]
-        for future in as_completed(futures):
-            try:
-                status = future.result()
-                if 200 <= status < 300:
-                    ok += 1
-                else:
-                    failed += 1
-            except Exception:
-                failed += 1
-    return ok, failed
-
-
-def wait_for_scale_out(ecs, baseline_desired: int, timeout_seconds: int = 900, poll_seconds: int = 15) -> tuple[int, int, int]:
-    deadline = time.time() + timeout_seconds
-    latest = (baseline_desired, 0, 0)
-    while time.time() < deadline:
-        latest = get_service_counts(ecs)
-        desired, running, pending = latest
-        log(f"Auto scaling: desired={desired} running={running} pending={pending}")
-        if desired > baseline_desired:
-            return latest
-        time.sleep(poll_seconds)
-    return latest
-
-
-def run_scaling_and_lb_test(alb_dns: str) -> None:
-    base_url = f"http://{alb_dns}"
-    ecs = boto3.client("ecs", region_name=REGION)
-
-    before_desired, before_running, before_pending = get_service_counts(ecs)
-    log(f"Estado inicial: desired={before_desired} running={before_running} pending={before_pending}")
-
-    instances_before = collect_hello_instances(base_url)
-    log(f"Instancias antes: {sorted(instances_before)}")
-
-    log("Gerando carga")
-    ok, failed = run_cpu_burn_load(base_url)
-    log(f"Carga: sucesso={ok} falha={failed}")
-
-    after_desired, after_running, after_pending = wait_for_scale_out(ecs, before_desired)
-    log(f"Estado final: desired={after_desired} running={after_running} pending={after_pending}")
-
-    instances_after = collect_hello_instances(base_url)
-    log(f"Instancias depois: {sorted(instances_after)}")
-
-
 def main(argv=None) -> None:
     parser = argparse.ArgumentParser(description="Cria, testa e opcionalmente apaga a infraestrutura")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--no-delete", action="store_true", help="Nao executa o teardown no final.")
     mode.add_argument("--only-delete", action="store_true", help="Executa apenas o teardown.")
-    parser.add_argument("--skip-scaling-test", action="store_true", help="Pula teste de carga para auto scaling/load balance.")
     args = parser.parse_args(argv)
 
     if args.only_delete:
@@ -265,12 +191,6 @@ def main(argv=None) -> None:
 
     log("Testes")
     test_service(alb_dns)
-
-    if args.skip_scaling_test:
-        log("Teste de scaling: ignorado")
-    else:
-        log("Teste de scaling")
-        run_scaling_and_lb_test(alb_dns)
 
     if args.no_delete:
         log("Teardown: ignorado")

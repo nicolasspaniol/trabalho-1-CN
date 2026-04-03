@@ -77,7 +77,7 @@ if [[ ! -d ".venv" ]]; then
   python3 -m venv .venv
 fi
 
-log "Instalando boto3 na venv (se necessario)"
+log "Instalando boto3 na venv"
 ./.venv/bin/pip install --quiet --upgrade pip boto3
 
 log "Garantindo repositorio ECR"
