@@ -1,8 +1,11 @@
 import argparse
+import json
 import os
 import socket
+import subprocess
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.request import urlopen
@@ -25,6 +28,7 @@ from local.constants import (
 )
 
 EXECUTION_ROLE_NAME = os.getenv("EXECUTION_ROLE_NAME", "LabRole")
+TARGET_GROUP_NAME = "tg-routing-worker"
 
 
 def log(message: str) -> None:
@@ -42,6 +46,12 @@ def run_deployment(execution_role_arn: str) -> None:
     )
 
 
+def run_pre_deploy_setup() -> None:
+    setup_script = PROJECT_ROOT / "local" / "pre_deploy_setup.sh"
+    log("Pre-setup")
+    subprocess.run(["bash", str(setup_script)], cwd=str(PROJECT_ROOT), check=True)
+
+
 def require_execution_role() -> str:
     execution_role_arn = os.getenv("EXECUTION_ROLE_ARN")
     if not execution_role_arn:
@@ -51,7 +61,7 @@ def require_execution_role() -> str:
     return execution_role_arn
 
 
-def wait_until(check, timeout_seconds: int, poll_seconds: int, timeout_message: str, retry_message=None):
+def wait_until(check, timeout_seconds: int, poll_seconds: int, timeout_message: str, retry_message: str | None = None):
     deadline = time.time() + timeout_seconds
     last_error = None
     while time.time() < deadline:
@@ -62,9 +72,14 @@ def wait_until(check, timeout_seconds: int, poll_seconds: int, timeout_message: 
         except (HTTPError, URLError, socket.timeout, TimeoutError, OSError) as error:
             last_error = error
             if retry_message:
-                log(f"{retry_message}: {error}")
+                log(retry_message)
         time.sleep(poll_seconds)
     raise TimeoutError(f"{timeout_message}: {last_error}")
+
+
+def http_get_json(url: str, timeout: int = 15) -> dict:
+    with urlopen(url, timeout=timeout) as response:
+        return json.loads(response.read().decode("utf-8"))
 
 
 def wait_for_load_balancer_dns(elbv2):
@@ -80,7 +95,7 @@ def wait_for_load_balancer_dns(elbv2):
         timeout_seconds=900,
         poll_seconds=15,
         timeout_message="ALB nao ficou disponivel dentro do prazo",
-        retry_message="Aguardando ALB ficar disponivel",
+        retry_message="Aguardando ALB",
     )
 
 
@@ -90,24 +105,21 @@ def wait_for_dns_resolution(hostname: str):
         timeout_seconds=300,
         poll_seconds=10,
         timeout_message=f"DNS nao resolveu a tempo para {hostname}",
-        retry_message=f"Aguardando DNS resolver {hostname}",
+        retry_message="Aguardando DNS",
     )
 
 
 def wait_for_healthy_targets(elbv2):
-    target_groups = elbv2.describe_target_groups(Names=["tg-routing-worker"]).get("TargetGroups", [])
+    target_groups = elbv2.describe_target_groups(Names=[TARGET_GROUP_NAME]).get("TargetGroups", [])
     if not target_groups:
-        raise TimeoutError("Target group tg-routing-worker nao encontrado")
+        raise TimeoutError(f"Target group {TARGET_GROUP_NAME} nao encontrado")
     tg_arn = target_groups[0]["TargetGroupArn"]
 
     def has_healthy_target():
         states = [item.get("TargetHealth", {}).get("State") for item in elbv2.describe_target_health(TargetGroupArn=tg_arn).get("TargetHealthDescriptions", [])]
         if any(state == "healthy" for state in states):
             return True
-        if states:
-            log(f"Aguardando targets healthy. Estados atuais: {states}")
-        else:
-            log("Aguardando registro de targets no target group")
+        log("Aguardando targets healthy")
         return False
 
     wait_until(
@@ -124,34 +136,103 @@ def wait_for_http_ok(url: str):
         timeout_seconds=900,
         poll_seconds=10,
         timeout_message=f"Endpoint nao respondeu a tempo: {url}",
-        retry_message=f"Aguardando endpoint responder",
+        retry_message="Aguardando endpoint",
     )
 
 
 def test_service(alb_dns: str) -> None:
     base_url = f"http://{alb_dns}"
-    health_url = f"{base_url}/health"
-    hello_url = f"{base_url}/hello?name=world"
 
-    log(f"Aguardando resolucao DNS de {alb_dns}")
+    log("Resolucao DNS")
     wait_for_dns_resolution(alb_dns)
 
-    log("Aguardando target healthy no ALB")
+    log("Health do target")
     elbv2 = boto3.client("elbv2", region_name=REGION)
     wait_for_healthy_targets(elbv2)
 
-    log(f"Testando {health_url}")
+    health_url = f"{base_url}/health"
+    log("Teste /health")
     wait_for_http_ok(health_url)
 
-    log(f"Testando {hello_url}")
-    with urlopen(hello_url, timeout=15) as response:
-        body = response.read().decode("utf-8")
-        log(f"Resposta /hello: {body}")
+    hello_url = f"{base_url}/hello?name=world"
+    log("Teste /hello")
+    http_get_json(hello_url)
 
-    log(f"Testando {base_url}/cpu-burn")
-    with urlopen(f"{base_url}/cpu-burn?seconds=5&payload_kb=32", timeout=30) as response:
-        body = response.read().decode("utf-8")
-        log(f"Resposta /cpu-burn: {body}")
+    burn_url = f"{base_url}/cpu-burn?seconds=5&payload_kb=32"
+    log("Teste /cpu-burn")
+    http_get_json(burn_url, timeout=30)
+
+
+def get_service_counts(ecs) -> tuple[int, int, int]:
+    service = ecs.describe_services(cluster=CLUSTER_NAME, services=[SERVICE_NAME]).get("services", [])
+    if not service:
+        return 0, 0, 0
+    item = service[0]
+    return item.get("desiredCount", 0), item.get("runningCount", 0), item.get("pendingCount", 0)
+
+
+def collect_hello_instances(base_url: str, attempts: int = 15) -> set[str]:
+    instances = set()
+    for _ in range(attempts):
+        instance = http_get_json(f"{base_url}/hello?name=lb-test").get("instance")
+        if instance:
+            instances.add(instance)
+    return instances
+
+
+def run_cpu_burn_load(base_url: str, requests: int = 120, concurrency: int = 30) -> tuple[int, int]:
+    def _call():
+        with urlopen(f"{base_url}/cpu-burn?seconds=45&payload_kb=256", timeout=90) as response:
+            return response.status
+
+    ok = 0
+    failed = 0
+    with ThreadPoolExecutor(max_workers=concurrency) as executor:
+        futures = [executor.submit(_call) for _ in range(requests)]
+        for future in as_completed(futures):
+            try:
+                status = future.result()
+                if 200 <= status < 300:
+                    ok += 1
+                else:
+                    failed += 1
+            except Exception:
+                failed += 1
+    return ok, failed
+
+
+def wait_for_scale_out(ecs, baseline_desired: int, timeout_seconds: int = 900, poll_seconds: int = 15) -> tuple[int, int, int]:
+    deadline = time.time() + timeout_seconds
+    latest = (baseline_desired, 0, 0)
+    while time.time() < deadline:
+        latest = get_service_counts(ecs)
+        desired, running, pending = latest
+        log(f"Auto scaling: desired={desired} running={running} pending={pending}")
+        if desired > baseline_desired:
+            return latest
+        time.sleep(poll_seconds)
+    return latest
+
+
+def run_scaling_and_lb_test(alb_dns: str) -> None:
+    base_url = f"http://{alb_dns}"
+    ecs = boto3.client("ecs", region_name=REGION)
+
+    before_desired, before_running, before_pending = get_service_counts(ecs)
+    log(f"Estado inicial: desired={before_desired} running={before_running} pending={before_pending}")
+
+    instances_before = collect_hello_instances(base_url)
+    log(f"Instancias antes: {sorted(instances_before)}")
+
+    log("Gerando carga")
+    ok, failed = run_cpu_burn_load(base_url)
+    log(f"Carga: sucesso={ok} falha={failed}")
+
+    after_desired, after_running, after_pending = wait_for_scale_out(ecs, before_desired)
+    log(f"Estado final: desired={after_desired} running={after_running} pending={after_pending}")
+
+    instances_after = collect_hello_instances(base_url)
+    log(f"Instancias depois: {sorted(instances_after)}")
 
 
 def main(argv=None) -> None:
@@ -159,39 +240,47 @@ def main(argv=None) -> None:
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--no-delete", action="store_true", help="Nao executa o teardown no final.")
     mode.add_argument("--only-delete", action="store_true", help="Executa apenas o teardown.")
+    parser.add_argument("--skip-scaling-test", action="store_true", help="Pula teste de carga para auto scaling/load balance.")
     args = parser.parse_args(argv)
 
     if args.only_delete:
-        log("Executando somente teardown")
+        log("Teardown")
         delete.main([])
-        log("Teardown concluido")
+        log("Fim")
         return
+
+    run_pre_deploy_setup()
 
     execution_role_arn = require_execution_role()
 
     os.environ["EXECUTION_ROLE_ARN"] = execution_role_arn
-    os.environ.setdefault("PYTHONPATH", ".")
 
-    log("Iniciando create/deploy")
+    log("Deploy")
     run_deployment(execution_role_arn)
 
-    log("Esperando ALB e endpoint subirem")
+    log("ALB")
     elbv2 = boto3.client("elbv2", region_name=REGION)
     alb_dns = wait_for_load_balancer_dns(elbv2)
-    log(f"ALB DNS: {alb_dns}")
+    log(f"DNS: {alb_dns}")
 
-    log("Executando testes")
+    log("Testes")
     test_service(alb_dns)
 
+    if args.skip_scaling_test:
+        log("Teste de scaling: ignorado")
+    else:
+        log("Teste de scaling")
+        run_scaling_and_lb_test(alb_dns)
+
     if args.no_delete:
-        log("Teardown ignorado por --no-delete")
-        log("Ciclo create/teste concluido")
+        log("Teardown: ignorado")
+        log("Fim")
         return
 
-    log("Iniciando teardown")
+    log("Teardown")
     delete.main([])
 
-    log("Ciclo create/teste/apagar finalizado")
+    log("Fim")
 
 if __name__ == "__main__":
     main()

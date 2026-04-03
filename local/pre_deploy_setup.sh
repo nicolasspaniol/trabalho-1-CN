@@ -10,13 +10,13 @@ aws configure
 # Preencha os campos abaixo antes de executar.
 
 AWS_REGION="us-east-1"
-AWS_PROFILE="default" # deixe vazio ("") para nao usar profile explicito
-AWS_ACCOUNT_ID=""      # se vazio, tenta descobrir via STS
+AWS_PROFILE="default"
+AWS_ACCOUNT_ID=""    
 ECR_REPO="worker"
 IMAGE_TAG="latest"
-EXECUTION_ROLE_ARN="arn:aws:iam::821743068643:role/LabRole"
+EXECUTION_ROLE_NAME="LabRole"
+EXECUTION_ROLE_ARN=""
 
-# Nao altere abaixo, a menos que necessario.
 WORKDIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DOCKERFILE_PATH="services/worker/Dockerfile"
 BUILDER_NAME="xbuilder"
@@ -64,6 +64,9 @@ if [[ -z "$AWS_ACCOUNT_ID" ]]; then
 fi
 
 IMAGE_URI="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO}:${IMAGE_TAG}"
+if [[ -z "$EXECUTION_ROLE_ARN" ]]; then
+  EXECUTION_ROLE_ARN="arn:aws:iam::${AWS_ACCOUNT_ID}:role/${EXECUTION_ROLE_NAME}"
+fi
 
 log "AWS_ACCOUNT_ID: $AWS_ACCOUNT_ID"
 log "IMAGE_URI: $IMAGE_URI"
@@ -88,10 +91,11 @@ run_aws ecr get-login-password --region "$AWS_REGION" | \
 
 log "Configurando Docker Buildx"
 if docker buildx inspect "$BUILDER_NAME" >/dev/null 2>&1; then
-  docker buildx use "$BUILDER_NAME"
-else
-  docker buildx create --name "$BUILDER_NAME" --use >/dev/null
+  log "Builder existente encontrado ($BUILDER_NAME). Recriando para evitar estado quebrado"
+  docker buildx rm "$BUILDER_NAME" >/dev/null 2>&1 || true
 fi
+
+docker buildx create --name "$BUILDER_NAME" --use >/dev/null
 
 docker buildx inspect --bootstrap >/dev/null
 
@@ -106,22 +110,3 @@ docker buildx build \
 log "Exportando variaveis para esta sessao"
 export EXECUTION_ROLE_ARN="$EXECUTION_ROLE_ARN"
 export PYTHONPATH="."
-
-cat <<EOF
-
-========================================
-Pre-setup concluido com sucesso.
-
-Proximo passo (manual):
-
-  EXECUTION_ROLE_ARN="$EXECUTION_ROLE_ARN" PYTHONPATH=. .venv/bin/python deploy/deploy.py
-
-Depois, se quiser forcar rollout:
-
-  aws ecs update-service \
-    --cluster DijkFood-Cluster \
-    --service Routing-Worker-Service \
-    --force-new-deployment \
-    --region "$AWS_REGION"
-========================================
-EOF
