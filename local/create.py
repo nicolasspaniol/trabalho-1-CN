@@ -44,3 +44,80 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     fetch_and_store_graph(args.location, args.file, args.bucket)
+
+
+"Módulo de criação dos bancos RDS e DynamoDB"
+
+import boto3
+import time
+
+dynamo = boto3.client('dynamodb', region_name='us-east-1')
+
+#
+def setup_dynamo():
+    print("Criando tabela DynamoDB...")
+    try:
+        table = dynamo.create_table(
+            TableName='Courier_Telemetry',
+            KeySchema=[
+                {'AttributeName': 'Order_ID', 'KeyType': 'HASH'},  # Partition Key
+                {'AttributeName': 'Timestamp', 'KeyType': 'RANGE'} # Sort Key
+            ],
+            AttributeDefinitions=[
+                {'AttributeName': 'Order_ID', 'AttributeType': 'S'},
+                {'AttributeName': 'Timestamp', 'AttributeType': 'N'}
+            ],
+            ProvisionedThroughput={
+                'ReadCapacityUnits': 10,
+                'WriteCapacityUnits': 500 # Ajuste conforme a carga do trabalho
+            }
+        )
+        # Waiter para garantir que a tabela existe antes de prosseguir
+        dynamo.get_waiter('table_exists').wait(TableName='Courier_Telemetry')
+        print("DynamoDB Ativo!")
+    except dynamo.exceptions.ResourceInUseException:
+        print("Tabela já existe.")
+
+
+rds = boto3.client('rds', region_name='us-east-1')
+
+def setup_rds():
+    print("Instanciando RDS (isso pode levar alguns minutos)...")
+    rds.create_db_instance(
+        DBInstanceIdentifier='dijkfood-db',
+        AllocatedStorage=20,
+        DBInstanceClass='db.t3.micro',
+        Engine='postgres', # ou 'mysql'
+        MasterUsername='admin',
+        MasterUserPassword='dijkfood',
+        VpcSecurityGroupIds=['sg-xxxxxxxx'], # ID do seu Security Group
+        PubliclyAccessible=True # Para você testar da sua máquina
+    )
+    
+    # Waiter crucial: o script para aqui até o banco estar pronto
+    waiter = rds.get_waiter('db_instance_available')
+    waiter.wait(DBInstanceIdentifier='dijkfood-db')
+    
+    # Recupera o Endpoint (DNS) para conectar e rodar o SQL depois
+    details = rds.describe_db_instances(DBInstanceIdentifier='dijkfood-db')
+    endpoint = details['DBInstances'][0]['Endpoint']['Address']
+    print(f"RDS Disponível em: {endpoint}")
+    return endpoint
+
+def cleanup_bancos():
+    print("Iniciando destruição dos recursos...")
+    
+    # Deletar DynamoDB
+    dynamo.delete_table(TableName='Courier_Telemetry')
+    
+    # Deletar RDS (Precisa desativar o snapshot final para ser rápido)
+    rds.delete_db_instance(
+        DBInstanceIdentifier='dijkfood-db',
+        SkipFinalSnapshot=True
+    )
+    
+    print("Aguardando exclusão completa...")
+    # Waiters de exclusão
+    dynamo.get_waiter('table_not_exists').wait(TableName='Courier_Telemetry')
+    rds.get_waiter('db_instance_deleted').wait(DBInstanceIdentifier='dijkfood-db')
+    print("Ambiente limpo com sucesso!")
