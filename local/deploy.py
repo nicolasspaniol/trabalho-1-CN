@@ -1,89 +1,267 @@
-"""Script Mestre de Deploy, Execução e Destruição"""
+"""Entrypoint unificado para o ciclo de deploy local."""
 
+import argparse
+import os
 import subprocess
-import time
 import sys
+import time
+from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+import boto3
+
+import local.create_infra as create
+import local.delete as delete
+from local.aws_waiters import (
+    http_get_json,
+    wait_for_dns_resolution,
+    wait_for_healthy_targets,
+    wait_for_http_ok,
+    wait_for_load_balancer_dns,
+)
+from local.constants import (
+    BUCKET_NAME,
+    CLUSTER_NAME,
+    LOAD_BALANCER_NAME,
+    REGION,
+    SERVICE_NAME,
+    TABLE_NAME,
+)
+
+EXECUTION_ROLE_NAME = os.getenv("EXECUTION_ROLE_NAME", "LabRole")
+TARGET_GROUP_NAME = "tg-routing-worker"
+
+# TODO(grupo-api): alinhar contratos dos endpoints finais (/customers/, /merchants/, /couriers/, /orders/, /locations).
+# TODO(grupo-worker): validar formato final das rotas retornadas para sim_delivery.py.
+# TODO(grupo-dados): definir local final do arquivo de grafo e estrategia de versionamento no S3.
+# TODO(grupo-infra): automatizar criacao e configuracao de bucket S3 do mapa (incluindo policy/versioning/lifecycle).
+# TODO(grupo-infra): automatizar criacao dos bancos/recursos de dados faltantes (RDS e demais stores do projeto, se aplicavel).
 
 
-##TODO: Funções de Infraestrutura do Deploy
-# - Criar funções para criar recursos AWS (S3, RDS, DynamoDB, etc.)
-# - Deploy dos Containers (Worker)
-# - Destruição dos recursos criados
+def log(message: str) -> None:
+    print(f"[cycle] {message}")
 
 
-# EXPERIMENTO DE CARGA E SIMULAÇÃO
-def run_simulation(bucket_name: str, alb_url: str):
-    """Roda os scripts de carga e simulação de entregas para gerar dados reais de latência"""
+def parse_simple_env_file(env_file: Path) -> dict[str, str]:
+    values: dict[str, str] = {}
+    if not env_file.exists():
+        return values
+
+    for raw_line in env_file.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key:
+            values[key] = value
+    return values
+
+
+def resolve_api_auth(api_username: str | None, api_password: str | None, api_auth_env_file: str) -> tuple[str | None, str | None]:
+    if api_username and api_password:
+        return api_username, api_password
+
+    env_values = parse_simple_env_file(PROJECT_ROOT / api_auth_env_file)
+    username = api_username or env_values.get("ADMIN_USERNAME") or os.getenv("API_USERNAME")
+    password = api_password or env_values.get("ADMIN_PASSWORD") or os.getenv("API_PASSWORD")
+
+    if username and password:
+        log("Simulacao: usando credenciais Basic Auth da API")
+    else:
+        log("Simulacao: sem credenciais Basic Auth (API publica ou contrato ainda sem auth)")
+    return username, password
+
+
+def parse_rps_scenarios(value: str) -> list[int]:
+    scenarios = []
+    for part in value.split(","):
+        item = part.strip()
+        if not item:
+            continue
+        scenarios.append(int(item))
+    if not scenarios:
+        raise ValueError("Lista de RPS vazia. Exemplo valido: 10,50,200")
+    return scenarios
+
+
+def run_python_script(script_path: Path, args: list[str], env: dict[str, str] | None = None) -> None:
+    cmd = [sys.executable, str(script_path), *args]
+    final_env = os.environ.copy()
+    if env:
+        final_env.update(env)
+    subprocess.run(cmd, cwd=str(PROJECT_ROOT), check=True, env=final_env)
+
+
+def run_simulation(
+    base_url: str,
+    num_users: int,
+    rps_scenarios: list[int],
+    duration: int,
+    cooldown_seconds: int,
+    api_username: str | None,
+    api_password: str | None,
+) -> None:
     delivery_process = None
+    graph_file = "sp_altodepinheiros.pkl"
+    auth_args: list[str] = []
+    auth_env: dict[str, str] = {}
+    if api_username and api_password:
+        auth_args = ["--username", api_username, "--password", api_password]
+        auth_env = {"API_USERNAME": api_username, "API_PASSWORD": api_password}
     try:
-        # 1. Cria o grafo e joga pro S3 (subprocess.run bloqueia até terminar)
-        print("1. Gerando mapa e subindo para o S3...")
-        subprocess.run(
-            ["uv", "run", "local/create.py", "--bucket", bucket_name], check=True
+        log("Simulacao: gerando grafo e enviando para S3")
+        run_python_script(PROJECT_ROOT / "local" / "create.py", ["--bucket", BUCKET_NAME, "--file", graph_file])
+
+        log("Simulacao: populando base via API")
+        run_python_script(
+            PROJECT_ROOT / "local" / "load.py",
+            ["--api-url", base_url, "--num-users", str(num_users), "--graph-path", graph_file, *auth_args],
+            env=auth_env,
         )
 
-        # 2. Popula o banco de dados via API
-        print("\n2. Populando o banco de dados (RDS)...")
-        subprocess.run(
-            ["uv", "run", "local/load.py", "--api-url", alb_url, "--num-users", "100"],
-            check=True,
-        )
-
-        # 3. Inicia os entregadores em BACKGROUND (Popen NÃO bloqueia o código)
-        print("\n3. Iniciando a central de entregadores em background...")
+        log("Simulacao: iniciando sim_delivery em background")
         delivery_process = subprocess.Popen(
-            ["uv", "run", "local/sim_delivery.py", "--api-url", alb_url]
+            [sys.executable, str(PROJECT_ROOT / "local" / "sim_delivery.py"), "--api-url", base_url, *auth_args],
+            cwd=str(PROJECT_ROOT),
+            env={**os.environ, **auth_env},
         )
 
-        # Dá um tempinho para os entregadores se conectarem
         time.sleep(3)
 
-        # 4. Dispara o teste de carga (Cenário de Pico de Exemplo)
-        print("\n4. Iniciando bombardeio de requisições (Load Test)...")
-        # Aqui você pode fazer um loop para rodar os 3 cenários exigidos (10, 50, 200 RPS)
-        for rps in [10, 50, 200]:
-            print(f"\n--- Executando Cenário: {rps} RPS ---")
-            subprocess.run(
-                [
-                    "uv",
-                    "run",
-                    "local/sim_client.py",
-                    "--api-url",
-                    alb_url,
-                    "--rps",
-                    str(rps),
-                    "--duration",
-                    "30",
-                ],
-                check=True,
+        for rps in rps_scenarios:
+            log(f"Simulacao: load test {rps} RPS")
+            run_python_script(
+                PROJECT_ROOT / "local" / "sim_client.py",
+                ["--api-url", base_url, "--rps", str(rps), "--duration", str(duration), *auth_args],
+                env=auth_env,
             )
-            time.sleep(
-                5
-            )  # Pausa dramática entre os cenários para o Auto Scaling respirar
-
-    except subprocess.CalledProcessError as e:
-        print(f"\n[ERRO CRÍTICO] A simulação falhou: {e}")
-        sys.exit(1)
+            time.sleep(cooldown_seconds)
     finally:
-        # 5. Mata o processo dos entregadores no final de tudo, independentemente de erro
-        print("\n5. Encerrando o simulador de entregadores...")
         if delivery_process is not None:
+            log("Simulacao: encerrando sim_delivery")
             delivery_process.terminate()
             delivery_process.wait()
 
 
-# MAIN
+def run_deployment(execution_role_arn: str) -> None:
+    create.setup_worker_infrastructure(
+        region=REGION,
+        cluster_name=CLUSTER_NAME,
+        service_name=SERVICE_NAME,
+        table_name=TABLE_NAME,
+        bucket_name=BUCKET_NAME,
+        execution_role_arn=execution_role_arn,
+    )
+
+
+def run_pre_deploy_setup() -> None:
+    setup_script = PROJECT_ROOT / "local" / "pre_deploy_setup.sh"
+    log("Pre-setup")
+    subprocess.run(["bash", str(setup_script)], cwd=str(PROJECT_ROOT), check=True)
+
+
+def require_execution_role() -> str:
+    execution_role_arn = os.getenv("EXECUTION_ROLE_ARN")
+    if not execution_role_arn:
+        sts = boto3.client("sts", region_name=REGION)
+        account_id = sts.get_caller_identity()["Account"]
+        execution_role_arn = f"arn:aws:iam::{account_id}:role/{EXECUTION_ROLE_NAME}"
+    return execution_role_arn
+
+
+def test_service(alb_dns: str) -> None:
+    base_url = f"http://{alb_dns}"
+
+    log("Resolucao DNS")
+    wait_for_dns_resolution(alb_dns, log=log)
+
+    log("Health do target")
+    elbv2 = boto3.client("elbv2", region_name=REGION)
+    wait_for_healthy_targets(elbv2, TARGET_GROUP_NAME, log=log)
+
+    health_url = f"{base_url}/health"
+    log("Teste /health")
+    wait_for_http_ok(health_url, log=log)
+
+    hello_url = f"{base_url}/hello?name=world"
+    log("Teste /hello")
+    http_get_json(hello_url)
+
+    burn_url = f"{base_url}/cpu-burn?seconds=5&payload_kb=32"
+    log("Teste /cpu-burn")
+    http_get_json(burn_url, timeout=30)
+
+
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(description="Cria, testa e opcionalmente apaga a infraestrutura")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--no-delete", action="store_true", help="Nao executa o teardown no final.")
+    mode.add_argument("--only-delete", action="store_true", help="Executa apenas o teardown.")
+    parser.add_argument("--with-simulation", action="store_true", help="Executa simulacao de carga apos os smoke tests.")
+    parser.add_argument("--num-users", type=int, default=100, help="Quantidade base de usuarios para load.py")
+    parser.add_argument("--rps-scenarios", default="10,50,200", help="Lista de cenarios de carga em RPS (csv)")
+    parser.add_argument("--duration", type=int, default=30, help="Duracao de cada cenario de carga em segundos")
+    parser.add_argument("--cooldown-seconds", type=int, default=5, help="Pausa entre cenarios para o autoscaling respirar")
+    parser.add_argument("--api-username", default=None, help="Usuario Basic Auth da API para simulacao")
+    parser.add_argument("--api-password", default=None, help="Senha Basic Auth da API para simulacao")
+    parser.add_argument(
+        "--api-auth-env-file",
+        default="services/api/.env",
+        help="Arquivo .env com ADMIN_USERNAME/ADMIN_PASSWORD para usar na simulacao",
+    )
+    args = parser.parse_args(argv)
+
+    if args.only_delete:
+        log("Teardown")
+        delete.main([])
+        log("Fim")
+        return 0
+
+    run_pre_deploy_setup()
+
+    execution_role_arn = require_execution_role()
+    os.environ["EXECUTION_ROLE_ARN"] = execution_role_arn
+
+    log("Deploy")
+    run_deployment(execution_role_arn)
+
+    log("ALB")
+    elbv2 = boto3.client("elbv2", region_name=REGION)
+    alb_dns = wait_for_load_balancer_dns(elbv2, LOAD_BALANCER_NAME, log=log)
+    log(f"DNS: {alb_dns}")
+
+    log("Testes")
+    test_service(alb_dns)
+
+    if args.with_simulation:
+        rps_scenarios = parse_rps_scenarios(args.rps_scenarios)
+        base_url = f"http://{alb_dns}"
+        api_username, api_password = resolve_api_auth(args.api_username, args.api_password, args.api_auth_env_file)
+        run_simulation(
+            base_url=base_url,
+            num_users=args.num_users,
+            rps_scenarios=rps_scenarios,
+            duration=args.duration,
+            cooldown_seconds=args.cooldown_seconds,
+            api_username=api_username,
+            api_password=api_password,
+        )
+
+    if args.no_delete:
+        log("Teardown: ignorado")
+        log("Fim")
+        return 0
+
+    log("Teardown")
+    delete.main([])
+    log("Fim")
+    return 0
+
+
 if __name__ == "__main__":
-    bucket, api_url = "", ""
-    try:
-        # #TODO: Sobe tudo pra AWS (chama funções de criação de recursos, deploy dos containers, etc.)
-        bucket, api_url = "", ""  # ( ... )
-
-        # Simulação
-        run_simulation(bucket, api_url)
-
-    except KeyboardInterrupt:
-        print("\nExecução interrompida pelo usuário.")
-    finally:
-        # TODO: Destruir tudo
-        print("Experimento finalizado com sucesso!")
+    raise SystemExit(main())

@@ -6,11 +6,16 @@ import asyncio
 import aiohttp
 import osmnx as ox
 import argparse
+import os
 from faker import Faker
 
 COURIER_PER_USER = 3  # REGRA: 3 entregadores por cliente
 MERCHANT_PER_USER = 0.1  # 1 restaurante para cada 10 clientes
 fake = Faker("pt_BR")
+
+CUSTOMERS_ENDPOINT = "/customers/"
+MERCHANTS_ENDPOINT = "/merchants/"
+COURIERS_ENDPOINT = "/couriers/"
 
 
 def load_graph_from_pickle(filepath: str):
@@ -28,24 +33,23 @@ def load_graph_from_pickle(filepath: str):
 
 def sample_valid_locations(graph_path: str, num_users: int):
     """
-    Extrai coordenadas reais dos nós da malha viária
-    para criar entidades com localizações plausíveis
+    Extrai ids de nós da malha viária para preencher address/location (inteiro)
+    conforme contrato da API.
     """
     G = load_graph_from_pickle(graph_path)
-    nodes_data = list(G.nodes(data=True))
+    node_ids = [int(node_id) for node_id in G.nodes()]
 
     num_couriers = num_users * COURIER_PER_USER
     num_merchants = max(1, int(num_users * MERCHANT_PER_USER))
     total_entities = num_users + num_couriers + num_merchants
 
-    sampled_nodes = random.choices(nodes_data, k=total_entities)
-    locations = [{"lat": data["y"], "lon": data["x"]} for _, data in sampled_nodes]
+    sampled_nodes = random.choices(node_ids, k=total_entities)
 
     # (Clientes, Entregadores, Restaurantes)
     return (
-        locations[:num_users],
-        locations[num_users : num_users + num_couriers],
-        locations[-num_merchants:],
+        sampled_nodes[:num_users],
+        sampled_nodes[num_users : num_users + num_couriers],
+        sampled_nodes[-num_merchants:],
     )
 
 
@@ -55,11 +59,13 @@ async def create_entity(
     """
     Envia o POST para a API para cadastrar a entidade
     """
-    async with session.post(f"{api_url}/{endpoint}", json=payload) as response:
+    url = f"{api_url.rstrip('/')}{endpoint}"
+    async with session.post(url, json=payload) as response:
+        response.raise_for_status()
         return await response.json()
 
 
-async def populate_database(api_url: str, graph_path: str, num_users: int):
+async def populate_database(api_url: str, graph_path: str, num_users: int, username: str | None = None, password: str | None = None):
     """
     Criação assíncrona de todas as entidades no DB
     """
@@ -68,7 +74,8 @@ async def populate_database(api_url: str, graph_path: str, num_users: int):
         graph_path, num_users
     )
 
-    async with aiohttp.ClientSession() as session:
+    auth = aiohttp.BasicAuth(username, password) if username and password else None
+    async with aiohttp.ClientSession(auth=auth) as session:
         tasks = []
 
         # Gerar Users
@@ -77,29 +84,37 @@ async def populate_database(api_url: str, graph_path: str, num_users: int):
                 "name": fake.name(),
                 "email": fake.email(),
                 "phone": fake.phone_number(),
-                "location": loc,
+                "address": loc,
             }
-            tasks.append(create_entity(session, api_url, "users", payload))
+            tasks.append(create_entity(session, api_url, CUSTOMERS_ENDPOINT, payload))
 
         # Gerar Couriers
         for loc in courier_locs:
             payload = {
                 "name": fake.name(),
-                "vehicle": random.choice(["motorcycle", "bicycle"]),
+                "vehicle_type": random.choice(["motorcycle", "bicycle"]),
+                "availability": True,
                 "location": loc,
             }
-            tasks.append(create_entity(session, api_url, "couriers", payload))
+            tasks.append(create_entity(session, api_url, COURIERS_ENDPOINT, payload))
 
         # Gerar Merchants
         for loc in merchant_locs:
             payload = {
                 "name": fake.company(),
-                "cuisine": random.choice(
+                "type": random.choice(
                     ["Italian", "Japanese", "Brazilian", "Mexican", "Indian", "Chinese"]
                 ),
-                "location": loc,
+                "address": loc,
+                "items": [
+                    {
+                        "name": "item_padrao",
+                        "preparation_time": random.randint(5, 20),
+                        "price": round(random.uniform(10.0, 60.0), 2),
+                    }
+                ],
             }
-            tasks.append(create_entity(session, api_url, "merchants", payload))
+            tasks.append(create_entity(session, api_url, MERCHANTS_ENDPOINT, payload))
 
         print(f"Enviando {len(tasks)} requisições de cadastro para a API...")
         results = await asyncio.gather(*tasks)
@@ -115,6 +130,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--num-users", type=int, default=100, help="Quantidade base de usuários"
     )
+    parser.add_argument("--username", default=os.getenv("API_USERNAME"), help="Usuario Basic Auth da API")
+    parser.add_argument("--password", default=os.getenv("API_PASSWORD"), help="Senha Basic Auth da API")
     args = parser.parse_args()
 
-    asyncio.run(populate_database(args.api_url, args.graph_path, args.num_users))
+    asyncio.run(populate_database(args.api_url, args.graph_path, args.num_users, args.username, args.password))
