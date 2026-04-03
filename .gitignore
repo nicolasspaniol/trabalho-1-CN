@@ -1,3 +1,6 @@
 **/__pycache__
 **/*.pkl
 local/cache/
+.aws/
+.docker-local/
+.docker-local-test/

@@ -1,4 +1,5 @@
 import argparse
+import os
 
 import boto3
 from botocore.exceptions import ClientError
@@ -15,7 +16,6 @@ from local.constants import (
     TASK_FAMILY,
     TASK_SG_NAME,
     TARGET_GROUP_NAME,
-    VPC_ID,
 )
 
 
@@ -48,13 +48,24 @@ def get_tg_arn(elbv2):
     return target_groups[0]["TargetGroupArn"] if target_groups else None
 
 
-def get_sg_id(ec2, name):
-    groups = safe(
-        lambda: ec2.describe_security_groups(
-            Filters=[{"Name": "group-name", "Values": [name]}, {"Name": "vpc-id", "Values": [VPC_ID]}]
-        ).get("SecurityGroups", []),
-        f"describe-security-groups ({name})",
-    )
+def resolve_vpc_id(ec2, elbv2):
+    load_balancers = safe(lambda: elbv2.describe_load_balancers(Names=[LOAD_BALANCER_NAME]).get("LoadBalancers", []), "describe-load-balancers") or []
+    if load_balancers:
+        return load_balancers[0].get("VpcId")
+
+    env_vpc = os.getenv("VPC_ID", "").strip()
+    if env_vpc:
+        return env_vpc
+
+    default_vpcs = safe(lambda: ec2.describe_vpcs(Filters=[{"Name": "is-default", "Values": ["true"]}]).get("Vpcs", []), "describe-vpcs-default") or []
+    return default_vpcs[0].get("VpcId") if default_vpcs else None
+
+
+def get_sg_id(ec2, name, vpc_id=None):
+    filters = [{"Name": "group-name", "Values": [name]}]
+    if vpc_id:
+        filters.append({"Name": "vpc-id", "Values": [vpc_id]})
+    groups = safe(lambda: ec2.describe_security_groups(Filters=filters).get("SecurityGroups", []), f"describe-security-groups ({name})")
     return groups[0]["GroupId"] if groups else None
 
 
@@ -72,6 +83,7 @@ def main(argv=None):
     logs = session.client("logs")
     dynamodb = session.client("dynamodb")
     ecr = session.client("ecr")
+    vpc_id = resolve_vpc_id(ec2, elbv2)
 
     log("1) Removendo service ECS")
     safe(lambda: ecs.update_service(cluster=CLUSTER_NAME, service=SERVICE_NAME, desiredCount=0), "update-service desired=0")
@@ -109,7 +121,7 @@ def main(argv=None):
 
     log("4) Removendo security groups customizados")
     for name in (TASK_SG_NAME, ALB_SG_NAME):
-        sg_id = get_sg_id(ec2, name)
+        sg_id = get_sg_id(ec2, name, vpc_id=vpc_id)
         if sg_id:
             safe(lambda gid=sg_id: ec2.delete_security_group(GroupId=gid), f"delete-sg {sg_id}")
 
