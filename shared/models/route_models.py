@@ -4,7 +4,6 @@ from typing import List
 class RouteRequest(BaseModel):
     merchant_node: int
     user_node: int
-    available_couriers: List[int]
 
 class RouteResponse(BaseModel):
     courier_id: str
