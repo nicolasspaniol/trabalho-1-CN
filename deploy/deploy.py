@@ -1,10 +1,9 @@
-import os
 import argparse
+import os
 import socket
 import sys
 import time
 from pathlib import Path
-from os import getenv
 from urllib.error import HTTPError, URLError
 from urllib.request import urlopen
 
@@ -16,36 +15,35 @@ import boto3
 
 import local.create as create
 import local.delete as delete
+from local.constants import (
+    BUCKET_NAME,
+    CLUSTER_NAME,
+    LOAD_BALANCER_NAME,
+    REGION,
+    SERVICE_NAME,
+    TABLE_NAME,
+)
 
-# Configurações Globais
-REGION = "us-east-1"
-CLUSTER_NAME = "DijkFood-Cluster"
-SERVICE_NAME = "Routing-Worker-Service"
-TABLE_NAME = "Couriers"
-BUCKET_NAME = "dijkfood-assets-sp"
-EXECUTION_ROLE_ARN = getenv("EXECUTION_ROLE_ARN")
-EXECUTION_ROLE_NAME = getenv("EXECUTION_ROLE_NAME", "LabRole")
-LOAD_BALANCER_NAME = "alb-routing-worker"
+EXECUTION_ROLE_NAME = os.getenv("EXECUTION_ROLE_NAME", "LabRole")
 
 
 def log(message: str) -> None:
     print(f"[cycle] {message}")
 
 
-def run_deployment():
-    execution_role_arn = getenv("EXECUTION_ROLE_ARN") or EXECUTION_ROLE_ARN
+def run_deployment(execution_role_arn: str) -> None:
     create.setup_worker_infrastructure(
         region=REGION,
         cluster_name=CLUSTER_NAME,
         service_name=SERVICE_NAME,
         table_name=TABLE_NAME,
         bucket_name=BUCKET_NAME,
-        execution_role_arn=execution_role_arn
+        execution_role_arn=execution_role_arn,
     )
 
 
 def require_execution_role() -> str:
-    execution_role_arn = getenv("EXECUTION_ROLE_ARN") or EXECUTION_ROLE_ARN
+    execution_role_arn = os.getenv("EXECUTION_ROLE_ARN")
     if not execution_role_arn:
         sts = boto3.client("sts", region_name=REGION)
         account_id = sts.get_caller_identity()["Account"]
@@ -53,79 +51,81 @@ def require_execution_role() -> str:
     return execution_role_arn
 
 
-def wait_for_load_balancer_dns(elbv2, timeout_seconds: int = 900, poll_seconds: int = 15) -> str:
-    deadline = time.time() + timeout_seconds
-    while time.time() < deadline:
-        response = elbv2.describe_load_balancers(Names=[LOAD_BALANCER_NAME])
-        load_balancers = response.get("LoadBalancers", [])
-        if load_balancers:
-            dns_name = load_balancers[0].get("DNSName")
-            if dns_name:
-                return dns_name
-        log(f"Aguardando ALB ficar disponivel ({poll_seconds}s)")
-        time.sleep(poll_seconds)
-
-    raise TimeoutError("ALB nao ficou disponivel dentro do prazo")
-
-
-def wait_for_dns_resolution(hostname: str, timeout_seconds: int = 300, poll_seconds: int = 10) -> None:
+def wait_until(check, timeout_seconds: int, poll_seconds: int, timeout_message: str, retry_message=None):
     deadline = time.time() + timeout_seconds
     last_error = None
-
     while time.time() < deadline:
         try:
-            socket.gethostbyname(hostname)
-            return
-        except OSError as error:
+            result = check()
+            if result:
+                return result
+        except (HTTPError, URLError, socket.timeout, TimeoutError, OSError) as error:
             last_error = error
-            log(f"Aguardando DNS resolver {hostname}: {error}")
-            time.sleep(poll_seconds)
+            if retry_message:
+                log(f"{retry_message}: {error}")
+        time.sleep(poll_seconds)
+    raise TimeoutError(f"{timeout_message}: {last_error}")
 
-    raise TimeoutError(f"DNS nao resolveu a tempo para {hostname}: {last_error}")
+
+def wait_for_load_balancer_dns(elbv2):
+    return wait_until(
+        lambda: next(
+            (
+                lb.get("DNSName")
+                for lb in elbv2.describe_load_balancers(Names=[LOAD_BALANCER_NAME]).get("LoadBalancers", [])
+                if lb.get("DNSName")
+            ),
+            None,
+        ),
+        timeout_seconds=900,
+        poll_seconds=15,
+        timeout_message="ALB nao ficou disponivel dentro do prazo",
+        retry_message="Aguardando ALB ficar disponivel",
+    )
 
 
-def wait_for_healthy_targets(elbv2, timeout_seconds: int = 900, poll_seconds: int = 10) -> None:
+def wait_for_dns_resolution(hostname: str):
+    return wait_until(
+        lambda: socket.gethostbyname(hostname),
+        timeout_seconds=300,
+        poll_seconds=10,
+        timeout_message=f"DNS nao resolveu a tempo para {hostname}",
+        retry_message=f"Aguardando DNS resolver {hostname}",
+    )
+
+
+def wait_for_healthy_targets(elbv2):
     target_groups = elbv2.describe_target_groups(Names=["tg-routing-worker"]).get("TargetGroups", [])
     if not target_groups:
         raise TimeoutError("Target group tg-routing-worker nao encontrado")
-
     tg_arn = target_groups[0]["TargetGroupArn"]
-    deadline = time.time() + timeout_seconds
 
-    while time.time() < deadline:
-        response = elbv2.describe_target_health(TargetGroupArn=tg_arn)
-        descriptions = response.get("TargetHealthDescriptions", [])
-        states = [item.get("TargetHealth", {}).get("State") for item in descriptions]
+    def has_healthy_target():
+        states = [item.get("TargetHealth", {}).get("State") for item in elbv2.describe_target_health(TargetGroupArn=tg_arn).get("TargetHealthDescriptions", [])]
         if any(state == "healthy" for state in states):
-            log("Pelo menos um target ficou healthy")
-            return
-
+            return True
         if states:
             log(f"Aguardando targets healthy. Estados atuais: {states}")
         else:
             log("Aguardando registro de targets no target group")
+        return False
 
-        time.sleep(poll_seconds)
+    wait_until(
+        has_healthy_target,
+        timeout_seconds=900,
+        poll_seconds=10,
+        timeout_message="Nenhum target ficou healthy dentro do prazo",
+    )
 
-    raise TimeoutError("Nenhum target ficou healthy dentro do prazo")
 
-
-def wait_for_http_ok(url: str, timeout_seconds: int = 900, poll_seconds: int = 10) -> None:
-    deadline = time.time() + timeout_seconds
-    last_error = None
-
-    while time.time() < deadline:
-        try:
-            with urlopen(url, timeout=15) as response:
-                if 200 <= response.status < 300:
-                    log(f"Endpoint respondeu com HTTP {response.status}")
-                    return
-        except (HTTPError, URLError, socket.timeout, TimeoutError, OSError) as error:
-            last_error = error
-            log(f"Aguardando endpoint responder: {error}")
-            time.sleep(poll_seconds)
-
-    raise TimeoutError(f"Endpoint nao respondeu a tempo: {last_error}")
+def wait_for_http_ok(url: str):
+    return wait_until(
+        lambda: urlopen(url, timeout=15).status < 400,
+        timeout_seconds=900,
+        poll_seconds=10,
+        timeout_message=f"Endpoint nao respondeu a tempo: {url}",
+        retry_message=f"Aguardando endpoint responder",
+    )
 
 
 def test_service(alb_dns: str) -> None:
@@ -157,16 +157,8 @@ def test_service(alb_dns: str) -> None:
 def main(argv=None) -> None:
     parser = argparse.ArgumentParser(description="Cria, testa e opcionalmente apaga a infraestrutura")
     mode = parser.add_mutually_exclusive_group()
-    mode.add_argument(
-        "--no-delete",
-        action="store_true",
-        help="Nao executa o teardown no final; deixa o servico rodando para inspeção.",
-    )
-    mode.add_argument(
-        "--only-delete",
-        action="store_true",
-        help="Executa apenas o teardown e encerra sem criar ou testar.",
-    )
+    mode.add_argument("--no-delete", action="store_true", help="Nao executa o teardown no final.")
+    mode.add_argument("--only-delete", action="store_true", help="Executa apenas o teardown.")
     args = parser.parse_args(argv)
 
     if args.only_delete:
@@ -181,7 +173,7 @@ def main(argv=None) -> None:
     os.environ.setdefault("PYTHONPATH", ".")
 
     log("Iniciando create/deploy")
-    run_deployment()
+    run_deployment(execution_role_arn)
 
     log("Esperando ALB e endpoint subirem")
     elbv2 = boto3.client("elbv2", region_name=REGION)

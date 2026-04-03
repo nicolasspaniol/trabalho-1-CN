@@ -4,6 +4,9 @@ set -euo pipefail
 # =====================================
 # Pre-setup para deploy ECS (AWS Academy)
 # =====================================
+
+aws configure
+
 # Preencha os campos abaixo antes de executar.
 
 AWS_REGION="us-east-1"
