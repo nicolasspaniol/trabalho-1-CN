@@ -21,6 +21,7 @@ ECR_REPO="worker"
 IMAGE_TAG="latest"
 EXECUTION_ROLE_NAME="LabRole"
 EXECUTION_ROLE_ARN=""
+ECR_AUTO_CREATE_REPO="false"
 
 WORKDIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DOCKERFILE_PATH="services/worker/Dockerfile"
@@ -128,6 +129,11 @@ fi
 
 DOCKER_CONFIG_DIR="$(mktemp -d "${TMPDIR:-/tmp}/dijkfood-docker-config.XXXXXX")"
 trap cleanup_temp_docker_config EXIT
+
+DOCKER_BUILDX_PLUGIN="${DOCKER_BUILDX_PLUGIN:-/Applications/Docker.app/Contents/Resources/cli-plugins/docker-buildx}"
+
+mkdir -p "$DOCKER_CONFIG_DIR/cli-plugins"
+ln -sf "$DOCKER_BUILDX_PLUGIN" "$DOCKER_CONFIG_DIR/cli-plugins/docker-buildx"
 
 cat > "$DOCKER_CONFIG_DIR/config.json" <<'EOF'
 {
