@@ -4,3 +4,4 @@ local/cache/
 .aws/
 .docker-local/
 .docker-local-test/
+.env
