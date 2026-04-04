@@ -13,7 +13,8 @@ if str(PROJECT_ROOT) not in sys.path:
 
 import boto3
 
-import local.create_infra as create
+import local.create as create_data
+import local.create_infra as create_infra
 import local.delete as delete
 from local.aws_waiters import (
     http_get_json,
@@ -33,6 +34,9 @@ from local.constants import (
 
 EXECUTION_ROLE_NAME = os.getenv("EXECUTION_ROLE_NAME", "LabRole")
 TARGET_GROUP_NAME = "tg-routing-worker"
+DB_INSTANCE_ID = os.getenv("DB_INSTANCE_ID", "dijkfood-postgres")
+DB_SECURITY_GROUP_NAME = os.getenv("DB_SECURITY_GROUP_NAME", "dijkfood-rds-sg")
+DB_SCHEMA_FILE = os.getenv("DB_SCHEMA_FILE", "local/schema.sql")
 
 # TODO(grupo-api): alinhar contratos dos endpoints finais (/customers/, /merchants/, /couriers/, /orders/, /locations).
 # TODO(grupo-worker): validar formato final das rotas retornadas para sim_delivery.py.
@@ -149,7 +153,29 @@ def run_simulation(
 
 
 def run_deployment(execution_role_arn: str) -> None:
-    create.setup_worker_infrastructure(
+    log("Deploy dados: garantindo bucket S3")
+    create_data.setup_s3_bucket(BUCKET_NAME)
+
+    log("Deploy dados: garantindo tabela DynamoDB")
+    create_data.setup_dynamo(TABLE_NAME)
+
+    log("Deploy dados: garantindo SG e instancia RDS")
+    sg_id = create_data.setup_security_group(DB_SECURITY_GROUP_NAME)
+    db_endpoint = create_data.setup_rds(DB_INSTANCE_ID, sg_id)
+    if not db_endpoint:
+        raise RuntimeError("Falha ao criar/obter endpoint do RDS")
+    os.environ["DB_HOST"] = db_endpoint
+
+    schema_path = PROJECT_ROOT / DB_SCHEMA_FILE
+    if schema_path.exists():
+        log(f"Deploy dados: aplicando schema em {schema_path}")
+        loaded = create_data.load_schema_to_rds(db_endpoint, str(schema_path))
+        if not loaded:
+            raise RuntimeError("Falha ao carregar schema SQL no RDS")
+    else:
+        log(f"Deploy dados: schema nao encontrado em {schema_path}, seguindo sem carga SQL")
+
+    create_infra.setup_worker_infrastructure(
         region=REGION,
         cluster_name=CLUSTER_NAME,
         service_name=SERVICE_NAME,
