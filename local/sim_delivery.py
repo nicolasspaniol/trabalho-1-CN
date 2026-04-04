@@ -3,6 +3,10 @@
 import asyncio
 import aiohttp
 import argparse
+import os
+
+# TODO(grupo-api): confirmar endpoints e schema de pedidos/telemetria no OpenAPI final.
+# Atualmente este script assume /orders e /locations.
 
 
 async def update_order_status(
@@ -10,7 +14,7 @@ async def update_order_status(
 ):
     """Atualiza o estado do pedido na API"""
     payload = {"status": new_status}
-    await session.patch(f"{api_url}/orders/{order_id}/status", json=payload)
+    await session.patch(f"{api_url.rstrip('/')}/orders/{order_id}/status", json=payload)
 
 
 async def simulate_courier_route(
@@ -54,17 +58,23 @@ async def simulate_courier_route(
     print(f"Pedido {order_id} entregue com sucesso pelo entregador {courier_id}!")
 
 
-async def delivery_worker(api_url: str):
+async def delivery_worker(api_url: str, username: str | None = None, password: str | None = None):
     """
     Fica monitorando a API em busca de pedidos que já saíram da cozinha
     e já tiveram a rota calculada pelo Worker (Dijkstra)
     """
-    async with aiohttp.ClientSession() as session:
+    auth = None
+    username = username or os.getenv("API_USERNAME")
+    password = password or os.getenv("API_PASSWORD")
+    if username and password:
+        auth = aiohttp.BasicAuth(username, password)
+
+    async with aiohttp.ClientSession(auth=auth) as session:
         while True:
             try:
                 # busca pedidos prontos para retirada
                 async with session.get(
-                    f"{api_url}/orders?status=READY_FOR_PICKUP"
+                    f"{api_url.rstrip('/')}/orders?status=READY_FOR_PICKUP"
                 ) as response:
                     ready_orders = await response.json()
 
@@ -91,7 +101,9 @@ async def delivery_worker(api_url: str):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Central de Entregadores DijkFood")
     parser.add_argument("--api-url", required=True, help="URL base da API (ALB)")
+    parser.add_argument("--username", default=None, help="Usuario Basic Auth da API")
+    parser.add_argument("--password", default=None, help="Senha Basic Auth da API")
     args = parser.parse_args()
 
     print(f"Iniciando a central de despachos conectada em: {args.api_url}")
-    asyncio.run(delivery_worker(args.api_url))
+    asyncio.run(delivery_worker(args.api_url, username=args.username, password=args.password))
