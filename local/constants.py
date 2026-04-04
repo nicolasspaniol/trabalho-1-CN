@@ -4,12 +4,13 @@ SERVICE_NAME = "Routing-Worker-Service"
 TABLE_NAME = "Couriers"
 BUCKET_NAME = "dijkfood-assets-sp"
 ECR_REPO = "worker"
+IMAGE_TAG = "latest"
 TASK_FAMILY = "routing-worker-task"
 LOAD_BALANCER_NAME = "alb-routing-worker"
 TARGET_GROUP_NAME = "tg-routing-worker"
 LOG_GROUP_NAME = "/ecs/routing-worker"
 ALB_SG_NAME = "routing-worker-alb"
 TASK_SG_NAME = "routing-worker-task"
-VPC_ID = "vpc-0d006360e6cdf569d"
-SUBNETS = ["subnet-00289e2de0daa7680", "subnet-0a2121369f5ae05bd"]
-IMAGE_URI = "821743068643.dkr.ecr.us-east-1.amazonaws.com/worker:latest"
+# Overrides (recomendado deixar automatico)
+VPC_ID = None
+SUBNETS = []
