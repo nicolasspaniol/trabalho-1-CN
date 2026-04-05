@@ -22,11 +22,10 @@ async def startup_event():
     global GRAPH
 
     bucket = os.getenv('MAPAS_BUCKET')
-    file_key = 'sp_graph.pkl'
+    file_key = 'sp_altodepinheiros.pkl'
 
     s3_client = boto3.client('s3')
-    # TODO alterar para o nome correto
-    local_path = '/tmp/graph.pkl'
+    local_path = '/tmp/sp_altodepinheiros.pkl'
 
     # Baixa o grafo da cidade
     s3_client.download_file(bucket, file_key, local_path)
