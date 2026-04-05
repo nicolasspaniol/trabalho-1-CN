@@ -12,6 +12,13 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+
+def require_db_password():
+    db_password = os.getenv('DB_PASSWORD')
+    if not db_password:
+        raise ValueError("DB_PASSWORD nao definido. Defina a variavel de ambiente ou deixe deploy.py configurar automaticamente.")
+    return db_password
+
 def get_session():
     return boto3.Session(
         aws_access_key_id=os.getenv('AWS_ACCESS_KEY_ID'),
@@ -127,7 +134,7 @@ def setup_rds(db_instance_id, sg_id):
     Retorna o Endpoint (host) do banco.
     """
     rds = session.client('rds')
-    db_password = os.getenv('DB_PASSWORD')
+    db_password = require_db_password()
     
     print(f"🐘 Provisionando instância RDS: {db_instance_id}...")
     try:
@@ -164,7 +171,7 @@ def load_schema_to_rds(db_endpoint, sql_file_path):
     """
     Conecta ao RDS via psycopg2 e executa o script SQL.
     """
-    db_password = os.getenv('DB_PASSWORD')
+    db_password = require_db_password()
     print(f"🛠️ Conectando ao RDS para carregar o schema: {sql_file_path}...")
     
     try:

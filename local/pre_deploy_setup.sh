@@ -71,6 +71,38 @@ cleanup_temp_docker_config() {
   fi
 }
 
+resolve_buildx() {
+  if docker buildx version >/dev/null 2>&1; then
+    printf '%s\n' "docker buildx"
+    return 0
+  fi
+
+  local candidate
+  for candidate in \
+    /usr/lib/docker/cli-plugins/docker-buildx \
+    /usr/libexec/docker/cli-plugins/docker-buildx \
+    /usr/local/lib/docker/cli-plugins/docker-buildx \
+    "$HOME/.docker/cli-plugins/docker-buildx"
+  do
+    if [[ -x "$candidate" ]]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+
+  return 0
+}
+
+build_and_push_image_legacy() {
+  log "Build + push da imagem (legacy docker build)"
+  docker build \
+    -f "$DOCKERFILE_PATH" \
+    -t "$IMAGE_URI" \
+    .
+
+  docker push "$IMAGE_URI"
+}
+
 log "Validando comandos obrigatorios"
 require_cmd aws
 require_cmd docker
@@ -130,11 +162,6 @@ fi
 DOCKER_CONFIG_DIR="$(mktemp -d "${TMPDIR:-/tmp}/dijkfood-docker-config.XXXXXX")"
 trap cleanup_temp_docker_config EXIT
 
-DOCKER_BUILDX_PLUGIN="${DOCKER_BUILDX_PLUGIN:-/Applications/Docker.app/Contents/Resources/cli-plugins/docker-buildx}"
-
-mkdir -p "$DOCKER_CONFIG_DIR/cli-plugins"
-ln -sf "$DOCKER_BUILDX_PLUGIN" "$DOCKER_CONFIG_DIR/cli-plugins/docker-buildx"
-
 cat > "$DOCKER_CONFIG_DIR/config.json" <<'EOF'
 {
   "auths": {}
@@ -149,22 +176,28 @@ run_aws ecr get-login-password --region "$AWS_REGION" | \
   docker login --username AWS --password-stdin "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
 
 log "Configurando Docker Buildx"
-if docker buildx inspect "$BUILDER_NAME" >/dev/null 2>&1; then
-  log "Builder existente encontrado ($BUILDER_NAME). Recriando para evitar estado quebrado"
-  docker buildx rm "$BUILDER_NAME" >/dev/null 2>&1 || true
+BUILDX_CMD="$(resolve_buildx)"
+
+if [[ -n "$BUILDX_CMD" ]]; then
+  if $BUILDX_CMD inspect "$BUILDER_NAME" >/dev/null 2>&1; then
+    log "Builder existente encontrado ($BUILDER_NAME). Recriando para evitar estado quebrado"
+    $BUILDX_CMD rm "$BUILDER_NAME" >/dev/null 2>&1 || true
+  fi
+
+  $BUILDX_CMD create --name "$BUILDER_NAME" --use >/dev/null
+  $BUILDX_CMD inspect --bootstrap >/dev/null
+
+  log "Build + push da imagem (linux/amd64)"
+  $BUILDX_CMD build \
+    --platform linux/amd64 \
+    -f "$DOCKERFILE_PATH" \
+    -t "$IMAGE_URI" \
+    --push \
+    .
+else
+  log "Docker Buildx nao encontrado; usando build/push legado"
+  build_and_push_image_legacy
 fi
-
-docker buildx create --name "$BUILDER_NAME" --use >/dev/null
-
-docker buildx inspect --bootstrap >/dev/null
-
-log "Build + push da imagem (linux/amd64)"
-docker buildx build \
-  --platform linux/amd64 \
-  -f "$DOCKERFILE_PATH" \
-  -t "$IMAGE_URI" \
-  --push \
-  .
 
 log "Exportando variaveis para esta sessao"
 export EXECUTION_ROLE_ARN="$EXECUTION_ROLE_ARN"

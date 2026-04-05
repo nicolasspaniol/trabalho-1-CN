@@ -13,6 +13,7 @@ Variacoes uteis:
 - uv run --project local local/deploy.py --no-delete
 - uv run --project local local/deploy.py --only-delete
 - uv run --project local local/deploy.py --with-simulation
+- uv run --project local local/deploy.py --with-simulation --graph-file <arquivo.pkl> --graph-location "<regiao>"
 
 Para simulacao com Basic Auth (sem export manual):
 
@@ -25,7 +26,7 @@ Para simulacao com Basic Auth (sem export manual):
 
 Status atual:
 
-- [x] Endpoints de cadastro/listagem alinhados para customers, merchants e couriers nos scripts locais.
+- [x] Endpoints de cadastro/listagem de customers, merchants e couriers alinhados nos scripts locais.
 - [ ] Contrato final de orders definido no OpenAPI (paths, payload e respostas).
 - [ ] Contrato final de locations definido no OpenAPI (payload e respostas).
 - [ ] Confirmar campo de retorno do pedido criado (id vs order_id).
@@ -41,9 +42,9 @@ Checklist para o grupo API publicar no OpenAPI:
 
 ## 3) Checklist de infraestrutura (tracker)
 
-- [ ] Automatizar criacao/configuracao do bucket S3 do grafo (policy, versionamento, lifecycle).
-- [ ] Automatizar criacao/configuracao dos bancos/recursos de dados pendentes (RDS e outros, se aplicavel).
-- [ ] Melhorar teardown com retry para DependencyViolation em security groups.
+- [ ] Automatizar policy/versioning/lifecycle do bucket S3 do grafo.
+- [x] Teardown remove bucket S3, RDS, DynamoDB e ECR por padrão.
+- [x] Teardown faz retry simples para DependencyViolation em security groups.
 - [ ] Esperar remocao completa de tarefas/ENIs antes de delete de cluster e SG.
 
 ## 4) Fluxo recomendado de execucao
@@ -55,6 +56,11 @@ Checklist para o grupo API publicar no OpenAPI:
 	uv run --project local local/deploy.py --with-simulation --no-delete
 4. Encerrar e limpar recursos:
 	uv run --project local local/deploy.py --only-delete
+
+Observacao:
+
+- O modo `--with-simulation` exige uma API com `/customers/`, `/merchants/`, `/couriers/`, `/orders/`, `/orders/{id}`, `/orders/{id}/status` e `/locations`.
+- Se o ALB apontar para o worker de smoke tests, a simulacao completa nao roda; apenas o fluxo de carga inicial e populacao pode ser validado.
 
 ## 5) Arquivos chave
 

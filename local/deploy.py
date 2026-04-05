@@ -24,7 +24,6 @@ from local.aws_waiters import (
     wait_for_load_balancer_dns,
 )
 from local.constants import (
-    BUCKET_NAME,
     CLUSTER_NAME,
     LOAD_BALANCER_NAME,
     REGION,
@@ -38,11 +37,11 @@ DB_INSTANCE_ID = os.getenv("DB_INSTANCE_ID", "dijkfood-postgres")
 DB_SECURITY_GROUP_NAME = os.getenv("DB_SECURITY_GROUP_NAME", "dijkfood-rds-sg")
 DB_SCHEMA_FILE = os.getenv("DB_SCHEMA_FILE", "local/schema.sql")
 
-# TODO(grupo-api): alinhar contratos dos endpoints finais (/customers/, /merchants/, /couriers/, /orders/, /locations).
+# TODO(grupo-api): alinhar contratos finais de orders e locations no OpenAPI.
 # TODO(grupo-worker): validar formato final das rotas retornadas para sim_delivery.py.
-# TODO(grupo-dados): definir local final do arquivo de grafo e estrategia de versionamento no S3.
-# TODO(grupo-infra): automatizar criacao e configuracao de bucket S3 do mapa (incluindo policy/versioning/lifecycle).
-# TODO(grupo-infra): automatizar criacao dos bancos/recursos de dados faltantes (RDS e demais stores do projeto, se aplicavel).
+# TODO(grupo-dados): definir estrategia final de versionamento/lifecycle do grafo no S3 para o mapa da cidade inteira.
+# TODO(grupo-infra): automatizar policy/versioning/lifecycle do bucket S3 do mapa.
+# TODO(grupo-infra): fechar a automacao dos bancos/recursos de dados faltantes que ainda nao estiverem cobertos.
 
 
 def log(message: str) -> None:
@@ -64,6 +63,46 @@ def parse_simple_env_file(env_file: Path) -> dict[str, str]:
         if key:
             values[key] = value
     return values
+
+
+def configure_aws_files() -> None:
+    credentials_file = PROJECT_ROOT / ".aws" / "credentials"
+    config_file = PROJECT_ROOT / ".aws" / "config"
+
+    if credentials_file.exists():
+        os.environ["AWS_SHARED_CREDENTIALS_FILE"] = str(credentials_file)
+        log(f"Usando credenciais locais em {credentials_file}")
+
+    if config_file.exists():
+        os.environ["AWS_CONFIG_FILE"] = str(config_file)
+        log(f"Usando config local em {config_file}")
+
+
+def resolve_account_id() -> str:
+    sts = boto3.client("sts", region_name=REGION)
+    return sts.get_caller_identity()["Account"]
+
+
+def resolve_bucket_name(account_id: str) -> str:
+    bucket_name = os.getenv("BUCKET_NAME", "").strip()
+    if bucket_name:
+        return bucket_name
+    return f"dijkfood-assets-sp-{account_id}"
+
+
+def resolve_db_password(account_id: str) -> str:
+    env_password = os.getenv("DB_PASSWORD", "").strip()
+    if env_password:
+        return env_password
+
+    env_values = parse_simple_env_file(PROJECT_ROOT / "services" / "api" / ".env")
+    password = env_values.get("DB_PASSWORD") or env_values.get("POSTGRES_PASSWORD") or env_values.get("MASTER_PASSWORD")
+    if password:
+        return password
+
+    password = f"DijkFood-{account_id}-Rds!"
+    log("DB_PASSWORD nao definido; usando senha padrao gerada para o RDS")
+    return password
 
 
 def resolve_api_auth(api_username: str | None, api_password: str | None, api_auth_env_file: str) -> tuple[str | None, str | None]:
@@ -101,6 +140,65 @@ def run_python_script(script_path: Path, args: list[str], env: dict[str, str] | 
     subprocess.run(cmd, cwd=str(PROJECT_ROOT), check=True, env=final_env)
 
 
+def resolve_openapi_paths(base_url: str) -> set[str] | None:
+    try:
+        payload = http_get_json(f"{base_url}/openapi.json")
+    except Exception:
+        return None
+
+    if not isinstance(payload, dict):
+        return None
+    paths = payload.get("paths")
+    if not isinstance(paths, dict):
+        return None
+    return set(paths.keys())
+
+
+def ensure_simulation_contract(base_url: str) -> bool:
+    """Valida se o ALB expõe o contrato necessário para simulacao completa.
+
+    Retorna True quando os endpoints de carga e entrega estão presentes.
+    Retorna False quando apenas a carga inicial pode rodar.
+    """
+    try:
+        hello_payload = http_get_json(f"{base_url}/hello")
+        if isinstance(hello_payload, dict) and hello_payload.get("service") == "routing-worker":
+            raise RuntimeError(
+                "Simulacao indisponivel: o ALB atual aponta para o worker em modo teste "
+                "(services/worker/app/main2.py), sem endpoints de dominio (/customers, /merchants, /couriers, /orders, /locations)."
+            )
+    except RuntimeError:
+        raise
+    except Exception:
+        # Se /hello nao existir, seguimos para validacao via OpenAPI.
+        pass
+
+    paths = resolve_openapi_paths(base_url)
+    if paths is None:
+        log("Simulacao: OpenAPI indisponivel, seguindo sem validacao previa de contrato")
+        return True
+
+    required_load_paths = {"/customers/", "/merchants/", "/couriers/"}
+    missing_load_paths = sorted(required_load_paths - paths)
+    if missing_load_paths:
+        raise RuntimeError(
+            "Simulacao indisponivel: endpoints de carga nao encontrados no OpenAPI: "
+            + ", ".join(missing_load_paths)
+        )
+
+    required_delivery_paths = {"/orders/", "/orders/{id}", "/orders/{id}/status", "/locations"}
+    missing_delivery_paths = sorted(required_delivery_paths - paths)
+    if missing_delivery_paths:
+        log(
+            "Simulacao parcial: endpoints de pedidos/telemetria ausentes no OpenAPI; "
+            "sera executada apenas a populacao de dados. Faltando: "
+            + ", ".join(missing_delivery_paths)
+        )
+        return False
+
+    return True
+
+
 def run_simulation(
     base_url: str,
     num_users: int,
@@ -109,9 +207,12 @@ def run_simulation(
     cooldown_seconds: int,
     api_username: str | None,
     api_password: str | None,
+    bucket_name: str,
+    graph_file: str,
+    graph_location: str,
 ) -> None:
     delivery_process = None
-    graph_file = "sp_altodepinheiros.pkl"
+    full_simulation_supported = ensure_simulation_contract(base_url)
     auth_args: list[str] = []
     auth_env: dict[str, str] = {}
     if api_username and api_password:
@@ -119,7 +220,10 @@ def run_simulation(
         auth_env = {"API_USERNAME": api_username, "API_PASSWORD": api_password}
     try:
         log("Simulacao: gerando grafo e enviando para S3")
-        run_python_script(PROJECT_ROOT / "local" / "create.py", ["--bucket", BUCKET_NAME, "--file", graph_file])
+        run_python_script(
+            PROJECT_ROOT / "local" / "create.py",
+            ["--bucket", bucket_name, "--file", graph_file, "--location", graph_location],
+        )
 
         log("Simulacao: populando base via API")
         run_python_script(
@@ -127,6 +231,10 @@ def run_simulation(
             ["--api-url", base_url, "--num-users", str(num_users), "--graph-path", graph_file, *auth_args],
             env=auth_env,
         )
+
+        if not full_simulation_supported:
+            log("Simulacao: fase de pedidos/entregas ignorada por incompatibilidade de contrato")
+            return
 
         log("Simulacao: iniciando sim_delivery em background")
         delivery_process = subprocess.Popen(
@@ -152,9 +260,9 @@ def run_simulation(
             delivery_process.wait()
 
 
-def run_deployment(execution_role_arn: str) -> None:
+def run_deployment(execution_role_arn: str, bucket_name: str) -> None:
     log("Deploy dados: garantindo bucket S3")
-    create_data.setup_s3_bucket(BUCKET_NAME)
+    create_data.setup_s3_bucket(bucket_name)
 
     log("Deploy dados: garantindo tabela DynamoDB")
     create_data.setup_dynamo(TABLE_NAME)
@@ -180,7 +288,7 @@ def run_deployment(execution_role_arn: str) -> None:
         cluster_name=CLUSTER_NAME,
         service_name=SERVICE_NAME,
         table_name=TABLE_NAME,
-        bucket_name=BUCKET_NAME,
+        bucket_name=bucket_name,
         execution_role_arn=execution_role_arn,
     )
 
@@ -236,11 +344,23 @@ def main(argv=None) -> int:
     parser.add_argument("--api-username", default=None, help="Usuario Basic Auth da API para simulacao")
     parser.add_argument("--api-password", default=None, help="Senha Basic Auth da API para simulacao")
     parser.add_argument(
+        "--graph-file",
+        default="sp_altodepinheiros.pkl",
+        help="Nome do arquivo local do grafo usado na simulacao",
+    )
+    parser.add_argument(
+        "--graph-location",
+        default="Alto de Pinheiros, Sao Paulo, Brazil",
+        help="Regiao usada para gerar o grafo no create.py",
+    )
+    parser.add_argument(
         "--api-auth-env-file",
         default="services/api/.env",
         help="Arquivo .env com ADMIN_USERNAME/ADMIN_PASSWORD para usar na simulacao",
     )
     args = parser.parse_args(argv)
+
+    configure_aws_files()
 
     if args.only_delete:
         log("Teardown")
@@ -250,15 +370,21 @@ def main(argv=None) -> int:
 
     run_pre_deploy_setup()
 
+    account_id = resolve_account_id()
+    bucket_name = resolve_bucket_name(account_id)
+    db_password = resolve_db_password(account_id)
+    os.environ["BUCKET_NAME"] = bucket_name
+    os.environ["DB_PASSWORD"] = db_password
+
     execution_role_arn = require_execution_role()
     os.environ["EXECUTION_ROLE_ARN"] = execution_role_arn
 
     log("Deploy")
-    run_deployment(execution_role_arn)
+    run_deployment(execution_role_arn, bucket_name)
 
     log("ALB")
     elbv2 = boto3.client("elbv2", region_name=REGION)
-    alb_dns = wait_for_load_balancer_dns(elbv2, LOAD_BALANCER_NAME, log=log)
+    alb_dns = str(wait_for_load_balancer_dns(elbv2, LOAD_BALANCER_NAME, log=log))
     log(f"DNS: {alb_dns}")
 
     log("Testes")
@@ -276,6 +402,9 @@ def main(argv=None) -> int:
             cooldown_seconds=args.cooldown_seconds,
             api_username=api_username,
             api_password=api_password,
+            bucket_name=bucket_name,
+            graph_file=args.graph_file,
+            graph_location=args.graph_location,
         )
 
     if args.no_delete:

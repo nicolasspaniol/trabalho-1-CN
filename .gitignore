@@ -1,7 +1,10 @@
 **/__pycache__
 **/*.pkl
 local/cache/
+cache/
 .aws/
 .docker-local/
 .docker-local-test/
 .env
+.venv/
+**/.venv/
