@@ -117,10 +117,10 @@ def setup_dynamo(table_name):
                 {'AttributeName': 'Timestamp', 'KeyType': 'RANGE'}
             ],
             AttributeDefinitions=[
-                {'AttributeName': 'Order_ID', 'AttributeType': 'S'},
+                {'AttributeName': 'Order_ID', 'AttributeType': 'N'},
                 {'AttributeName': 'Timestamp', 'AttributeType': 'N'}
             ],
-            ProvisionedThroughput={'ReadCapacityUnits': 10, 'WriteCapacityUnits': 100}
+            BillingMode="PAY_PER_REQUEST"
         )
         dynamo.get_waiter('table_exists').wait(TableName=table_name)
         print("✅ DynamoDB Ativo!")
