@@ -33,4 +33,4 @@ ENV PYTHONPATH="/app"
 EXPOSE 80
 
 # Roda o servidor na porta 80 com mais de um worker para suportar carga e health check.
-CMD ["fastapi", "run", "app/main2.py", "--port", "80", "--workers", "2"]
+CMD ["fastapi", "run", "app/main.py", "--port", "80", "--workers", "2"]

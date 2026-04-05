@@ -2,23 +2,19 @@ import boto3
 import os
 import pickle
 import heapq
+from contextlib import asynccontextmanager
+from boto3.dynamodb.conditions import Key
 from botocore.config import Config
 from botocore.exceptions import ClientError
 from fastapi import FastAPI, HTTPException
 from shared.models.route_models import RouteRequest, RouteResponse
 
-app = FastAPI()
-
 GRAPH = None
-# Conexão
-# TODO atualizar os nomes das conexões
-session_config = Config(max_pool_connections=50)
-DYNAMODB = boto3.resource('dynamodb', region_name='us-east-1', config=session_config)
-COURIERS_TABLE = DYNAMODB.Table('Couriers')
 
-@app.on_event("startup")
-async def startup_event():
-    '''Carrega o grafo da cidade de São Paulo na memória RAM'''
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    '''Carrega o grafo da cidade de São Paulo na memória RAM.'''
     global GRAPH
 
     bucket = os.getenv('MAPAS_BUCKET')
@@ -32,6 +28,17 @@ async def startup_event():
     # Carrega na memória
     with open(local_path, 'rb') as f:
         GRAPH = pickle.load(f)
+
+    yield
+
+
+app = FastAPI(lifespan=lifespan)
+
+# Conexão
+# TODO atualizar os nomes das conexões
+session_config = Config(max_pool_connections=50)
+DYNAMODB = boto3.resource('dynamodb', region_name='us-east-1', config=session_config)
+COURIERS_TABLE = DYNAMODB.Table('Couriers')
 
 def try_reserve_courier(courier_id: str) -> bool:
     '''Tenta fazer uma atualização condicional na tabela dos couriers, mais especificadamente no status deles'''
@@ -65,11 +72,11 @@ async def calculate_route(request: RouteRequest):
     try:
         response = COURIERS_TABLE.query(
             IndexName='StatusIndex',  # TODO fazer um index
-            KeyConditionExpression=boto3.resource('dynamodb').conditions.Key('status').eq('AVAILABLE')
+            KeyConditionExpression=Key('status').eq('AVAILABLE')
         )
         # Dicionário para verificação se um nó tem um entregador
         couriers_map = {int(item['current_node']): item['id'] for item in response['Items']}
-    except Exception as e:
+    except Exception:
         raise HTTPException(status_code=500, detail="Falha ao consultar o couriers disponiveis")
 
     origin = request.merchant_node
