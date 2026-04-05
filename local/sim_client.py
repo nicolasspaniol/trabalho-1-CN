@@ -17,8 +17,8 @@ async def place_order(
     session: aiohttp.ClientSession, api_url: str, customer_id: int, merchant_id: int, default_item_id: int
 ):
     """Envia um pedido e mede a latência de escrita"""
-    # TODO(grupo-api): confirmar o endpoint final de pedidos e a regra de item_ids.
-    payload = {"user_id": customer_id, "merchant_id": merchant_id, "item_ids": [default_item_id]}
+    # TODO(grupo-api): confirmar o campo de retorno do pedido criado (id vs order_id) e a regra final de item_ids.
+    payload = {"merchant_id": merchant_id, "item_ids": [default_item_id]}
 
     start_time = time.perf_counter()
     # Envia o POST para criar um pedido e espera a resposta para medir a latência de escrita
@@ -36,10 +36,10 @@ async def place_order(
 async def check_order_status(
     session: aiohttp.ClientSession, api_url: str, order_id: str
 ):
-    """Consulta um pedido específico para medir a latência de leitura sob estresse"""
+    """Consulta eventos do pedido para medir a latência de leitura sob estresse"""
     start_time = time.perf_counter()
     try:
-        url = f"{api_url.rstrip('/')}{ORDERS_ENDPOINT}{order_id}"
+        url = f"{api_url.rstrip('/')}{ORDERS_ENDPOINT}{order_id}/events"
         async with session.get(url) as response:
             await response.json()
             return time.perf_counter() - start_time

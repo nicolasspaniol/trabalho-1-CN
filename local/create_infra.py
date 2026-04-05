@@ -166,6 +166,61 @@ def wait_service_gone(ecs, cluster_name, service_name):
         time.sleep(5)
 
 
+def ensure_service_autoscaling(
+    autoscaling,
+    cluster_name,
+    service_name,
+    min_capacity=2,
+    max_capacity=20,
+    cpu_target=70.0,
+    memory_target=75.0,
+    scale_out_cooldown=30,
+    scale_in_cooldown=300,
+):
+    """Configura autoscaling para um servico ECS com politicas de CPU e memoria."""
+    resource_id = f"service/{cluster_name}/{service_name}"
+
+    autoscaling.register_scalable_target(
+        ServiceNamespace="ecs",
+        ResourceId=resource_id,
+        ScalableDimension="ecs:service:DesiredCount",
+        MinCapacity=min_capacity,
+        MaxCapacity=max_capacity,
+    )
+
+    autoscaling.put_scaling_policy(
+        PolicyName="CpuScaling",
+        ServiceNamespace="ecs",
+        ResourceId=resource_id,
+        ScalableDimension="ecs:service:DesiredCount",
+        PolicyType="TargetTrackingScaling",
+        TargetTrackingScalingPolicyConfiguration={
+            "TargetValue": cpu_target,
+            "PredefinedMetricSpecification": {
+                "PredefinedMetricType": "ECSServiceAverageCPUUtilization"
+            },
+            "ScaleOutCooldown": scale_out_cooldown,
+            "ScaleInCooldown": scale_in_cooldown,
+        },
+    )
+
+    autoscaling.put_scaling_policy(
+        PolicyName="MemoryScaling",
+        ServiceNamespace="ecs",
+        ResourceId=resource_id,
+        ScalableDimension="ecs:service:DesiredCount",
+        PolicyType="TargetTrackingScaling",
+        TargetTrackingScalingPolicyConfiguration={
+            "TargetValue": memory_target,
+            "PredefinedMetricSpecification": {
+                "PredefinedMetricType": "ECSServiceAverageMemoryUtilization"
+            },
+            "ScaleOutCooldown": scale_out_cooldown,
+            "ScaleInCooldown": scale_in_cooldown,
+        },
+    )
+
+
 def setup_worker_infrastructure(region, cluster_name, service_name, table_name, bucket_name, execution_role_arn):
     if not execution_role_arn:
         raise ValueError("execution_role_arn is required")
@@ -277,19 +332,15 @@ def setup_worker_infrastructure(region, cluster_name, service_name, table_name, 
     else:
         ecs.create_service(serviceName=service_name, **service_kwargs)
 
-    resource_id = f"service/{cluster_name}/{service_name}"
-    autoscaling.register_scalable_target(ServiceNamespace="ecs", ResourceId=resource_id, ScalableDimension="ecs:service:DesiredCount", MinCapacity=2, MaxCapacity=20)
-    autoscaling.put_scaling_policy(
-        PolicyName="CpuScaling",
-        ServiceNamespace="ecs",
-        ResourceId=resource_id,
-        ScalableDimension="ecs:service:DesiredCount",
-        PolicyType="TargetTrackingScaling",
-        TargetTrackingScalingPolicyConfiguration={
-            "TargetValue": 70.0,
-            "PredefinedMetricSpecification": {"PredefinedMetricType": "ECSServiceAverageCPUUtilization"},
-            "ScaleOutCooldown": 30,
-            "ScaleInCooldown": 300,
-        },
+    ensure_service_autoscaling(
+        autoscaling=autoscaling,
+        cluster_name=cluster_name,
+        service_name=service_name,
+        min_capacity=2,
+        max_capacity=20,
+        cpu_target=70.0,
+        memory_target=75.0,
+        scale_out_cooldown=30,
+        scale_in_cooldown=300,
     )
     return True

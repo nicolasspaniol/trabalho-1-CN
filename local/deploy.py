@@ -38,11 +38,10 @@ DB_INSTANCE_ID = os.getenv("DB_INSTANCE_ID", "dijkfood-postgres")
 DB_SECURITY_GROUP_NAME = os.getenv("DB_SECURITY_GROUP_NAME", "dijkfood-rds-sg")
 DB_SCHEMA_FILE = os.getenv("DB_SCHEMA_FILE", "local/schema.sql")
 
-# TODO(grupo-api): alinhar contratos finais de orders e locations no OpenAPI.
-# TODO(grupo-worker): validar formato final das rotas retornadas para sim_delivery.py.
+# TODO(grupo-api): publicar o contrato final de couriers/me/location, picked_up e delivered no OpenAPI.
+# TODO(grupo-worker): validar o formato final das rotas e o fluxo de courier contra o contrato novo.
 # TODO(grupo-dados): definir estrategia final de versionamento/lifecycle do grafo no S3 para o mapa da cidade inteira.
 # TODO(grupo-infra): automatizar policy/versioning/lifecycle do bucket S3 do mapa.
-# TODO(grupo-infra): fechar a automacao dos bancos/recursos de dados faltantes que ainda nao estiverem cobertos.
 
 
 def log(message: str) -> None:
@@ -168,7 +167,7 @@ def ensure_simulation_contract(base_url: str) -> str:
         if isinstance(hello_payload, dict) and hello_payload.get("service") == "routing-worker":
             log(
                 "Simulacao indisponivel: o ALB atual aponta para o worker em modo teste "
-                "(services/worker/app/main2.py), sem endpoints de dominio (/customers, /merchants, /couriers, /orders, /locations)."
+                "(services/worker/app/main2.py), sem endpoints de dominio (/customers, /merchants, /couriers, /orders, /couriers/me/location, /orders/{order_id}/picked_up, /orders/{order_id}/delivered)."
             )
             return "unavailable"
     except RuntimeError:
