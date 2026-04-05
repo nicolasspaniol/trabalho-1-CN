@@ -10,7 +10,9 @@ dependencies = [
     "faker",
     "networkx",
     "numpy",
-    "osmnx"
+    "osmnx",
+    "python-dotenv",
+    "psycopg2-binary"
 ]
 
 [tool.uv]
