@@ -37,11 +37,10 @@ DB_INSTANCE_ID = os.getenv("DB_INSTANCE_ID", "dijkfood-postgres")
 DB_SECURITY_GROUP_NAME = os.getenv("DB_SECURITY_GROUP_NAME", "dijkfood-rds-sg")
 DB_SCHEMA_FILE = os.getenv("DB_SCHEMA_FILE", "local/schema.sql")
 
-# TODO(grupo-api): alinhar contratos finais de orders e locations no OpenAPI.
-# TODO(grupo-worker): validar formato final das rotas retornadas para sim_delivery.py.
+# TODO(grupo-api): publicar o contrato final de couriers/me/location, picked_up e delivered no OpenAPI.
+# TODO(grupo-worker): validar o formato final das rotas e o fluxo de courier contra o contrato novo.
 # TODO(grupo-dados): definir estrategia final de versionamento/lifecycle do grafo no S3 para o mapa da cidade inteira.
 # TODO(grupo-infra): automatizar policy/versioning/lifecycle do bucket S3 do mapa.
-# TODO(grupo-infra): fechar a automacao dos bancos/recursos de dados faltantes que ainda nao estiverem cobertos.
 
 
 def log(message: str) -> None:
@@ -157,7 +156,7 @@ def resolve_openapi_paths(base_url: str) -> set[str] | None:
 def ensure_simulation_contract(base_url: str) -> bool:
     """Valida se o ALB expõe o contrato necessário para simulacao completa.
 
-    Retorna True quando os endpoints de carga e entrega estão presentes.
+    Retorna True quando a API suporta o fluxo de simulacao atual ou o novo fluxo de courier.
     Retorna False quando apenas a carga inicial pode rodar.
     """
     try:
@@ -165,7 +164,7 @@ def ensure_simulation_contract(base_url: str) -> bool:
         if isinstance(hello_payload, dict) and hello_payload.get("service") == "routing-worker":
             raise RuntimeError(
                 "Simulacao indisponivel: o ALB atual aponta para o worker em modo teste "
-                "(services/worker/app/main2.py), sem endpoints de dominio (/customers, /merchants, /couriers, /orders, /locations)."
+                "(services/worker/app/main2.py), sem endpoints de dominio (/customers, /merchants, /couriers, /orders, /couriers/me/location, /orders/{order_id}/picked_up, /orders/{order_id}/delivered)."
             )
     except RuntimeError:
         raise
@@ -186,17 +185,25 @@ def ensure_simulation_contract(base_url: str) -> bool:
             + ", ".join(missing_load_paths)
         )
 
-    required_delivery_paths = {"/orders/", "/orders/{id}", "/orders/{id}/status", "/locations"}
-    missing_delivery_paths = sorted(required_delivery_paths - paths)
-    if missing_delivery_paths:
-        log(
-            "Simulacao parcial: endpoints de pedidos/telemetria ausentes no OpenAPI; "
-            "sera executada apenas a populacao de dados. Faltando: "
-            + ", ".join(missing_delivery_paths)
-        )
-        return False
+    required_new_delivery_paths = {
+        "/orders/",
+        "/couriers/me/order",
+        "/orders/{order_id}/accept",
+        "/couriers/me/location",
+        "/orders/{order_id}/picked_up",
+        "/orders/{order_id}/delivered",
+    }
 
-    return True
+    if required_new_delivery_paths <= paths:
+        log("Simulacao: contrato completo de courier detectado (accept + couriers/me/location + picked_up + delivered)")
+        return True
+
+    missing_new_paths = sorted(required_new_delivery_paths - paths)
+    log(
+        "Simulacao parcial: contrato final de courier incompleto; faltando: "
+        + ", ".join(missing_new_paths)
+    )
+    return False
 
 
 def run_simulation(
