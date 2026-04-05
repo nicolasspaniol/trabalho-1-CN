@@ -3,59 +3,117 @@ import os
 import pickle
 import heapq
 from contextlib import asynccontextmanager
-from boto3.dynamodb.conditions import Key
-from botocore.config import Config
-from botocore.exceptions import ClientError
+from psycopg2 import pool
 from fastapi import FastAPI, HTTPException
 from shared.models.route_models import RouteRequest, RouteResponse
 
 GRAPH = None
+GRAPH_LOAD_ERROR = None
+DB_POOL = None
+DB_POOL_ERROR = None
 
+
+def try_load_graph_from_s3() -> bool:
+    global GRAPH, GRAPH_LOAD_ERROR
+
+    bucket = os.getenv('MAPAS_BUCKET')
+    file_key = os.getenv('MAPAS_FILE', 'sp_altodepinheiros.pkl')
+
+    s3_client = boto3.client('s3')
+    local_path = f"/tmp/{os.path.basename(file_key)}"
+
+    try:
+        s3_client.download_file(bucket, file_key, local_path)
+        with open(local_path, 'rb') as f:
+            GRAPH = pickle.load(f)
+        GRAPH_LOAD_ERROR = None
+        return True
+    except Exception as error:
+        GRAPH = None
+        GRAPH_LOAD_ERROR = str(error)
+        return False
+
+
+def try_init_db_pool() -> bool:
+    global DB_POOL, DB_POOL_ERROR
+
+    if DB_POOL is not None:
+        return True
+
+    db_host = os.getenv('DB_HOST', '').strip()
+    db_name = os.getenv('DB_NAME', 'postgres').strip() or 'postgres'
+    db_user = os.getenv('DB_USER', 'postgres').strip() or 'postgres'
+    db_password = os.getenv('DB_PASSWORD', '').strip()
+
+    if not db_host or not db_password:
+        DB_POOL_ERROR = 'DB_HOST ou DB_PASSWORD nao configurado'
+        return False
+
+    try:
+        DB_POOL = pool.SimpleConnectionPool(
+            minconn=1,
+            maxconn=int(os.getenv('DB_POOL_MAX_CONNECTIONS', '5')),
+            host=db_host,
+            dbname=db_name,
+            user=db_user,
+            password=db_password,
+        )
+        DB_POOL_ERROR = None
+        return True
+    except Exception as error:
+        DB_POOL = None
+        DB_POOL_ERROR = str(error)
+        return False
+
+
+def fetch_available_couriers() -> list[tuple[int, int]]:
+    if not try_init_db_pool():
+        raise RuntimeError(DB_POOL_ERROR or 'Falha ao inicializar pool do RDS')
+
+    conn = DB_POOL.getconn()
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                'SELECT courier_id, location FROM courier WHERE availability IS TRUE'
+            )
+            rows = cursor.fetchall()
+        return [(int(courier_id), int(location)) for courier_id, location in rows]
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        DB_POOL.putconn(conn)
+
+
+def reserve_courier(courier_id: int) -> bool:
+    if not try_init_db_pool():
+        raise RuntimeError(DB_POOL_ERROR or 'Falha ao inicializar pool do RDS')
+
+    conn = DB_POOL.getconn()
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                'UPDATE courier SET availability = FALSE WHERE courier_id = %s AND availability IS TRUE RETURNING courier_id',
+                (courier_id,),
+            )
+            reserved = cursor.fetchone()
+        conn.commit()
+        return reserved is not None
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        DB_POOL.putconn(conn)
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     '''Carrega o grafo da cidade de São Paulo na memória RAM.'''
-    global GRAPH
-
-    bucket = os.getenv('MAPAS_BUCKET')
-    file_key = 'sp_altodepinheiros.pkl'
-
-    s3_client = boto3.client('s3')
-    local_path = '/tmp/sp_altodepinheiros.pkl'
-
-    # Baixa o grafo da cidade
-    s3_client.download_file(bucket, file_key, local_path)
-    # Carrega na memória
-    with open(local_path, 'rb') as f:
-        GRAPH = pickle.load(f)
+    try_load_graph_from_s3()
 
     yield
 
 
 app = FastAPI(lifespan=lifespan)
-
-# Conexão
-# TODO atualizar os nomes das conexões
-session_config = Config(max_pool_connections=50)
-DYNAMODB = boto3.resource('dynamodb', region_name='us-east-1', config=session_config)
-COURIERS_TABLE = DYNAMODB.Table('Couriers')
-
-def try_reserve_courier(courier_id: str) -> bool:
-    '''Tenta fazer uma atualização condicional na tabela dos couriers, mais especificadamente no status deles'''
-    try:
-        # TODO verificar as estruturas da conexão com o dynamodb
-        COURIERS_TABLE.update_item(
-            Key={'id': courier_id},
-            ConditionExpression="#s = :avail",
-            UpdateExpression="SET #s = :busy",
-            ExpressionAttributeNames={'#s': 'status'},
-            ExpressionAttributeValues={':busy': 'BUSY', ':avail': 'AVAILABLE'}
-        )
-        return True
-    except ClientError as e:
-        if e.response['Error']['Code'] == 'ConditionalCheckFailedException':
-            return False
-        raise e
 
 def reconstruct_path(predecessors: dict, target: int) -> list[int]:
     '''Reconstroi o caminho encontrado pelo Dilkstra'''
@@ -69,13 +127,14 @@ def reconstruct_path(predecessors: dict, target: int) -> list[int]:
 
 @app.post("/calculate-route", response_model=RouteResponse)
 async def calculate_route(request: RouteRequest):
+    if GRAPH is None:
+        try_load_graph_from_s3()
+    if GRAPH is None:
+        raise HTTPException(status_code=503, detail="Graph not loaded yet")
+
     try:
-        response = COURIERS_TABLE.query(
-            IndexName='StatusIndex',  # TODO fazer um index
-            KeyConditionExpression=Key('status').eq('AVAILABLE')
-        )
-        # Dicionário para verificação se um nó tem um entregador
-        couriers_map = {int(item['current_node']): item['id'] for item in response['Items']}
+        available_couriers = fetch_available_couriers()
+        couriers_map = {location: courier_id for courier_id, location in available_couriers}
     except Exception:
         raise HTTPException(status_code=500, detail="Falha ao consultar o couriers disponiveis")
 
@@ -99,8 +158,7 @@ async def calculate_route(request: RouteRequest):
         courier_id = couriers_map.get(node)
         if selected_courier is None and courier_id is not None:
             # Tenta reservar o entregador
-            # TODO verificação se está localização
-            if try_reserve_courier(courier_id): # Se ele estiver disponivel
+            if reserve_courier(courier_id): # Se ele estiver disponivel
                 # Define o entregador escolido
                 selected_courier = courier_id
                 node_of_courier = node
@@ -141,4 +199,6 @@ async def calculate_route(request: RouteRequest):
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "graph_loaded": GRAPH is not None}
+    if GRAPH is None:
+        try_load_graph_from_s3()
+    return {"status": "ok", "graph_loaded": GRAPH is not None, "graph_error": GRAPH_LOAD_ERROR}

@@ -5,7 +5,6 @@ import boto3
 
 from local.constants import (
     ALB_SG_NAME,
-    BUCKET_NAME,
     CLUSTER_NAME,
     ECR_REPO,
     IMAGE_TAG,
@@ -36,6 +35,24 @@ def resolve_image_uri(account_id, region):
     if "IMAGE_URI" in os.environ and os.environ["IMAGE_URI"].strip():
         return os.environ["IMAGE_URI"].strip()
     return f"{account_id}.dkr.ecr.{region}.amazonaws.com/{ECR_REPO}:{IMAGE_TAG}"
+
+
+def resolve_graph_file_key():
+    return os.getenv("MAPAS_FILE", "sp_altodepinheiros.pkl").strip() or "sp_altodepinheiros.pkl"
+
+
+def resolve_db_host():
+    db_host = os.getenv("DB_HOST", "").strip()
+    if not db_host:
+        raise ValueError("DB_HOST nao definido. O worker precisa do endpoint do RDS.")
+    return db_host
+
+
+def resolve_db_password():
+    db_password = os.getenv("DB_PASSWORD", "").strip()
+    if not db_password:
+        raise ValueError("DB_PASSWORD nao definido. O worker precisa da senha do RDS.")
+    return db_password
 
 
 def resolve_vpc_id(ec2):
@@ -165,6 +182,9 @@ def setup_worker_infrastructure(region, cluster_name, service_name, table_name, 
     vpc_id = resolve_vpc_id(ec2)
     subnets = resolve_subnets(ec2, vpc_id)
     image_uri = resolve_image_uri(account_id, region)
+    graph_file_key = resolve_graph_file_key()
+    db_host = resolve_db_host()
+    db_password = resolve_db_password()
 
     alb_sg_id = ensure_security_group(ec2, vpc_id, ALB_SG_NAME, "Ingress publico HTTP para ALB do worker")
     task_sg_id = ensure_security_group(ec2, vpc_id, TASK_SG_NAME, "Ingress HTTP do ALB para tasks ECS")
@@ -217,7 +237,15 @@ def setup_worker_infrastructure(region, cluster_name, service_name, table_name, 
                 "name": "worker-container",
                 "image": image_uri,
                 "portMappings": [{"containerPort": 80}],
-                "environment": [{"name": "MAPAS_BUCKET", "value": bucket_name}, {"name": "TABLE_NAME", "value": table_name}],
+                "environment": [
+                    {"name": "MAPAS_BUCKET", "value": bucket_name},
+                    {"name": "MAPAS_FILE", "value": graph_file_key},
+                    {"name": "DB_HOST", "value": db_host},
+                    {"name": "DB_USER", "value": "postgres"},
+                    {"name": "DB_NAME", "value": "postgres"},
+                    {"name": "DB_PASSWORD", "value": db_password},
+                    {"name": "TABLE_NAME", "value": table_name},
+                ],
                 "logConfiguration": {
                     "logDriver": "awslogs",
                     "options": {"awslogs-group": LOG_GROUP_NAME, "awslogs-region": region, "awslogs-stream-prefix": "ecs"},

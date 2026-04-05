@@ -6,6 +6,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from urllib.error import HTTPError
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
@@ -154,19 +155,22 @@ def resolve_openapi_paths(base_url: str) -> set[str] | None:
     return set(paths.keys())
 
 
-def ensure_simulation_contract(base_url: str) -> bool:
-    """Valida se o ALB expõe o contrato necessário para simulacao completa.
+def ensure_simulation_contract(base_url: str) -> str:
+    """Valida o contrato da API para decidir o modo de simulacao.
 
-    Retorna True quando os endpoints de carga e entrega estão presentes.
-    Retorna False quando apenas a carga inicial pode rodar.
+    Retorna:
+    - "full": carga + pedidos/entregas
+    - "data-only": apenas populacao de dados
+    - "unavailable": sem endpoints minimos para iniciar a simulacao
     """
     try:
         hello_payload = http_get_json(f"{base_url}/hello")
         if isinstance(hello_payload, dict) and hello_payload.get("service") == "routing-worker":
-            raise RuntimeError(
+            log(
                 "Simulacao indisponivel: o ALB atual aponta para o worker em modo teste "
                 "(services/worker/app/main2.py), sem endpoints de dominio (/customers, /merchants, /couriers, /orders, /locations)."
             )
+            return "unavailable"
     except RuntimeError:
         raise
     except Exception:
@@ -176,15 +180,16 @@ def ensure_simulation_contract(base_url: str) -> bool:
     paths = resolve_openapi_paths(base_url)
     if paths is None:
         log("Simulacao: OpenAPI indisponivel, seguindo sem validacao previa de contrato")
-        return True
+        return "full"
 
     required_load_paths = {"/customers/", "/merchants/", "/couriers/"}
     missing_load_paths = sorted(required_load_paths - paths)
     if missing_load_paths:
-        raise RuntimeError(
+        log(
             "Simulacao indisponivel: endpoints de carga nao encontrados no OpenAPI: "
             + ", ".join(missing_load_paths)
         )
+        return "unavailable"
 
     required_delivery_paths = {"/orders/", "/orders/{id}", "/orders/{id}/status", "/locations"}
     missing_delivery_paths = sorted(required_delivery_paths - paths)
@@ -194,9 +199,9 @@ def ensure_simulation_contract(base_url: str) -> bool:
             "sera executada apenas a populacao de dados. Faltando: "
             + ", ".join(missing_delivery_paths)
         )
-        return False
+        return "data-only"
 
-    return True
+    return "full"
 
 
 def run_simulation(
@@ -212,7 +217,7 @@ def run_simulation(
     graph_location: str,
 ) -> None:
     delivery_process = None
-    full_simulation_supported = ensure_simulation_contract(base_url)
+    simulation_mode = ensure_simulation_contract(base_url)
     auth_args: list[str] = []
     auth_env: dict[str, str] = {}
     if api_username and api_password:
@@ -225,6 +230,10 @@ def run_simulation(
             ["--bucket", bucket_name, "--file", graph_file, "--location", graph_location],
         )
 
+        if simulation_mode == "unavailable":
+            log("Simulacao: ignorada por incompatibilidade de contrato")
+            return
+
         log("Simulacao: populando base via API")
         run_python_script(
             PROJECT_ROOT / "local" / "load.py",
@@ -232,7 +241,7 @@ def run_simulation(
             env=auth_env,
         )
 
-        if not full_simulation_supported:
+        if simulation_mode == "data-only":
             log("Simulacao: fase de pedidos/entregas ignorada por incompatibilidade de contrato")
             return
 
@@ -308,9 +317,37 @@ def require_execution_role() -> str:
     return execution_role_arn
 
 
-def test_service(alb_dns: str) -> None:
-    base_url = f"http://{alb_dns}"
+def test_optional_endpoints(base_url: str) -> None:
+    paths = resolve_openapi_paths(base_url)
 
+    hello_url = f"{base_url}/hello?name=world"
+    if paths is None or "/hello" in paths:
+        log("Teste /hello")
+        try:
+            http_get_json(hello_url)
+        except HTTPError as error:
+            if error.code == 404:
+                log("Teste /hello: endpoint nao disponivel neste modo, seguindo")
+            else:
+                raise
+    else:
+        log("Teste /hello: endpoint ausente no OpenAPI, ignorado")
+
+    burn_url = f"{base_url}/cpu-burn?seconds=5&payload_kb=32"
+    if paths is None or "/cpu-burn" in paths:
+        log("Teste /cpu-burn")
+        try:
+            http_get_json(burn_url, timeout=30)
+        except HTTPError as error:
+            if error.code == 404:
+                log("Teste /cpu-burn: endpoint nao disponivel neste modo, seguindo")
+            else:
+                raise
+    else:
+        log("Teste /cpu-burn: endpoint ausente no OpenAPI, ignorado")
+
+
+def wait_service_ready(alb_dns: str) -> None:
     log("Resolucao DNS")
     wait_for_dns_resolution(alb_dns, log=log)
 
@@ -318,17 +355,34 @@ def test_service(alb_dns: str) -> None:
     elbv2 = boto3.client("elbv2", region_name=REGION)
     wait_for_healthy_targets(elbv2, TARGET_GROUP_NAME, log=log)
 
+
+def test_service(
+    alb_dns: str,
+    include_optional: bool = True,
+    include_readiness: bool = True,
+    require_graph_loaded: bool = False,
+) -> None:
+    base_url = f"http://{alb_dns}"
+
+    if include_readiness:
+        wait_service_ready(alb_dns)
+
     health_url = f"{base_url}/health"
     log("Teste /health")
     wait_for_http_ok(health_url, log=log)
 
-    hello_url = f"{base_url}/hello?name=world"
-    log("Teste /hello")
-    http_get_json(hello_url)
+    if require_graph_loaded:
+        health_payload = http_get_json(health_url)
+        graph_loaded = bool(health_payload.get("graph_loaded")) if isinstance(health_payload, dict) else False
+        if not graph_loaded:
+            graph_error = health_payload.get("graph_error") if isinstance(health_payload, dict) else None
+            raise RuntimeError(
+                "Health check falhou: grafo nao carregado na task. "
+                f"graph_error={graph_error!r}"
+            )
 
-    burn_url = f"{base_url}/cpu-burn?seconds=5&payload_kb=32"
-    log("Teste /cpu-burn")
-    http_get_json(burn_url, timeout=30)
+    if include_optional:
+        test_optional_endpoints(base_url)
 
 
 def main(argv=None) -> int:
@@ -375,6 +429,7 @@ def main(argv=None) -> int:
     db_password = resolve_db_password(account_id)
     os.environ["BUCKET_NAME"] = bucket_name
     os.environ["DB_PASSWORD"] = db_password
+    os.environ["MAPAS_FILE"] = args.graph_file
 
     execution_role_arn = require_execution_role()
     os.environ["EXECUTION_ROLE_ARN"] = execution_role_arn
@@ -387,25 +442,36 @@ def main(argv=None) -> int:
     alb_dns = str(wait_for_load_balancer_dns(elbv2, LOAD_BALANCER_NAME, log=log))
     log(f"DNS: {alb_dns}")
 
-    log("Testes")
-    test_service(alb_dns)
+    base_url = f"http://{alb_dns}"
 
     if args.with_simulation:
+        log("Readiness")
+        wait_service_ready(alb_dns)
+
         rps_scenarios = parse_rps_scenarios(args.rps_scenarios)
-        base_url = f"http://{alb_dns}"
         api_username, api_password = resolve_api_auth(args.api_username, args.api_password, args.api_auth_env_file)
-        run_simulation(
-            base_url=base_url,
-            num_users=args.num_users,
-            rps_scenarios=rps_scenarios,
-            duration=args.duration,
-            cooldown_seconds=args.cooldown_seconds,
-            api_username=api_username,
-            api_password=api_password,
-            bucket_name=bucket_name,
-            graph_file=args.graph_file,
-            graph_location=args.graph_location,
-        )
+        try:
+            run_simulation(
+                base_url=base_url,
+                num_users=args.num_users,
+                rps_scenarios=rps_scenarios,
+                duration=args.duration,
+                cooldown_seconds=args.cooldown_seconds,
+                api_username=api_username,
+                api_password=api_password,
+                bucket_name=bucket_name,
+                graph_file=args.graph_file,
+                graph_location=args.graph_location,
+            )
+        except RuntimeError as error:
+            log(str(error))
+            return 2
+
+        log("Testes")
+        test_service(alb_dns, include_optional=True, include_readiness=False, require_graph_loaded=True)
+    else:
+        log("Testes")
+        test_service(alb_dns, include_optional=True, include_readiness=True, require_graph_loaded=False)
 
     if args.no_delete:
         log("Teardown: ignorado")
