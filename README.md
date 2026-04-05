@@ -99,8 +99,8 @@ Para simulacao com Basic Auth (sem export manual):
 Observacao:
 
 - O modo `--with-simulation` exige o contrato final de entrega:
-	- `/orders/{order_id}/accept` + `/couriers/me/location` + `/orders/{order_id}/picked_up` + `/orders/{order_id}/delivered`
-- O endpoint `accept` nao foi removido: ele continua coexistindo com `picked_up` e `delivered` no contrato final.
+	- `/orders/{order_id}/accept` + `/orders/{order_id}/ready` + `/couriers/me/location` + `/orders/{order_id}/picked_up` + `/orders/{order_id}/delivered`
+- O endpoint `accept` nao foi removido: ele continua coexistindo com `ready`, `picked_up` e `delivered` no contrato final.
 - Se o ALB apontar para o worker de smoke tests, a simulacao completa nao roda; apenas o fluxo de carga inicial e populacao pode ser validado.
 
 Estado resumido do projeto:

@@ -185,7 +185,7 @@ def ensure_simulation_contract(base_url: str) -> bool:
         if isinstance(hello_payload, dict) and hello_payload.get("service") == "routing-worker":
             raise RuntimeError(
                 "Simulacao indisponivel: o ALB atual aponta para o worker em modo teste "
-                "(services/worker/app/main2.py), sem endpoints de dominio (/customers, /merchants, /couriers, /orders, /couriers/me/location, /orders/{order_id}/picked_up, /orders/{order_id}/delivered)."
+                "(services/worker/app/main2.py), sem endpoints de dominio (/customers, /merchants, /couriers, /orders, /couriers/me/location, /orders/{order_id}/ready, /orders/{order_id}/picked_up, /orders/{order_id}/delivered)."
             )
     except RuntimeError:
         raise
@@ -212,13 +212,14 @@ def ensure_simulation_contract(base_url: str) -> bool:
         "/orders",
         "/couriers/me/order",
         "/orders/{order_id}/accept",
+        "/orders/{order_id}/ready",
         "/couriers/me/location",
         "/orders/{order_id}/picked_up",
         "/orders/{order_id}/delivered",
     }
 
     if required_new_delivery_paths <= normalized_paths:
-        log("Simulacao: contrato completo de courier detectado (accept + couriers/me/location + picked_up + delivered)")
+        log("Simulacao: contrato completo de courier detectado (accept + ready + couriers/me/location + picked_up + delivered)")
         return True
 
     missing_new_paths = sorted(required_new_delivery_paths - normalized_paths)

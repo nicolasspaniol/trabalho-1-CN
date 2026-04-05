@@ -38,6 +38,7 @@ def resolve_delivery_mode(paths: set[str] | None) -> str:
         "/couriers/me/location",
         "/couriers/me/order",
         "/orders/{order_id}/accept",
+        "/orders/{order_id}/ready",
         "/orders/{order_id}/picked_up",
         "/orders/{order_id}/delivered",
     }
@@ -90,7 +91,7 @@ async def update_courier_location(session: aiohttp.ClientSession, api_url: str, 
     try:
         async with session.put(
             f"{api_url.rstrip('/')}/couriers/me/location",
-            json={"location": location},
+            params={"location": location},
         ) as response:
             response.raise_for_status()
             return True
@@ -106,6 +107,16 @@ async def mark_order_picked_up(session: aiohttp.ClientSession, api_url: str, ord
             return True
     except Exception as e:
         print(f"  Erro ao marcar pedido {order_id} como picked_up: {e}")
+        return False
+
+
+async def mark_order_ready(session: aiohttp.ClientSession, api_url: str, order_id: int) -> bool:
+    try:
+        async with session.post(f"{api_url.rstrip('/')}/orders/{order_id}/ready", json={}) as response:
+            response.raise_for_status()
+            return True
+    except Exception as e:
+        print(f"  Erro ao marcar pedido {order_id} como ready: {e}")
         return False
 
 
@@ -146,6 +157,9 @@ async def deliver_order_new(session: aiohttp.ClientSession, api_url: str, order:
     if not await accept_order(session, api_url, order_id):
         return False
 
+    if not await mark_order_ready(session, api_url, order_id):
+        return False
+
     print(f"  ↳ Movendo courier para restaurante no node {merchant_address}")
     if not await update_courier_location(session, api_url, merchant_address):
         return False
@@ -171,7 +185,7 @@ async def delivery_worker(api_url: str, username: str | None = None, password: s
     Simula um courier monitorando sua fila de pedidos.
 
     O worker tenta detectar qual contrato a API expõe:
-    - Contrato final: PUT /couriers/me/location + POST /orders/{id}/accept + POST /orders/{id}/picked_up + POST /orders/{id}/delivered
+    - Contrato final: PUT /couriers/me/location + POST /orders/{id}/accept + POST /orders/{id}/ready + POST /orders/{id}/picked_up + POST /orders/{id}/delivered
     - Parcial: apenas monitora e registra que falta contrato
     """
     auth = None
@@ -185,7 +199,7 @@ async def delivery_worker(api_url: str, username: str | None = None, password: s
         delivery_mode = resolve_delivery_mode(paths)
 
         if delivery_mode == NEW_DELIVERY_MODE:
-            print("Iniciando courier worker com contrato final: accept + couriers/me/location + picked_up + delivered")
+            print("Iniciando courier worker com contrato final: accept + ready + couriers/me/location + picked_up + delivered")
         else:
             print("Iniciando courier worker em modo parcial: contrato de delivery incompleto")
 
@@ -219,7 +233,7 @@ async def delivery_worker(api_url: str, username: str | None = None, password: s
                 else:
                     print(
                         "  └─ Contrato de courier incompleto; aguardando /orders/{order_id}/accept, "
-                        "/couriers/me/location, /orders/{order_id}/picked_up e /orders/{order_id}/delivered"
+                        "/orders/{order_id}/ready, /couriers/me/location, /orders/{order_id}/picked_up e /orders/{order_id}/delivered"
                     )
                     last_handled_order_id = order_id
 
