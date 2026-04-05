@@ -154,53 +154,79 @@ def resolve_openapi_paths(base_url: str) -> set[str] | None:
     return set(paths.keys())
 
 
-def ensure_simulation_contract(base_url: str) -> str:
-    """Valida o contrato da API para decidir o modo de simulacao.
+def normalize_openapi_paths(paths: set[str]) -> set[str]:
+    normalized: set[str] = set()
+    for path in paths:
+        clean = path.strip()
+        if not clean:
+            continue
+        normalized.add(clean.rstrip("/") or "/")
+    return normalized
 
-    Retorna:
-    - "full": carga + pedidos/entregas
-    - "data-only": apenas populacao de dados
-    - "unavailable": sem endpoints minimos para iniciar a simulacao
+
+def supports_data_load(base_url: str) -> bool:
+    paths = resolve_openapi_paths(base_url)
+    if paths is None:
+        return True
+
+    normalized_paths = normalize_openapi_paths(paths)
+    required_load_paths = {"/customers", "/merchants", "/couriers"}
+    return required_load_paths <= normalized_paths
+
+
+def ensure_simulation_contract(base_url: str) -> bool:
+    """Valida se o ALB expoe o contrato necessario para simulacao completa.
+
+    Retorna True quando a API suporta o contrato final de courier.
+    Retorna False quando apenas a carga inicial pode rodar.
     """
     try:
         hello_payload = http_get_json(f"{base_url}/hello")
         if isinstance(hello_payload, dict) and hello_payload.get("service") == "routing-worker":
-            log(
+            raise RuntimeError(
                 "Simulacao indisponivel: o ALB atual aponta para o worker em modo teste "
                 "(services/worker/app/main2.py), sem endpoints de dominio (/customers, /merchants, /couriers, /orders, /couriers/me/location, /orders/{order_id}/picked_up, /orders/{order_id}/delivered)."
             )
-            return "unavailable"
     except RuntimeError:
         raise
     except Exception:
-        # Se /hello nao existir, seguimos para validacao via OpenAPI.
         pass
 
     paths = resolve_openapi_paths(base_url)
     if paths is None:
         log("Simulacao: OpenAPI indisponivel, seguindo sem validacao previa de contrato")
-        return "full"
+        return True
 
-    required_load_paths = {"/customers/", "/merchants/", "/couriers/"}
-    missing_load_paths = sorted(required_load_paths - paths)
+    normalized_paths = normalize_openapi_paths(paths)
+
+    required_load_paths = {"/customers", "/merchants", "/couriers"}
+    missing_load_paths = sorted(required_load_paths - normalized_paths)
     if missing_load_paths:
         log(
-            "Simulacao indisponivel: endpoints de carga nao encontrados no OpenAPI: "
+            "Simulacao: endpoints de carga ausentes no OpenAPI; seguindo sem carga via API: "
             + ", ".join(missing_load_paths)
         )
-        return "unavailable"
+        return False
 
-    required_delivery_paths = {"/orders/", "/orders/{id}", "/orders/{id}/status", "/locations"}
-    missing_delivery_paths = sorted(required_delivery_paths - paths)
-    if missing_delivery_paths:
-        log(
-            "Simulacao parcial: endpoints de pedidos/telemetria ausentes no OpenAPI; "
-            "sera executada apenas a populacao de dados. Faltando: "
-            + ", ".join(missing_delivery_paths)
-        )
-        return "data-only"
+    required_new_delivery_paths = {
+        "/orders",
+        "/couriers/me/order",
+        "/orders/{order_id}/accept",
+        "/couriers/me/location",
+        "/orders/{order_id}/picked_up",
+        "/orders/{order_id}/delivered",
+    }
 
-    return "full"
+    if required_new_delivery_paths <= normalized_paths:
+        log("Simulacao: contrato completo de courier detectado (accept + couriers/me/location + picked_up + delivered)")
+        return True
+
+    missing_new_paths = sorted(required_new_delivery_paths - normalized_paths)
+    log(
+        "Simulacao parcial: contrato final de courier incompleto; faltando: "
+        + ", ".join(missing_new_paths)
+    )
+    return False
 
 
 def run_simulation(
@@ -216,7 +242,8 @@ def run_simulation(
     graph_location: str,
 ) -> None:
     delivery_process = None
-    simulation_mode = ensure_simulation_contract(base_url)
+    can_load_data = supports_data_load(base_url)
+    full_simulation_supported = ensure_simulation_contract(base_url)
     auth_args: list[str] = []
     auth_env: dict[str, str] = {}
     if api_username and api_password:
@@ -229,8 +256,8 @@ def run_simulation(
             ["--bucket", bucket_name, "--file", graph_file, "--location", graph_location],
         )
 
-        if simulation_mode == "unavailable":
-            log("Simulacao: ignorada por incompatibilidade de contrato")
+        if not can_load_data:
+            log("Simulacao: pulando carga/sim_delivery/load-test por falta de endpoints de carga; deploy segue normalmente")
             return
 
         log("Simulacao: populando base via API")
@@ -240,7 +267,7 @@ def run_simulation(
             env=auth_env,
         )
 
-        if simulation_mode == "data-only":
+        if not full_simulation_supported:
             log("Simulacao: fase de pedidos/entregas ignorada por incompatibilidade de contrato")
             return
 
