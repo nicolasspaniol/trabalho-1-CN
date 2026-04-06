@@ -6,7 +6,6 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from urllib.error import HTTPError
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
@@ -344,36 +343,6 @@ def require_execution_role() -> str:
     return execution_role_arn
 
 
-def test_optional_endpoints(base_url: str) -> None:
-    paths = resolve_openapi_paths(base_url)
-
-    hello_url = f"{base_url}/hello?name=world"
-    if paths is None or "/hello" in paths:
-        log("Teste /hello")
-        try:
-            http_get_json(hello_url)
-        except HTTPError as error:
-            if error.code == 404:
-                log("Teste /hello: endpoint nao disponivel neste modo, seguindo")
-            else:
-                raise
-    else:
-        log("Teste /hello: endpoint ausente no OpenAPI, ignorado")
-
-    burn_url = f"{base_url}/cpu-burn?seconds=5&payload_kb=32"
-    if paths is None or "/cpu-burn" in paths:
-        log("Teste /cpu-burn")
-        try:
-            http_get_json(burn_url, timeout=30)
-        except HTTPError as error:
-            if error.code == 404:
-                log("Teste /cpu-burn: endpoint nao disponivel neste modo, seguindo")
-            else:
-                raise
-    else:
-        log("Teste /cpu-burn: endpoint ausente no OpenAPI, ignorado")
-
-
 def wait_service_ready(alb_dns: str) -> None:
     log("Resolucao DNS")
     wait_for_dns_resolution(alb_dns, log=log)
@@ -385,9 +354,10 @@ def wait_service_ready(alb_dns: str) -> None:
 
 def test_service(
     alb_dns: str,
-    include_optional: bool = True,
     include_readiness: bool = True,
-    require_graph_loaded: bool = False,
+    require_graph_loaded: bool = True,
+    require_db_connected: bool = True,
+    require_tables_ok: bool = True,
 ) -> None:
     base_url = f"http://{alb_dns}"
 
@@ -397,19 +367,36 @@ def test_service(
     health_url = f"{base_url}/health"
     log("Teste /health")
     wait_for_http_ok(health_url, log=log)
+    health_payload = http_get_json(health_url)
+    if not isinstance(health_payload, dict):
+        raise RuntimeError('Health check falhou: payload invalido.')
 
     if require_graph_loaded:
-        health_payload = http_get_json(health_url)
-        graph_loaded = bool(health_payload.get("graph_loaded")) if isinstance(health_payload, dict) else False
+        graph_loaded = bool(health_payload.get('graph_loaded'))
         if not graph_loaded:
-            graph_error = health_payload.get("graph_error") if isinstance(health_payload, dict) else None
+            graph_error = health_payload.get('graph_error')
             raise RuntimeError(
                 "Health check falhou: grafo nao carregado na task. "
                 f"graph_error={graph_error!r}"
             )
 
-    if include_optional:
-        test_optional_endpoints(base_url)
+    if require_db_connected:
+        db_connected = bool(health_payload.get('db_connected'))
+        if not db_connected:
+            db_error = health_payload.get('db_error')
+            raise RuntimeError(
+                'Health check falhou: conexao com RDS indisponivel na task. '
+                f'db_error={db_error!r}'
+            )
+
+    if require_tables_ok:
+        tables_ok = bool(health_payload.get('tables_ok'))
+        if not tables_ok:
+            missing_tables = health_payload.get('missing_tables')
+            raise RuntimeError(
+                'Health check falhou: tabelas obrigatorias ausentes no RDS. '
+                f'missing_tables={missing_tables!r}'
+            )
 
 
 def main(argv=None) -> int:
@@ -495,10 +482,22 @@ def main(argv=None) -> int:
             return 2
 
         log("Testes")
-        test_service(alb_dns, include_optional=True, include_readiness=False, require_graph_loaded=True)
+        test_service(
+            alb_dns,
+            include_readiness=False,
+            require_graph_loaded=True,
+            require_db_connected=True,
+            require_tables_ok=True,
+        )
     else:
         log("Testes")
-        test_service(alb_dns, include_optional=True, include_readiness=True, require_graph_loaded=False)
+        test_service(
+            alb_dns,
+            include_readiness=True,
+            require_graph_loaded=True,
+            require_db_connected=True,
+            require_tables_ok=True,
+        )
 
     if args.no_delete:
         log("Teardown: ignorado")

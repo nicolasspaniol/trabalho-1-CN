@@ -11,6 +11,9 @@ GRAPH = None
 GRAPH_LOAD_ERROR = None
 DB_POOL = None
 DB_POOL_ERROR = None
+REQUIRED_TABLES = (
+    'courier',
+)
 
 
 def try_load_graph_from_s3() -> bool:
@@ -105,6 +108,35 @@ def reserve_courier(courier_id: int) -> bool:
     finally:
         DB_POOL.putconn(conn)
 
+
+def check_db_health() -> tuple[bool, str | None, list[str]]:
+    '''Valida conexão com RDS e presença das tabelas esperadas.''' 
+    if not try_init_db_pool():
+        return False, DB_POOL_ERROR or 'Falha ao inicializar pool do RDS', list(REQUIRED_TABLES)
+
+    conn = DB_POOL.getconn()
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                '''
+                SELECT table_name
+                FROM information_schema.tables
+                WHERE table_schema = 'public'
+                  AND table_name = ANY(%s)
+                ''',
+                (list(REQUIRED_TABLES),),
+            )
+            rows = cursor.fetchall()
+
+        existing_tables = {table_name for (table_name,) in rows}
+        missing_tables = [table for table in REQUIRED_TABLES if table not in existing_tables]
+        return True, None, missing_tables
+    except Exception as error:
+        conn.rollback()
+        return False, str(error), list(REQUIRED_TABLES)
+    finally:
+        DB_POOL.putconn(conn)
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     '''Carrega o grafo da cidade de São Paulo na memória RAM.'''
@@ -114,6 +146,26 @@ async def lifespan(_: FastAPI):
 
 
 app = FastAPI(lifespan=lifespan)
+
+
+def get_edge_length(edge_info: dict) -> float:
+    '''Retorna comprimento de aresta para Graph/DiGraph e MultiGraph/MultiDiGraph.'''
+    if not isinstance(edge_info, dict) or not edge_info:
+        return 1
+
+    # Graph/DiGraph: edge_info ja e o dict de atributos da aresta.
+    if 'length' in edge_info:
+        return edge_info.get('length', 1)
+
+    lengths = []
+    # MultiGraph/MultiDiGraph: edge_info e um dict de chave->atributos.
+    for attributes in edge_info.values():
+        if isinstance(attributes, dict):
+            lengths.append(attributes.get('length', 1))
+
+    if not lengths:
+        return 1
+    return min(lengths)
 
 def reconstruct_path(predecessors: dict, target: int) -> list[int]:
     '''Reconstroi o caminho encontrado pelo Dilkstra'''
@@ -130,7 +182,7 @@ async def calculate_route(request: RouteRequest):
     if GRAPH is None:
         try_load_graph_from_s3()
     if GRAPH is None:
-        raise HTTPException(status_code=503, detail="Graph not loaded yet")
+        raise HTTPException(status_code=503, detail="Grafo não disponível: " + (GRAPH_LOAD_ERROR or "Erro desconhecido"))
 
     try:
         available_couriers = fetch_available_couriers()
@@ -143,7 +195,7 @@ async def calculate_route(request: RouteRequest):
 
     distances = {origin: 0}
     predecessors = {origin: origin}
-    p_queue = [(0, origin)] # Corrigido para lista para funcionar com heapq
+    p_queue = [(0, origin)]
     selected_courier = None
     node_of_courier = None
 
@@ -177,7 +229,7 @@ async def calculate_route(request: RouteRequest):
         # Visita dos os nós conectados no nó atual
         if node in GRAPH:
             for unvisited_node, edge_info in GRAPH[node].items():
-                distance = edge_info[0].get('length', 1)
+                distance = get_edge_length(edge_info)
                 new_dist = distance_node + distance
                 if new_dist < distances.get(unvisited_node, float('inf')):
                     distances[unvisited_node] = new_dist
@@ -186,7 +238,7 @@ async def calculate_route(request: RouteRequest):
 
     # Se a busca terminou em nenhum entregador foi encontrado, um erro é chamado
     if not selected_courier or not user_visited:
-        raise HTTPException(status_code=404, detail="No available couriers found.")
+        raise HTTPException(status_code=404, detail="Sem rota disponível: " + ("Nenhum entregador disponível" if not selected_courier else "Cliente inalcançável"))
 
     # Retorna na forma esperada
     return RouteResponse(
@@ -201,4 +253,16 @@ async def calculate_route(request: RouteRequest):
 async def health():
     if GRAPH is None:
         try_load_graph_from_s3()
-    return {"status": "ok", "graph_loaded": GRAPH is not None, "graph_error": GRAPH_LOAD_ERROR}
+    db_connected, db_error, missing_tables = check_db_health()
+    graph_loaded = GRAPH is not None
+
+    status = 'ok' if graph_loaded and db_connected and not missing_tables else 'degraded'
+    return {
+        'status': status,
+        'graph_loaded': graph_loaded,
+        'graph_error': GRAPH_LOAD_ERROR,
+        'db_connected': db_connected,
+        'db_error': db_error,
+        'tables_ok': not missing_tables,
+        'missing_tables': missing_tables,
+    }
