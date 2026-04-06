@@ -1,8 +1,17 @@
 [project]
-name="api"
+name="dijkfood_api"
 version="0.1.0"
 requires-python = ">=3.13"
 dependencies = [
+    "boto3>=1.42.83",
     "fastapi[standard]>=0.135.2",
-    "psycopg2>=2.9.11",
+    "psycopg[binary,pool]>=3.3.3",
+    "requests>=2.33.1",
+    "sqlmodel>=0.0.37",
 ]
+
+[dependency-groups]
+local = ["shared"]
+
+[tool.uv.sources]
+shared = { path = "../../shared", editable = true }

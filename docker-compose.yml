@@ -1,0 +1,37 @@
+services:
+  db:
+    image: postgres
+    restart: always
+    shm_size: 128mb
+    env_file: ".env"
+    environment:
+      POSTGRES_PASSWORD: "${DB_PASSWORD}"
+      POSTGRES_USER: "${DB_USERNAME}"
+      POSTGRES_DB: "${DB_NAME}"
+    volumes:
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql
+
+  dynamodb:
+    image: amazon/dynamodb-local
+    ports:
+      - "8020:8000"
+    command: "-jar DynamoDBLocal.jar -inMemory -sharedDb"
+
+  worker:
+    build:
+      context: .
+      dockerfile: dummy_worker/Dockerfile
+    ports:
+      - "8010:8010"
+
+  api:
+    env_file: ".env"
+    build:
+      context: .
+      dockerfile: services/api/Dockerfile
+    ports:
+      - "8000:80"
+    depends_on:
+      - dynamodb
+      - worker
+      - db

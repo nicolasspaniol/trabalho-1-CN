@@ -1,5 +1,5 @@
 [project]
-name = "dijkfood-worker"
+name = "dijkfood_worker"
 version = "0.1.0"
 dependencies = [
     "fastapi[standard]",
