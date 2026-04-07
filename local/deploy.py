@@ -559,6 +559,8 @@ def main(argv=None) -> int:
     execution_role_arn = require_execution_role()
     os.environ["EXECUTION_ROLE_ARN"] = execution_role_arn
 
+    log("Deploy dados: garantindo bucket S3 antes do upload do grafo")
+    create_data.setup_s3_bucket(bucket_name)
     ensure_graph_in_s3(bucket_name, args.graph_file, args.graph_location)
 
     log("Deploy")
