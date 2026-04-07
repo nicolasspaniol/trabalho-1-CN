@@ -71,9 +71,11 @@ async def fetch_courier_ids(session: aiohttp.ClientSession, api_url: str) -> lis
 
     courier_ids: list[int] = []
     for item in payload:
-        if isinstance(item, dict) and "id" in item:
+        if isinstance(item, dict):
+            value = item.get("id", item.get("user_id"))
             try:
-                courier_ids.append(int(item["id"]))
+                if value is not None:
+                    courier_ids.append(int(value))
             except (TypeError, ValueError):
                 continue
     return courier_ids
@@ -118,11 +120,16 @@ async def get_merchant_address(session: aiohttp.ClientSession, api_url: str, mer
         return None
 
 
-async def update_courier_location(session: aiohttp.ClientSession, api_url: str, location: int) -> bool:
+async def update_courier_location(
+    session: aiohttp.ClientSession,
+    location_api_url: str,
+    order_id: int,
+    location: int,
+) -> bool:
     try:
         async with session.put(
-            f"{api_url.rstrip('/')}/couriers/me/location",
-            params={"location": location},
+            f"{location_api_url.rstrip('/')}/couriers/me/location",
+            params={"order_id": order_id, "location": location},
         ) as response:
             response.raise_for_status()
             return True
@@ -184,6 +191,7 @@ async def accept_order(session: aiohttp.ClientSession, api_url: str, order_id: i
 async def deliver_order_new(
     session: aiohttp.ClientSession,
     api_url: str,
+    location_api_url: str,
     order: dict[str, Any],
     can_mark_delivered: bool,
 ) -> bool:
@@ -204,7 +212,7 @@ async def deliver_order_new(
         if isinstance(path_to_user, list) and path_to_user:
             try:
                 customer_node = int(path_to_user[-1])
-                await update_courier_location(session, api_url, customer_node)
+                await update_courier_location(session, location_api_url, order_id, customer_node)
             except (TypeError, ValueError):
                 pass
 
@@ -218,6 +226,7 @@ async def deliver_order_new(
 
 async def run_courier_loop(
     api_url: str,
+    location_api_url: str,
     courier_username: str,
     delivery_mode: str,
     can_mark_delivered: bool,
@@ -238,7 +247,11 @@ async def run_courier_loop(
                     await asyncio.sleep(2)
                     continue
 
-                order_id = int(current_order.get("id"))
+                order_id_value = current_order.get("id")
+                if order_id_value is None:
+                    await asyncio.sleep(2)
+                    continue
+                order_id = int(order_id_value)
                 status = current_order.get("status")
 
                 if order_id == last_handled_order_id:
@@ -246,10 +259,16 @@ async def run_courier_loop(
                     continue
 
                 if delivery_mode == NEW_DELIVERY_MODE:
-                    if status != "READY_FOR_PICKUP":
+                    if not str(status).upper().endswith("READY_FOR_PICKUP"):
                         await asyncio.sleep(2)
                         continue
-                    handled = await deliver_order_new(session, api_url, current_order, can_mark_delivered)
+                    handled = await deliver_order_new(
+                        session,
+                        api_url,
+                        location_api_url,
+                        current_order,
+                        can_mark_delivered,
+                    )
                     if handled:
                         last_handled_order_id = order_id
                 else:
@@ -265,7 +284,12 @@ async def run_courier_loop(
             await asyncio.sleep(2)
 
 
-async def delivery_worker(api_url: str, username: str | None = None, password: str | None = None):
+async def delivery_worker(
+    api_url: str,
+    location_api_url: str | None = None,
+    username: str | None = None,
+    password: str | None = None,
+):
     """
     Simula um courier monitorando sua fila de pedidos.
 
@@ -278,6 +302,8 @@ async def delivery_worker(api_url: str, username: str | None = None, password: s
     password = password or os.getenv("API_PASSWORD")
 
     admin_auth = aiohttp.BasicAuth(username, password) if username and password else None
+    location_api_url = location_api_url or api_url
+
     async with aiohttp.ClientSession(auth=admin_auth) as admin_session:
         courier_ids = await fetch_courier_ids(admin_session, api_url)
 
@@ -293,9 +319,16 @@ async def delivery_worker(api_url: str, username: str | None = None, password: s
         return
 
     async with aiohttp.ClientSession(auth=admin_auth) as session:
-        paths = await fetch_openapi_paths(session, api_url)
+        api_paths = await fetch_openapi_paths(session, api_url)
+        location_paths = await fetch_openapi_paths(session, location_api_url)
+        paths = set()
+        if api_paths:
+            paths.update(api_paths)
+        if location_paths:
+            paths.update(location_paths)
+
         delivery_mode = resolve_delivery_mode(paths)
-        can_mark_delivered = supports_delivered(paths)
+        can_mark_delivered = supports_delivered(api_paths)
 
         if delivery_mode == NEW_DELIVERY_MODE:
             if can_mark_delivered:
@@ -309,6 +342,7 @@ async def delivery_worker(api_url: str, username: str | None = None, password: s
             asyncio.create_task(
                 run_courier_loop(
                     api_url=api_url,
+                    location_api_url=location_api_url,
                     courier_username=courier_username,
                     delivery_mode=delivery_mode,
                     can_mark_delivered=can_mark_delivered,
@@ -322,8 +356,20 @@ async def delivery_worker(api_url: str, username: str | None = None, password: s
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Central de Entregadores DijkFood")
     parser.add_argument("--api-url", required=True, help="URL base da API (ALB)")
+    parser.add_argument(
+        "--location-api-url",
+        default=None,
+        help="URL base da API de location (ALB). Quando omitida, usa --api-url.",
+    )
     parser.add_argument("--username", default=None, help="Usuario Basic Auth da API")
     parser.add_argument("--password", default=None, help="Senha Basic Auth da API")
     args = parser.parse_args()
 
-    asyncio.run(delivery_worker(args.api_url, username=args.username, password=args.password))
+    asyncio.run(
+        delivery_worker(
+            args.api_url,
+            location_api_url=args.location_api_url,
+            username=args.username,
+            password=args.password,
+        )
+    )

@@ -35,7 +35,7 @@ COPY --from=builder /app/services/location/.venv .venv
 ENV PATH="/app/services/location/.venv/bin:$PATH"
 
 # Copia o código do servidor pro container
-COPY /services/location/*.py ./
+COPY services/location/*.py ./
 
 EXPOSE 80
 

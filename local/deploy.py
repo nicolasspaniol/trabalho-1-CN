@@ -29,6 +29,9 @@ from local.constants import (
     API_TARGET_GROUP_NAME,
     CLUSTER_NAME,
     LOAD_BALANCER_NAME,
+    LOCATION_LOAD_BALANCER_NAME,
+    LOCATION_SERVICE_NAME,
+    LOCATION_TARGET_GROUP_NAME,
     REGION,
     SERVICE_NAME,
     TABLE_NAME,
@@ -191,7 +194,7 @@ def supports_data_load(base_url: str) -> bool:
     return required_load_paths <= normalized_paths
 
 
-def ensure_simulation_contract(base_url: str) -> bool:
+def ensure_simulation_contract(base_url: str, location_base_url: str | None = None) -> bool:
     """Valida se o ALB expoe o contrato necessario para simulacao completa.
 
     Retorna True quando a API suporta o contrato final de courier.
@@ -210,11 +213,16 @@ def ensure_simulation_contract(base_url: str) -> bool:
         pass
 
     paths = resolve_openapi_paths(base_url)
-    if paths is None:
+    location_paths = resolve_openapi_paths(location_base_url) if location_base_url else None
+    if paths is None and location_paths is None:
         log("Simulacao: OpenAPI indisponivel, seguindo sem validacao previa de contrato")
         return True
 
-    normalized_paths = normalize_openapi_paths(paths)
+    normalized_paths = set()
+    if paths is not None:
+        normalized_paths.update(normalize_openapi_paths(paths))
+    if location_paths is not None:
+        normalized_paths.update(normalize_openapi_paths(location_paths))
 
     required_load_paths = {"/customers", "/merchants", "/couriers"}
     missing_load_paths = sorted(required_load_paths - normalized_paths)
@@ -257,10 +265,11 @@ def run_simulation(
     bucket_name: str,
     graph_file: str,
     graph_location: str,
+    location_base_url: str | None,
 ) -> None:
     delivery_process = None
     can_load_data = supports_data_load(base_url)
-    full_simulation_supported = ensure_simulation_contract(base_url)
+    full_simulation_supported = ensure_simulation_contract(base_url, location_base_url)
     auth_args: list[str] = []
     auth_env: dict[str, str] = {}
     if api_username and api_password:
@@ -291,7 +300,15 @@ def run_simulation(
 
         log("Simulacao: iniciando sim_delivery em background")
         delivery_process = subprocess.Popen(
-            [sys.executable, str(PROJECT_ROOT / "local" / "sim_delivery.py"), "--api-url", base_url, *auth_args],
+            [
+                sys.executable,
+                str(PROJECT_ROOT / "local" / "sim_delivery.py"),
+                "--api-url",
+                base_url,
+                "--location-api-url",
+                location_base_url or base_url,
+                *auth_args,
+            ],
             cwd=str(PROJECT_ROOT),
             env={**os.environ, **auth_env},
         )
@@ -369,12 +386,29 @@ def run_deployment(execution_role_arn: str, bucket_name: str) -> None:
         )
     )
 
+    log("Deploy location: criando servico de telemetria")
+    create_infra.setup_location_infrastructure(
+        region=REGION,
+        cluster_name=CLUSTER_NAME,
+        service_name=LOCATION_SERVICE_NAME,
+        execution_role_arn=execution_role_arn,
+    )
+
+    location_alb_dns = str(
+        wait_for_load_balancer_dns(
+            boto3.client("elbv2", region_name=REGION),
+            LOCATION_LOAD_BALANCER_NAME,
+            log=log,
+        )
+    )
+
     log("Deploy API: criando servico FastAPI de dominio")
     create_infra.setup_api_infrastructure(
         region=REGION,
         cluster_name=CLUSTER_NAME,
         service_name=API_SERVICE_NAME,
         worker_base_url=f"http://{worker_alb_dns}",
+        location_base_url=f"http://{location_alb_dns}",
         db_host=os.environ["DB_HOST"],
         db_password=os.environ["DB_PASSWORD"],
         execution_role_arn=execution_role_arn,
@@ -414,8 +448,15 @@ def test_api_service(base_url: str) -> None:
     wait_for_http_ok(openapi_url, log=log)
 
 
+def test_location_service(base_url: str) -> None:
+    health_url = f"{base_url}/health"
+    log("Teste location /health")
+    wait_for_http_ok(health_url, log=log)
+
+
 def test_service(
     alb_dns: str,
+    target_group_name: str,
     include_readiness: bool = True,
     require_graph_loaded: bool = True,
     require_db_connected: bool = True,
@@ -424,13 +465,16 @@ def test_service(
     base_url = f"http://{alb_dns}"
 
     if include_readiness:
-        wait_service_ready(alb_dns)
+        wait_service_ready(alb_dns, target_group_name)
 
     health_url = f"{base_url}/health"
     log("Teste /health")
     wait_for_http_ok(health_url, log=log)
     health_payload = http_get_json(health_url)
     if not isinstance(health_payload, dict):
+        # Alguns servicos expõem /health minimalista (boolean).
+        if health_payload is True and not (require_graph_loaded or require_db_connected or require_tables_ok):
+            return
         raise RuntimeError('Health check falhou: payload invalido.')
 
     if require_graph_loaded:
@@ -529,14 +573,21 @@ def main(argv=None) -> int:
     api_alb_dns = str(wait_for_load_balancer_dns(elbv2, API_LOAD_BALANCER_NAME, log=log))
     log(f"DNS API: {api_alb_dns}")
 
+    log("ALB location")
+    location_alb_dns = str(wait_for_load_balancer_dns(elbv2, LOCATION_LOAD_BALANCER_NAME, log=log))
+    log(f"DNS location: {location_alb_dns}")
+
     worker_base_url = f"http://{worker_alb_dns}"
     api_base_url = f"http://{api_alb_dns}"
+    location_base_url = f"http://{location_alb_dns}"
 
     if args.with_simulation:
         log("Readiness worker")
         wait_service_ready(worker_alb_dns, TARGET_GROUP_NAME)
         log("Readiness API")
         wait_service_ready(api_alb_dns, API_TARGET_GROUP_NAME)
+        log("Readiness location")
+        wait_service_ready(location_alb_dns, LOCATION_TARGET_GROUP_NAME)
 
         simulation_base_url = resolve_simulation_base_url(api_base_url, args.simulation_api_url)
         if simulation_base_url == api_base_url and not supports_data_load(simulation_base_url):
@@ -559,6 +610,7 @@ def main(argv=None) -> int:
                 bucket_name=bucket_name,
                 graph_file=args.graph_file,
                 graph_location=args.graph_location,
+                location_base_url=location_base_url,
             )
         except RuntimeError as error:
             log(str(error))
@@ -567,23 +619,40 @@ def main(argv=None) -> int:
         log("Testes")
         test_service(
             worker_alb_dns,
+            TARGET_GROUP_NAME,
             include_readiness=False,
             require_graph_loaded=True,
             require_db_connected=True,
             require_tables_ok=True,
         )
         test_api_service(api_base_url)
+        test_location_service(location_base_url)
     else:
         log("Testes")
         test_service(
             worker_alb_dns,
+            TARGET_GROUP_NAME,
             include_readiness=True,
             require_graph_loaded=True,
             require_db_connected=True,
             require_tables_ok=True,
         )
-        wait_service_ready(api_alb_dns, API_TARGET_GROUP_NAME)
-        test_api_service(api_base_url)
+        test_service(
+            api_alb_dns,
+            API_TARGET_GROUP_NAME,
+            include_readiness=True,
+            require_graph_loaded=False,
+            require_db_connected=False,
+            require_tables_ok=False,
+        )
+        test_service(
+            location_alb_dns,
+            LOCATION_TARGET_GROUP_NAME,
+            include_readiness=True,
+            require_graph_loaded=False,
+            require_db_connected=False,
+            require_tables_ok=False,
+        )
 
     if args.no_delete:
         log("Teardown: ignorado")

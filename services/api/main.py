@@ -1,16 +1,16 @@
-from fastapi.responses import JSONResponse
-from sqlalchemy.exc import IntegrityError
-from fastapi import FastAPI, APIRouter, HTTPException, Depends, Request, Query, status, BackgroundTasks
-from fastapi.security import HTTPBasic, HTTPBasicCredentials
-from sqlmodel import SQLModel, create_engine, Session, select, delete
-from secrets import compare_digest
 from os import getenv
+from secrets import compare_digest
 from typing import Annotated, Optional
-import boto3
-from boto3.resources.base import ServiceResource
-import requests
 
-# Dependências locais
+import boto3
+import requests
+from boto3.resources.base import ServiceResource
+from fastapi import APIRouter, BackgroundTasks, Depends, FastAPI, HTTPException, Query, Request, status
+from fastapi.responses import JSONResponse
+from fastapi.security import HTTPBasic, HTTPBasicCredentials
+from sqlalchemy.exc import IntegrityError
+from sqlmodel import SQLModel, Session, create_engine, delete, select
+
 import models as em
 import rest
 
@@ -18,53 +18,29 @@ import rest
 app = FastAPI()
 security = HTTPBasic()
 
-WORKER_URL = getenv("WORKER_URL")
+WORKER_URL = getenv("WORKER_URL", "").strip()
+LOCATION_URL = getenv("LOCATION_URL", "").strip()
 
 COURIER_LOCATION_TABLE = "CourierLocation"
 DELIVERY_ROUTE_TABLE = "DeliveryRoute"
 
-ADMIN_USERNAME = getenv("ADMIN_USERNAME")
-ADMIN_PASSWORD = getenv("ADMIN_PASSWORD")
+ADMIN_USERNAME = getenv("ADMIN_USERNAME", "admin")
+ADMIN_PASSWORD = getenv("ADMIN_PASSWORD", "admin")
 
 DATABASE_URL = (
-    f"postgresql+psycopg://"
-    f"{getenv("DB_USERNAME")}:"
-    f"{getenv("DB_PASSWORD")}@"
-    f"{getenv("DB_HOST")}:"
-    f"{getenv("DB_PORT")}/"
-    f"{getenv("DB_NAME")}"
+    "postgresql+psycopg://"
+    f"{getenv('DB_USERNAME', 'postgres')}:"
+    f"{getenv('DB_PASSWORD', '')}@"
+    f"{getenv('DB_HOST', 'localhost')}:"
+    f"{getenv('DB_PORT', '5432')}/"
+    f"{getenv('DB_NAME', 'postgres')}"
 )
 db_engine = create_engine(DATABASE_URL)
 
-dynamodb = boto3.resource(
-    "dynamodb",
-    region_name=getenv("DYNAMODB_REGION"),
-    endpoint_url=getenv("DYNAMODB_URL"),
-    aws_access_key_id=getenv("DYNAMODB_ACCESS_KEY_ID"),
-    aws_secret_access_key=getenv("DYNAMODB_SECRET_ACCESS_KEY"),
-)
-
-NOT_FOUND = { 404: { "description": "Not found" } }
+NOT_FOUND = {404: {"description": "Not found"}}
 
 
-# HELPERS -------------------------------------
-
-def assert_exists(obj, id, name):
-    msg = f"{str.title(name)} with ID {id} not found"
-
-    if not obj:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=msg)
-
-
-def get_dynamo_item(table, order_id: int):
-    return table \
-        .get_item(Key={"Order_ID": order_id}) \
-        .get("Item")
-    
-
-# DEPENDÊNCIAS -------------------------------------
-
-def get_dynamodb():
+def get_dynamodb() -> ServiceResource:
     return boto3.resource(
         "dynamodb",
         region_name=getenv("DYNAMODB_REGION"),
@@ -79,112 +55,153 @@ def get_session():
         yield session
 
 
-def get_auth(credentials: HTTPBasicCredentials = Depends(security)):
+def get_auth(credentials: HTTPBasicCredentials = Depends(security)) -> str:
     username_is_correct = compare_digest(credentials.username, ADMIN_USERNAME)
     password_is_correct = compare_digest(credentials.password, ADMIN_PASSWORD)
-
     if username_is_correct and password_is_correct:
         return credentials.username
-    else:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid credentials",
-            headers={"WWW-Authenticate": "Basic"},
-        )
+    raise HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Invalid credentials",
+        headers={"WWW-Authenticate": "Basic"},
+    )
 
 
 def get_user(model):
-    def f(session: SessionDep, credentials: HTTPBasicCredentials = Depends(security)):
-        if str.isnumeric(credentials.username):
+    def dependency(session: SessionDep, credentials: HTTPBasicCredentials = Depends(security)):
+        if credentials.username.isnumeric():
             user = session.get(model, int(credentials.username))
-
             if user:
                 return user
-
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid credentials",
             headers={"WWW-Authenticate": "Basic"},
         )
 
-    return f
+    return dependency
 
 
-# Armazenamento
+def get_dynamo_item(table, order_id: int):
+    return table.get_item(Key={"Order_ID": order_id}).get("Item")
+
+
+def assert_exists(obj, obj_id: int, name: str) -> None:
+    if not obj:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"{name.title()} with ID {obj_id} not found",
+        )
+
+
+def add_order_event(order: em.Order, new_status: em.OrderStatus) -> None:
+    order.events.append(em.OrderEvent(updated_status=new_status))
+
+
+def order_status_transition(order: em.Order, old_status: em.OrderStatus, new_status: em.OrderStatus) -> None:
+    if order.status != old_status:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid state transition")
+    order.status = new_status
+    add_order_event(order, new_status)
+
+
+def write_courier_location(dynamo: ServiceResource, order_id: int, location: int) -> None:
+    if LOCATION_URL:
+        try:
+            requests.put(
+                f"{LOCATION_URL.rstrip('/')}/couriers/me/location",
+                params={"order_id": order_id},
+                json={"location": location},
+                timeout=5,
+            ).raise_for_status()
+            return
+        except Exception:
+            pass
+
+    dynamo.Table(COURIER_LOCATION_TABLE).put_item(
+        Item={
+            "Order_ID": order_id,
+            "Location": location,
+        }
+    )
+
+
 SessionDep = Annotated[Session, Depends(get_session)]
 DynamoDep = Annotated[ServiceResource, Depends(get_dynamodb)]
 
-# "Autenticação"
-AdminDep = Annotated[None, Depends(get_auth)]
+AdminDep = Annotated[str, Depends(get_auth)]
 UserDep = Annotated[em.User, Depends(get_user(em.User))]
 CustomerDep = Annotated[em.Customer, Depends(get_user(em.Customer))]
-MerchantDep = Annotated[em.Merchant, Depends(get_user(em.Merchant))]
+MerchantDep = Annotated[em.User, Depends(get_user(em.User))]
 CourierDep = Annotated[em.Courier, Depends(get_user(em.Courier))]
 
-# Outros
 Limit = Annotated[int, Query(ge=1, le=100)]
 
-
-# OUTROS HANDLERS -------------------------------------
 
 @app.exception_handler(IntegrityError)
 async def integrity_exception_handler(_req: Request, _exc: IntegrityError):
     return JSONResponse(
         status_code=status.HTTP_400_BAD_REQUEST,
-        content={"detail": "Database constraint violation"}
+        content={"detail": "Database constraint violation"},
     )
 
 
 @app.on_event("startup")
-def ensure_table():
-    # Mantem o banco alinhado com os modelos atuais, mesmo quando schema.sql estiver desatualizado.
-    SQLModel.metadata.create_all(db_engine)
+def ensure_tables() -> None:
+    # Nao derruba o processo por indisponibilidade temporaria do banco.
+    try:
+        SQLModel.metadata.create_all(db_engine)
+    except Exception as exc:
+        print(f"[startup] aviso: falha ao inicializar schema SQL: {exc}")
 
-    existing = dynamodb.meta.client.list_tables()["TableNames"]
+    # Nao derruba o processo por indisponibilidade temporaria do DynamoDB.
+    try:
+        dynamodb = get_dynamodb()
+        existing = dynamodb.meta.client.list_tables()["TableNames"]
 
-    if "CourierLocation" not in existing:
-        dynamodb.create_table(
-            TableName="CourierLocation",
-            KeySchema=[
-                {"AttributeName": "Order_ID", "KeyType": "HASH"},
-            ],
-            AttributeDefinitions=[
-                {"AttributeName": "Order_ID", "AttributeType": "N"},
-            ],
-            BillingMode="PAY_PER_REQUEST",
-        )
+        if COURIER_LOCATION_TABLE not in existing:
+            dynamodb.create_table(
+                TableName=COURIER_LOCATION_TABLE,
+                KeySchema=[{"AttributeName": "Order_ID", "KeyType": "HASH"}],
+                AttributeDefinitions=[{"AttributeName": "Order_ID", "AttributeType": "N"}],
+                BillingMode="PAY_PER_REQUEST",
+            )
 
-    if "DeliveryRoute" not in existing:
-        dynamodb.create_table(
-            TableName="DeliveryRoute",
-            KeySchema=[
-                {"AttributeName": "Order_ID", "KeyType": "HASH"},
-            ],
-            AttributeDefinitions=[
-                {"AttributeName": "Order_ID", "AttributeType": "N"},
-            ],
-            BillingMode="PAY_PER_REQUEST",
-        )
+        if DELIVERY_ROUTE_TABLE not in existing:
+            dynamodb.create_table(
+                TableName=DELIVERY_ROUTE_TABLE,
+                KeySchema=[{"AttributeName": "Order_ID", "KeyType": "HASH"}],
+                AttributeDefinitions=[{"AttributeName": "Order_ID", "AttributeType": "N"}],
+                BillingMode="PAY_PER_REQUEST",
+            )
+    except Exception as exc:
+        print(f"[startup] aviso: falha ao inicializar DynamoDB: {exc}")
 
-
-# CUSTOMER ----------------------------------------------
 
 customers = APIRouter(prefix="/customers", tags=["Customer"])
+merchants = APIRouter(prefix="/merchants", tags=["Merchant"])
+couriers = APIRouter(prefix="/couriers", tags=["Courier"])
+orders = APIRouter(prefix="/orders", tags=["Order"])
 
 
 @customers.post("/", status_code=status.HTTP_201_CREATED, response_model=em.CustomerPublic)
 def create_customer(customer: em.CustomerCreate, session: SessionDep, _auth: AdminDep):
+    user = em.User(role=em.UserRole.customer)
+    session.add(user)
+    session.flush()
     customer_db = em.Customer(
-        **customer.model_dump(),
-        user=em.User(role=em.UserRole.customer)
+        user_id=user.id,
+        name=customer.name,
+        email=customer.email,
+        phone=customer.phone,
+        address=customer.address,
     )
-
     session.add(customer_db)
     session.commit()
     session.refresh(customer_db)
-
     return customer_db
-    
+
+
 @customers.get("/", response_model=list[em.CustomerPublic])
 def get_all_customers(session: SessionDep, _auth: AdminDep, offset: int = 0, limit: Limit = 100):
     return rest.get_all(session, em.Customer, offset, limit)
@@ -215,26 +232,32 @@ def delete_customer(id: int, session: SessionDep, _auth: AdminDep):
     return rest.delete(session, em.Customer, id)
 
 
-# MERCHANT ------------------------------------------------
-
-merchants = APIRouter(prefix="/merchants", tags=["Merchant"])
-
-
 @merchants.post("/", status_code=status.HTTP_201_CREATED, response_model=em.MerchantPublic)
 def create_merchant(merchant: em.MerchantCreate, session: SessionDep, _auth: AdminDep):
+    user = em.User(role=em.UserRole.merchant)
+    session.add(user)
+    session.flush()
     merchant_db = em.Merchant(
-        **merchant.model_dump(exclude={"items"}),
-        user=em.User(role=em.UserRole.merchant),
-        items=[em.Item.model_validate(item) for item in merchant.items]
+        user_id=user.id,
+        name=merchant.name,
+        type=merchant.type,
+        address=merchant.address,
     )
-
     session.add(merchant_db)
+    session.flush()
+    for item in merchant.items:
+        item_db = em.Item(
+            name=item.name,
+            preparation_time=item.preparation_time,
+            price=item.price,
+            merchant_id=merchant_db.user_id,
+        )
+        session.add(item_db)
     session.commit()
     session.refresh(merchant_db)
-
     return merchant_db
 
-    
+
 @merchants.get("/", response_model=list[em.MerchantPublic])
 def get_all_merchants(session: SessionDep, _auth: AdminDep, offset: int = 0, limit: Limit = 100):
     return rest.get_all(session, em.Merchant, offset, limit)
@@ -247,7 +270,7 @@ def get_merchant(id: int, session: SessionDep, _auth: AdminDep):
 
 @merchants.get("/me", response_model=em.MerchantPublic)
 def get_own_merchant(merchant: MerchantDep, session: SessionDep):
-    return rest.get_one(session, em.Merchant, merchant.user_id)
+    return rest.get_one(session, em.Merchant, merchant.id)
 
 
 @merchants.put("/{id}", responses=NOT_FOUND)
@@ -256,16 +279,10 @@ def replace_merchant(id: int, merchant: em.MerchantCreate, session: SessionDep, 
     if not db_merchant:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Object not found")
 
-    db_merchant.sqlmodel_update(
-        merchant.model_dump(exclude={"items"})
-    )
-
+    db_merchant.sqlmodel_update(merchant.model_dump(exclude={"items"}))
     for item in db_merchant.items:
         session.delete(item)
-
-    db_merchant.items = [
-        em.Item.model_validate(item) for item in merchant.items
-    ]
+    db_merchant.items = [em.Item.model_validate(item) for item in merchant.items]
 
     session.add(db_merchant)
     session.commit()
@@ -280,17 +297,12 @@ def update_merchant(id: int, merchant: em.MerchantUpdate, session: SessionDep, _
 
     data = merchant.model_dump(exclude_unset=True)
     items_data = data.pop("items", None)
-
     db_merchant.sqlmodel_update(data)
 
     if items_data is not None:
         for item in db_merchant.items:
             session.delete(item)
-
-        db_merchant.items = [
-            em.Item.model_validate(item)
-            for item in items_data
-        ]
+        db_merchant.items = [em.Item.model_validate(item) for item in items_data]
 
     session.add(db_merchant)
     session.commit()
@@ -299,28 +311,25 @@ def update_merchant(id: int, merchant: em.MerchantUpdate, session: SessionDep, _
 
 @merchants.delete("/{id}", status_code=status.HTTP_204_NO_CONTENT, responses=NOT_FOUND)
 def delete_merchant(id: int, session: SessionDep, _auth: AdminDep):
-    session.exec(
-        delete(em.Item).where(em.Item.merchant_id == id)
-    )
+    session.exec(delete(em.Item).where(em.Item.merchant_id == id))
     return rest.delete(session, em.Merchant, id)
-
-
-# COURIER -------------------------------------------------
-
-couriers = APIRouter(prefix="/couriers", tags=["Courier"])
 
 
 @couriers.post("/", status_code=status.HTTP_201_CREATED, response_model=em.CourierPublic)
 def create_courier(courier: em.CourierCreate, session: SessionDep, _auth: AdminDep):
+    user = em.User(role=em.UserRole.courier)
+    session.add(user)
+    session.flush()
     courier_db = em.Courier(
-        **courier.model_dump(),
-        user=em.User(role=em.UserRole.courier)
+        user_id=user.id,
+        name=courier.name,
+        location=courier.location,
+        vehicle_type=courier.vehicle_type,
+        availability=courier.availability,
     )
-
     session.add(courier_db)
     session.commit()
     session.refresh(courier_db)
-
     return courier_db
 
 
@@ -330,8 +339,8 @@ def get_all_couriers(session: SessionDep, _auth: AdminDep, offset: int = 0, limi
 
 
 @couriers.get("/me", response_model=em.CourierPublic)
-def get_own_courier(id: int, session: SessionDep, courier: CourierDep):
-    return rest.get_one(session, em.Customer, courier.user_id)
+def get_own_courier(session: SessionDep, courier: CourierDep):
+    return rest.get_one(session, em.Courier, courier.user_id)
 
 
 @couriers.get("/{id}", response_model=em.CourierPublic, responses=NOT_FOUND)
@@ -354,107 +363,118 @@ def delete_courier(id: int, session: SessionDep, _auth: AdminDep):
     return rest.delete(session, em.Courier, id)
 
 
-# ORDER --------------------------------------------------
+@couriers.get("/me/order", response_model=em.OrderPublicComplete, responses=NOT_FOUND, tags=["Order"])
+def get_assigned_order(session: SessionDep, courier: CourierDep, dynamo: DynamoDep):
+    order = session.exec(
+        select(em.Order).where(
+            em.Order.courier_id == courier.user_id,
+            em.Order.status.in_([em.OrderStatus.ready_for_pickup, em.OrderStatus.picked_up, em.OrderStatus.in_transit]),
+        )
+    ).first()
 
-def look_for_courier(
-    order: em.Order,
-    customer_address: int,
-    merchant_address: int,
-    session: Session,
-    dynamo: ServiceResource,
-):
-    # 1. Encontrar entregador e rota
-    payload = {
-        "merchant_node": merchant_address,
-        "user_node": customer_address,
-    }
+    if not order:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No active order")
 
-    response = requests.post(f"{WORKER_URL}/calculate-route", json=payload)
+    order_public = em.OrderPublicComplete.model_validate(order, from_attributes=True)
 
+    delivery_route = get_dynamo_item(dynamo.Table(DELIVERY_ROUTE_TABLE), order.id)
+    if delivery_route:
+        order_public.delivery_route = em.DeliveryRoute.from_dynamo(delivery_route)
+
+    courier_location = get_dynamo_item(dynamo.Table(COURIER_LOCATION_TABLE), order.id)
+    if courier_location:
+        order_public.courier_location = em.CourierLocation.from_dynamo(courier_location)
+
+    return order_public
+
+
+@couriers.put("/me/location")
+def update_courier_location(location: int, session: SessionDep, courier: CourierDep, dynamo: DynamoDep):
+    order = session.exec(
+        select(em.Order).where(
+            em.Order.courier_id == courier.user_id,
+            em.Order.status == em.OrderStatus.in_transit,
+        )
+    ).first()
+
+    if not order:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No active order in transit")
+
+    write_courier_location(dynamo, order.id, location)
+    return {"status": "updated"}
+
+
+def look_for_courier(order_id: int, customer_address: int, merchant_address: int):
+    if not WORKER_URL:
+        return
+
+    response = requests.post(
+        f"{WORKER_URL.rstrip('/')}/calculate-route",
+        json={"merchant_node": merchant_address, "user_node": customer_address},
+        timeout=10,
+    )
     if response.status_code != 200:
         return
 
     data = response.json()
-
-    # 2. Extrair dados da resposta
-    courier_id = data["courier_id"]
-
-    # 3. Atribuir entregador no BD
-    order.courier_id = courier_id
-
-    courier = session.get(em.Courier, courier_id)
-    if courier:
-        courier.availability = False
-        session.add(courier)
-
-    # 4. Armazenar rota no DynamoDB (DeliveryRoute)
+    courier_id = int(data["courier_id"])
 
     route = em.DeliveryRoute(
-        courier_id = courier_id,
-        distance_to_merchant = int(data["distance_to_merchant"]),
-        path_to_merchant = data["path_to_merchant"],
-        distance_to_user = int(data["distance_to_user"]),
-        path_to_user = data["path_to_user"],
+        courier_id=courier_id,
+        distance_to_merchant=int(data["distance_to_merchant"]),
+        path_to_merchant=[int(node) for node in data["path_to_merchant"]],
+        distance_to_user=int(data["distance_to_user"]),
+        path_to_user=[int(node) for node in data["path_to_user"]],
     )
 
-    dynamo.Table(DELIVERY_ROUTE_TABLE).put_item(
-        Item={
-            "Order_ID": order.id,
-            **route.to_dynamo()
-        }
-    )
+    try:
+        dynamo = get_dynamodb()
+        dynamo.Table(DELIVERY_ROUTE_TABLE).put_item(Item={"Order_ID": order_id, **route.to_dynamo()})
+    except Exception:
+        pass
 
-    session.add(order)
-    session.commit()
+    with Session(db_engine) as session:
+        order = session.get(em.Order, order_id)
+        if not order:
+            return
 
+        order.courier_id = courier_id
+        courier = session.get(em.Courier, courier_id)
+        if courier:
+            courier.availability = False
+            session.add(courier)
 
-orders = APIRouter(prefix="/orders", tags=["Order"])
+        session.add(order)
+        session.commit()
 
 
 @orders.get("/{order_id}", response_model=em.OrderPublicComplete)
-def get_order(
-    order_id: int,
-    session: SessionDep,
-    user: UserDep,
-    dynamo: DynamoDep,
-):
+def get_order(order_id: int, session: SessionDep, user: UserDep, dynamo: DynamoDep):
     order: em.Order = session.get(em.Order, order_id)
     assert_exists(order, order_id, "order")
 
     if user.id not in (order.customer_id, order.merchant_id, order.courier_id):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not your order")
 
-    order_public: em.OrderPublicComplete = em.OrderPublicComplete.model_validate(order, from_attributes=True)
+    order_public = em.OrderPublicComplete.model_validate(order, from_attributes=True)
 
-    if order.status.idx() <= em.OrderStatus.ready_for_pickup.idx():
-        return order_public
+    if order.status.idx() > em.OrderStatus.ready_for_pickup.idx():
+        delivery_route = get_dynamo_item(dynamo.Table(DELIVERY_ROUTE_TABLE), order.id)
+        if delivery_route:
+            order_public.delivery_route = em.DeliveryRoute.from_dynamo(delivery_route)
 
-    # 1. Query latest route and courier location from DynamoDB
-    delivery_routes = dynamo.Table(DELIVERY_ROUTE_TABLE)
-    courier_locations = dynamo.Table(COURIER_LOCATION_TABLE)
-
-    delivery_route = get_dynamo_item(delivery_routes, order.id)
-    if delivery_route:
-        order_public.delivery_route = em.DeliveryRoute.from_dynamo(delivery_route)
-
-    courier_location = get_dynamo_item(courier_locations, order.id)
-    if courier_location:
-        order_public.courier_location = em.CourierLocation.from_dynamo(courier_location)
+        courier_location = get_dynamo_item(dynamo.Table(COURIER_LOCATION_TABLE), order.id)
+        if courier_location:
+            order_public.courier_location = em.CourierLocation.from_dynamo(courier_location)
 
     return order_public
-    
+
 
 @orders.get("/{order_id}/events", response_model=list[em.OrderEvent])
-def list_order_events(
-    order_id: int,
-    session: SessionDep,
-    _auth: AdminDep,
-):
+def list_order_events(order_id: int, session: SessionDep, _auth: AdminDep):
     order = session.get(em.Order, order_id)
-
     if not order:
-        raise HTTPException(status_code=404, detail="Order not found")
-
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Order not found")
     return order.events
 
 
@@ -465,272 +485,175 @@ def place_order(order: em.OrderCreate, session: SessionDep, customer: CustomerDe
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Merchant not found")
 
     order_db = em.Order(
-        customer_id = customer.user_id,
-        merchant_id = merchant.user_id,
-        courier_id = None,
-        status = em.OrderStatus.confirmed,
+        merchant_id=order.merchant_id,
+        customer_id=customer.user_id,
+        courier_id=None,
+        status=em.OrderStatus.confirmed,
     )
-
-    event = em.OrderEvent(updated_status=em.OrderStatus.confirmed)
-    order_db.events.append(event)
+    add_order_event(order_db, em.OrderStatus.confirmed)
 
     session.add(order_db)
     session.commit()
     session.refresh(order_db)
-
     return order_db
 
 
 @orders.get("/", response_model=list[em.OrderPublic])
-def get_all_orders(
+def list_orders(
+    session: SessionDep,
+    user: UserDep,
     status: Optional[em.OrderStatus] = None,
-    session: SessionDep = None,
-    user: UserDep = None,
     offset: int = 0,
-    limit: Limit = 100
+    limit: Limit = 100,
 ):
     user_id_field = {
         em.UserRole.customer: em.Order.customer_id,
         em.UserRole.merchant: em.Order.merchant_id,
-        em.UserRole.courier: em.Order.courier_id
+        em.UserRole.courier: em.Order.courier_id,
     }[user.role]
 
     conditions = [user_id_field == user.id]
-
     if status is not None:
         conditions.append(em.Order.status == status)
 
-    return session.exec(
-        select(em.Order)
-        .where(*conditions)
-        .offset(offset)
-        .limit(limit)
-    ).all()
+    return session.exec(select(em.Order).where(*conditions).offset(offset).limit(limit)).all()
 
 
 @orders.patch("/{order_id}")
-def update_order(
-    order_id: int,
-    order: em.OrderUpdate,
-    session: SessionDep,
-    user: UserDep,
-    bg_tasks: BackgroundTasks,
-    dynamo: DynamoDep
-):
+def update_order(order_id: int, order: em.OrderUpdate, session: SessionDep, user: UserDep, bg_tasks: BackgroundTasks, dynamo: DynamoDep):
     order_db = session.get(em.Order, order_id)
-
     assert_exists(order_db, order_id, "order")
-   
-    data = order.model_dump(exclude_unset=True)
-    updated_status = data.pop("status", None)
 
+    updated_status = order.model_dump(exclude_unset=True).get("status")
     if updated_status is None:
         return order_db
 
-    # Assert valid state transition
     if updated_status.idx() != order_db.status.idx() + 1:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Invalid state transition"
-        )
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid state transition")
 
-    # Assert user role is correct
     if updated_status.idx() <= em.OrderStatus.ready_for_pickup.idx():
         if user.id != order_db.merchant_id:
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="Not your order"
-            )
-    else:
-        if user.id != order_db.courier_id:
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="Not your order"
-            )
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not your order")
+    elif user.id != order_db.courier_id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not your order")
 
     if updated_status == em.OrderStatus.ready_for_pickup:
         bg_tasks.add_task(
-            look_for_courier, order_db, order_db.customer.address,
-            order_db.merchant.address, session, dynamo
+            look_for_courier,
+            order_db.id,
+            order_db.customer.address,
+            order_db.merchant.address,
         )
-    
     elif updated_status == em.OrderStatus.picked_up:
-        dynamo.Table(COURIER_LOCATION_TABLE).put_item(
-            Item={
-                "Order_ID": order_id,
-                "Location": order_db.merchant.address,
-            }
-        )
+        write_courier_location(dynamo, order_id, order_db.merchant.address)
 
     order_db.status = updated_status
-    
-    event = em.OrderEvent(updated_status=updated_status)
-    order_db.events.append(event)
-
-    order_db.sqlmodel_update(data)
+    add_order_event(order_db, updated_status)
 
     session.add(order_db)
     session.commit()
     session.refresh(order_db)
-
     return order_db
 
 
 @orders.post("/{order_id}/accept")
 def accept_order(order_id: int, session: SessionDep, merchant: MerchantDep):
     order = session.get(em.Order, order_id)
-
     if not order:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Order not found")
-
     if order.merchant_id != merchant.id:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not your order")
 
-    if order.status != "CONFIRMED":
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid state transition")
-
-    order.status = "PREPARING"
-
-    add_order_event(session, order, "PREPARING")
-
+    order_status_transition(order, em.OrderStatus.confirmed, em.OrderStatus.preparing)
     session.add(order)
     session.commit()
     session.refresh(order)
-
     return order
 
 
-def order_status_transition(session, order: em.Order, old_status: str, new_status: str):
-    if not order:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Order not found")
-
-    if order.status != old_status:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid state transition")
-
-    order.status = new_status
-
-    add_order_event(session, order, new_status)
-
-
 @orders.post("/{order_id}/ready")
-def announce_order_is_ready(
-    order_id: int,
-    session: SessionDep,
-    merchant: MerchantDep,
-    bg_tasks: BackgroundTasks,
-    table: DeliveryRouteDep
-):
+def announce_order_is_ready(order_id: int, session: SessionDep, merchant: MerchantDep, bg_tasks: BackgroundTasks):
     order = session.get(em.Order, order_id)
-
     if not order:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Order not found")
-
     if order.merchant_id != merchant.id:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not your order")
 
-    order_status_transition(session, order, "PREPARING", "READY_FOR_PICKUP")
+    merchant_db = session.get(em.Merchant, merchant.id)
+    if not merchant_db:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Merchant not found")
+
+    order_status_transition(order, em.OrderStatus.preparing, em.OrderStatus.ready_for_pickup)
     session.add(order)
     session.commit()
     session.refresh(order)
 
     customer = session.get(em.Customer, order.customer_id)
-
-    bg_tasks.add_task(look_for_courier, order, customer.address, merchant.address, session, table)
-
+    if customer is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Customer not found")
+    bg_tasks.add_task(look_for_courier, order.id, customer.address, merchant_db.address)
     return order
 
 
 @orders.post("/{order_id}/picked_up")
-def announce_order_picked_up(
-    order_id: int,
-    session: SessionDep,
-    courier: CourierDep,
-    bg_tasks: BackgroundTasks
-):
+def announce_order_picked_up(order_id: int, session: SessionDep, courier: CourierDep, bg_tasks: BackgroundTasks):
     order = session.get(em.Order, order_id)
-
     if not order:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Order not found")
-
-    if order.courier_id != courier.id:
+    if order.courier_id != courier.user_id:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not your order")
 
-    order_status_transition(session, order, "READY_FOR_PICKUP", "PICKED_UP")
+    order_status_transition(order, em.OrderStatus.ready_for_pickup, em.OrderStatus.picked_up)
     session.add(order)
     session.commit()
     session.refresh(order)
-
     return order
 
 
 @orders.post("/{order_id}/in_transit")
-def announce_order_in_transit(
-    order_id: int,
-    session: SessionDep,
-    courier: CourierDep,
-    courier_location: CourierLocationDep,
-    bg_tasks: BackgroundTasks
-):
+def announce_order_in_transit(order_id: int, session: SessionDep, courier: CourierDep, dynamo: DynamoDep, bg_tasks: BackgroundTasks):
     order = session.get(em.Order, order_id)
-
     if not order:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Order not found")
-
-    if order.courier_id != courier.id:
+    if order.courier_id != courier.user_id:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not your order")
 
     merchant = session.get(em.Merchant, order.merchant_id)
+    write_courier_location(dynamo, order.id, merchant.address)
 
-    courier_location.put_item(
-        Item={
-            "Order_ID": order.id,
-            "Timestamp": int(order.order_time.timestamp()),
-            "Location": merchant.address,
-        }
-    )
-    
-
-    order_status_transition(session, order, "PICKED_UP", "IN_TRANSIT")
+    order_status_transition(order, em.OrderStatus.picked_up, em.OrderStatus.in_transit)
     session.add(order)
     session.commit()
     session.refresh(order)
-
     return order
 
 
 @orders.post("/{order_id}/delivered")
-def announce_order_delivered(
-    order_id: int,
-    session: SessionDep,
-    courier: CourierDep,
-    bg_tasks: BackgroundTasks
-):
+def announce_order_delivered(order_id: int, session: SessionDep, courier: CourierDep, bg_tasks: BackgroundTasks):
     order = session.get(em.Order, order_id)
-
     if not order:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Order not found")
-
-    if order.courier_id != courier.id:
+    if order.courier_id != courier.user_id:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not your order")
 
-    order_status_transition(session, order, "IN_TRANSIT", "DELIVERED")
+    order_status_transition(order, em.OrderStatus.in_transit, em.OrderStatus.delivered)
+
+    courier_db = session.get(em.Courier, courier.user_id)
+    if courier_db:
+        courier_db.availability = True
+        session.add(courier_db)
+
     session.add(order)
     session.commit()
     session.refresh(order)
-
     return order
 
 
-# Adding routes to app
-customers.include_router(customer_orders)
-merchants.include_router(merchant_orders)
 app.include_router(customers)
 app.include_router(merchants)
 app.include_router(couriers)
 app.include_router(orders)
 
-
-# OUTRAS ROTAS --------------------------------------------------
 
 @app.get("/health", tags=["Other"])
 def health():

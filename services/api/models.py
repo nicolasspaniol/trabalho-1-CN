@@ -1,5 +1,6 @@
 # Baseado em https://fastapi.tiangolo.com/tutorial/sql-databases/
 
+from sqlalchemy import BigInteger
 from sqlmodel import SQLModel, Field, Relationship
 from datetime import datetime
 from enum import Enum
@@ -31,7 +32,7 @@ class CustomerBase(SQLModel):
     name: str
     email: str
     phone: str
-    address: int
+    address: int = Field(sa_type=BigInteger)
 
 class Customer(CustomerBase, table=True):
     user_id: int = Field(primary_key=True, foreign_key="user.id")
@@ -55,7 +56,7 @@ class CustomerUpdate(CustomerBase):
 
 class CourierBase(SQLModel):
     name: str
-    location: int
+    location: int = Field(sa_type=BigInteger)
     vehicle_type: str
     availability: bool
 
@@ -81,7 +82,7 @@ class CourierUpdate(CourierBase):
 class MerchantBase(SQLModel):
     name: str
     type: str
-    address: int
+    address: int = Field(sa_type=BigInteger)
 
 class Merchant(MerchantBase, table=True):
     user_id: int = Field(primary_key=True, foreign_key="user.id")

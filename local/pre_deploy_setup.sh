@@ -21,7 +21,8 @@ IMAGE_TAG="latest"
 EXECUTION_ROLE_NAME="LabRole"
 EXECUTION_ROLE_ARN=""
 ECR_AUTO_CREATE_REPO="false"
-DEPLOY_TARGETS="worker,api"
+DEPLOY_TARGETS="worker,api,location"
+NO_CACHE_TARGETS="${NO_CACHE_TARGETS:-}"
 
 WORKDIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BUILDER_NAME="xbuilder"
@@ -120,6 +121,7 @@ resolve_target_repo() {
   case "$target" in
     worker) echo "worker" ;;
     api) echo "api" ;;
+    location) echo "location" ;;
     *) fail "Target desconhecido: $target" ;;
   esac
 }
@@ -129,16 +131,20 @@ resolve_target_dockerfile() {
   case "$target" in
     worker) echo "services/worker/Dockerfile" ;;
     api) echo "services/api/Dockerfile" ;;
+    location) echo "services/location/Dockerfile" ;;
     *) fail "Target desconhecido: $target" ;;
   esac
 }
 
 resolve_target_no_cache() {
   local target="$1"
-  case "$target" in
-    api) echo "--no-cache" ;;
-    *) echo "" ;;
-  esac
+  local normalized
+  normalized=",$(echo "$NO_CACHE_TARGETS" | tr '[:upper:]' '[:lower:]' | tr -d ' '),"
+  if [[ "$normalized" == *",$target,"* ]]; then
+    echo "--no-cache"
+  else
+    echo ""
+  fi
 }
 
 parse_targets() {

@@ -19,6 +19,14 @@ from local.constants import (
     ECR_REPO,
     LOAD_BALANCER_NAME,
     LOG_GROUP_NAME,
+    LOCATION_ALB_SG_NAME,
+    LOCATION_ECR_REPO,
+    LOCATION_LOAD_BALANCER_NAME,
+    LOCATION_LOG_GROUP_NAME,
+    LOCATION_SERVICE_NAME,
+    LOCATION_TARGET_GROUP_NAME,
+    LOCATION_TASK_FAMILY,
+    LOCATION_TASK_SG_NAME,
     REGION,
     SERVICE_NAME,
     TABLE_NAME,
@@ -209,7 +217,7 @@ def main(argv=None):
     bucket_name = resolve_bucket_name(account_id)
     vpc_id = resolve_vpc_id(ec2, elbv2)
 
-    service_names = [SERVICE_NAME, API_SERVICE_NAME]
+    service_names = [SERVICE_NAME, API_SERVICE_NAME, LOCATION_SERVICE_NAME]
     for name in service_names:
         log(f"1) Removendo service ECS: {name}")
         safe(lambda n=name: ecs.update_service(cluster=CLUSTER_NAME, service=n, desiredCount=0), "update-service desired=0")
@@ -239,8 +247,8 @@ def main(argv=None):
         )
 
     log("3) Removendo listener/ALB/TargetGroup")
-    lb_names = [LOAD_BALANCER_NAME, API_LOAD_BALANCER_NAME]
-    tg_names = [TARGET_GROUP_NAME, API_TARGET_GROUP_NAME]
+    lb_names = [LOAD_BALANCER_NAME, API_LOAD_BALANCER_NAME, LOCATION_LOAD_BALANCER_NAME]
+    tg_names = [TARGET_GROUP_NAME, API_TARGET_GROUP_NAME, LOCATION_TARGET_GROUP_NAME]
     for lb_name in lb_names:
         lb_arn = get_lb_arn_by_name(elbv2, lb_name)
         if lb_arn:
@@ -256,7 +264,7 @@ def main(argv=None):
             safe(lambda arn=tg_arn: elbv2.delete_target_group(TargetGroupArn=arn), "delete-target-group")
 
     log("4) Removendo task definitions")
-    families = [TASK_FAMILY, API_TASK_FAMILY]
+    families = [TASK_FAMILY, API_TASK_FAMILY, LOCATION_TASK_FAMILY]
     for family in families:
         task_defs = safe(lambda fam=family: ecs.list_task_definitions(familyPrefix=fam).get("taskDefinitionArns", []), "list-task-definitions") or []
         for arn in task_defs:
@@ -267,7 +275,7 @@ def main(argv=None):
     safe(lambda: ecs.delete_cluster(cluster=CLUSTER_NAME), "delete-cluster")
 
     log("6) Removendo log groups")
-    for log_group in (LOG_GROUP_NAME, API_LOG_GROUP_NAME):
+    for log_group in (LOG_GROUP_NAME, API_LOG_GROUP_NAME, LOCATION_LOG_GROUP_NAME):
         safe(lambda name=log_group: logs.delete_log_group(logGroupName=name), "delete-log-group")
 
     log("7) Removendo tabela DynamoDB")
@@ -286,7 +294,15 @@ def main(argv=None):
             warn(f"delete-bucket: {code} - {error}")
 
     log("10) Removendo security groups customizados")
-    for name in (TASK_SG_NAME, ALB_SG_NAME, API_TASK_SG_NAME, API_ALB_SG_NAME, DB_SECURITY_GROUP_NAME):
+    for name in (
+        TASK_SG_NAME,
+        ALB_SG_NAME,
+        API_TASK_SG_NAME,
+        API_ALB_SG_NAME,
+        LOCATION_TASK_SG_NAME,
+        LOCATION_ALB_SG_NAME,
+        DB_SECURITY_GROUP_NAME,
+    ):
         sg_id = get_sg_id(ec2, name, vpc_id=vpc_id)
         if not sg_id:
             continue
@@ -300,7 +316,7 @@ def main(argv=None):
         log("11) Mantendo ECR (flag --keep-ecr)")
     else:
         log("11) Removendo imagens/repo ECR")
-        for repo_name in (ECR_REPO, API_ECR_REPO):
+        for repo_name in (ECR_REPO, API_ECR_REPO, LOCATION_ECR_REPO):
             images = safe(lambda rn=repo_name: ecr.list_images(repositoryName=rn).get("imageIds", []), "list-images") or []
             if images:
                 safe(lambda rn=repo_name, ids=images: ecr.batch_delete_image(repositoryName=rn, imageIds=ids), "batch-delete-image")

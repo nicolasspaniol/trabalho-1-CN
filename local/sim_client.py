@@ -87,7 +87,12 @@ async def fetch_entity_ids(api_url: str, endpoint: str, auth: aiohttp.BasicAuth 
             async with session.get(url) as response:
                 response.raise_for_status()  # Garante que não deu erro 500/404
                 data = await response.json()
-                return [item["id"] for item in data if "id" in item]
+                ids: list[int] = []
+                for item in data:
+                    value = item.get("id", item.get("user_id"))
+                    if value is not None:
+                        ids.append(int(value))
+                return ids
         except Exception as e:
             print(f"Erro ao buscar {endpoint} na API: {e}")
             return []

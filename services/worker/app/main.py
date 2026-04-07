@@ -77,7 +77,7 @@ def fetch_available_couriers() -> list[tuple[int, int]]:
     try:
         with conn.cursor() as cursor:
             cursor.execute(
-                'SELECT id, location FROM courier WHERE availability IS TRUE'
+                'SELECT user_id, location FROM courier WHERE availability IS TRUE'
             )
             rows = cursor.fetchall()
         return [(int(courier_id), int(location)) for courier_id, location in rows]
@@ -96,7 +96,7 @@ def reserve_courier(courier_id: int) -> bool:
     try:
         with conn.cursor() as cursor:
             cursor.execute(
-                'UPDATE courier SET availability = FALSE WHERE id = %s AND availability IS TRUE RETURNING id',
+                'UPDATE courier SET availability = FALSE WHERE user_id = %s AND availability IS TRUE RETURNING user_id',
                 (courier_id,),
             )
             reserved = cursor.fetchone()

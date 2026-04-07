@@ -1,5 +1,5 @@
 url="http://127.0.0.1:8000"
-url_loc="http:/127.0.0.1:8050"
+url_loc="http://127.0.0.1:8050"
 
 req() {
   echo "----------------" >&2
@@ -75,11 +75,11 @@ req -X PATCH "$url/orders/$order_id" \
   -u "$courier_id":
 
 # Atualiza posição (ENTREGADOR)
-req -X PUT "$url_loc?order_id=$order_id" \
+req -X PUT "$url_loc/couriers/me/location?order_id=$order_id" \
   -d '{"location": 23}' \
   -u "$courier_id":
 
-req -X PUT "$url_loc?order_id=$order_id" \
+req -X PUT "$url_loc/couriers/me/location?order_id=$order_id" \
   -d '{"location": 28}' \
   -u "$courier_id":
 
@@ -88,7 +88,7 @@ req -X GET "$url/orders/$order_id" \
   -u "$customer_id":
 
 # Atualiza posição (ENTREGADOR)
-req -X PUT "$url_loc?order_id=$order_id" \
+req -X PUT "$url_loc/couriers/me/location?order_id=$order_id" \
   -d '{"location": 43}' \
   -u "$courier_id":
 

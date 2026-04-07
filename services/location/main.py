@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Depends
+from fastapi import Depends, FastAPI
 from os import getenv
 import boto3
 from boto3.resources.base import ServiceResource
@@ -35,7 +35,7 @@ class Location(SQLModel):
     location: int
 
 
-@app.put("/")
+@app.put("/couriers/me/location")
 def update_courier_location(
     order_id: int,
     location: Location,
