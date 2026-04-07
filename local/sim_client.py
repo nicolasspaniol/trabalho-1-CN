@@ -41,6 +41,7 @@ async def check_order_status(
     try:
         url = f"{api_url.rstrip('/')}{ORDERS_ENDPOINT}{order_id}/events"
         async with session.get(url) as response:
+            response.raise_for_status()
             await response.json()
             return time.perf_counter() - start_time
     except Exception:
@@ -69,7 +70,12 @@ async def run_load_test(
     """Executa o teste de carga gerando tráfego de pedidos e leituras concorrentes"""
     write_latencies = []
     read_latencies = []
-    active_orders = ["dummy_id"]  # Usado para os primeiros GETs até popularem os reais
+    active_orders = []
+    write_attempts = 0
+    successful_writes = 0
+    read_attempts = 0
+    successful_reads = 0
+    test_start = time.perf_counter()
 
     connector = aiohttp.TCPConnector(limit=0)
     async with aiohttp.ClientSession(connector=connector, auth=auth) as session:
@@ -91,42 +97,65 @@ async def run_load_test(
                 )
                 for _ in range(rps)
             ]
+            write_attempts += len(write_tasks)
 
             # Dispara requisições concorrentes de leitura para provar isolamento do banco
-            read_tasks = [
-                check_order_status(session, api_url, random.choice(active_orders))
-                for _ in range(max(1, rps // 5))
-            ]
+            read_tasks = []
+            if active_orders:
+                read_tasks = [
+                    check_order_status(session, api_url, random.choice(active_orders))
+                    for _ in range(max(1, rps // 5))
+                ]
+                read_attempts += len(read_tasks)
 
             write_results = await asyncio.gather(*write_tasks)
-            read_results = await asyncio.gather(*read_tasks)
+            read_results = await asyncio.gather(*read_tasks) if read_tasks else []
 
             for w_lat, o_id in write_results:
                 if w_lat is not None:
                     write_latencies.append(w_lat)
+                    successful_writes += 1
                     if o_id != "dummy_id":
                         active_orders.append(o_id)
 
-            read_latencies.extend(
-                [r_lat for r_lat in read_results if r_lat is not None]
-            )
+            valid_reads = [r_lat for r_lat in read_results if r_lat is not None]
+            read_latencies.extend(valid_reads)
+            successful_reads += len(valid_reads)
 
             elapsed = time.perf_counter() - loop_start
             await asyncio.sleep(max(0.0, 1.0 - elapsed))
 
-    # Relatório de Isolamento (Avaliação Crítica do Professor)
-    if write_latencies and read_latencies:
+    total_elapsed = max(1e-9, time.perf_counter() - test_start)
+    effective_write_rps = successful_writes / total_elapsed
+    effective_read_rps = successful_reads / total_elapsed
+
+    print(f"\n--- Resumo de Throughput ({rps} RPS alvo) ---")
+    print(f"Escritas: {successful_writes}/{write_attempts} sucesso | RPS efetivo: {effective_write_rps:.2f}")
+    if read_attempts:
+        print(f"Leituras: {successful_reads}/{read_attempts} sucesso | RPS efetivo: {effective_read_rps:.2f}")
+    else:
+        print("Leituras: sem amostras (sem pedidos ativos no inicio do teste)")
+
+    # Relatório de isolamento e latência P95
+    if write_latencies:
         p95_write = np.percentile(write_latencies, 95) * 1000
-        p95_read = np.percentile(read_latencies, 95) * 1000
 
         print(f"\n--- Resultados do Cenário ({rps} RPS) ---")
         print(f"Latência de Roteamento (Escrita) P95: {p95_write:.2f} ms")
-        print(f"Latência de Consulta (Leitura) P95:  {p95_read:.2f} ms")
+        if read_latencies:
+            p95_read = np.percentile(read_latencies, 95) * 1000
+            print(f"Latência de Consulta (Leitura) P95:  {p95_read:.2f} ms")
+        else:
+            p95_read = None
+            print("Latência de Consulta (Leitura) P95:  sem amostras válidas")
 
-        if p95_write < 500 and p95_read < 500:
+        p95_ok = p95_write < 500 and (p95_read is None or p95_read < 500)
+        throughput_ok = effective_write_rps >= (0.9 * rps)
+
+        if p95_ok and throughput_ok:
             print("SUCESSO: Requisito P95 < 500ms alcançado.")
         else:
-            print("ALERTA: Gargalo de performance detectado.")
+            print("ALERTA: gargalo de performance detectado (latência e/ou throughput abaixo do esperado).")
 
 
 async def main(args):

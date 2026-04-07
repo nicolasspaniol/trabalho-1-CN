@@ -37,7 +37,7 @@ DB_INSTANCE_ID = os.getenv("DB_INSTANCE_ID", "dijkfood-postgres")
 DB_SECURITY_GROUP_NAME = os.getenv("DB_SECURITY_GROUP_NAME", "dijkfood-rds-sg")
 DB_SCHEMA_FILE = os.getenv("DB_SCHEMA_FILE", "local/schema.sql")
 
-# TODO(grupo-api): publicar o contrato final de couriers/me/location, picked_up e delivered no OpenAPI.
+# TODO(grupo-api): publicar o contrato final de couriers/me/location e picked_up no OpenAPI.
 # TODO(grupo-worker): validar o formato final das rotas e o fluxo de courier contra o contrato novo.
 # TODO(grupo-dados): definir estrategia final de versionamento/lifecycle do grafo no S3 para o mapa da cidade inteira.
 # TODO(grupo-infra): automatizar policy/versioning/lifecycle do bucket S3 do mapa.
@@ -184,7 +184,7 @@ def ensure_simulation_contract(base_url: str) -> bool:
         if isinstance(hello_payload, dict) and hello_payload.get("service") == "routing-worker":
             raise RuntimeError(
                 "Simulacao indisponivel: o ALB atual aponta para o worker em modo teste "
-                "(services/worker/app/main2.py), sem endpoints de dominio (/customers, /merchants, /couriers, /orders, /couriers/me/location, /orders/{order_id}/ready, /orders/{order_id}/picked_up, /orders/{order_id}/delivered)."
+                "(services/worker/app/main2.py), sem endpoints de dominio (/customers, /merchants, /couriers, /orders, /couriers/me/location, /orders/{order_id}/ready, /orders/{order_id}/picked_up)."
             )
     except RuntimeError:
         raise
@@ -214,11 +214,10 @@ def ensure_simulation_contract(base_url: str) -> bool:
         "/orders/{order_id}/ready",
         "/couriers/me/location",
         "/orders/{order_id}/picked_up",
-        "/orders/{order_id}/delivered",
     }
 
     if required_new_delivery_paths <= normalized_paths:
-        log("Simulacao: contrato completo de courier detectado (accept + ready + couriers/me/location + picked_up + delivered)")
+        log("Simulacao: contrato completo de courier detectado (accept + ready + couriers/me/location + picked_up)")
         return True
 
     missing_new_paths = sorted(required_new_delivery_paths - normalized_paths)
@@ -250,12 +249,6 @@ def run_simulation(
         auth_args = ["--username", api_username, "--password", api_password]
         auth_env = {"API_USERNAME": api_username, "API_PASSWORD": api_password}
     try:
-        log("Simulacao: gerando grafo e enviando para S3")
-        run_python_script(
-            PROJECT_ROOT / "local" / "create.py",
-            ["--bucket", bucket_name, "--file", graph_file, "--location", graph_location],
-        )
-
         if not can_load_data:
             log("Simulacao: pulando carga/sim_delivery/load-test por falta de endpoints de carga; deploy segue normalmente")
             return
@@ -293,6 +286,14 @@ def run_simulation(
             log("Simulacao: encerrando sim_delivery")
             delivery_process.terminate()
             delivery_process.wait()
+
+
+def ensure_graph_in_s3(bucket_name: str, graph_file: str, graph_location: str) -> None:
+    log("Dados: gerando grafo e enviando para S3")
+    run_python_script(
+        PROJECT_ROOT / "local" / "create.py",
+        ["--bucket", bucket_name, "--file", graph_file, "--location", graph_location],
+    )
 
 
 def run_deployment(execution_role_arn: str, bucket_name: str) -> None:
@@ -447,6 +448,8 @@ def main(argv=None) -> int:
 
     execution_role_arn = require_execution_role()
     os.environ["EXECUTION_ROLE_ARN"] = execution_role_arn
+
+    ensure_graph_in_s3(bucket_name, args.graph_file, args.graph_location)
 
     log("Deploy")
     run_deployment(execution_role_arn, bucket_name)

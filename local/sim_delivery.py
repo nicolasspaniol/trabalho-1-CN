@@ -10,6 +10,16 @@ import aiohttp
 NEW_DELIVERY_MODE = "new"
 PARTIAL_DELIVERY_MODE = "partial"
 
+REQUIRED_DELIVERY_PATHS = {
+    "/couriers/me/location",
+    "/couriers/me/order",
+    "/orders/{order_id}/accept",
+    "/orders/{order_id}/ready",
+    "/orders/{order_id}/picked_up",
+}
+
+OPTIONAL_DELIVERED_PATH = "/orders/{order_id}/delivered"
+
 
 async def fetch_openapi_paths(session: aiohttp.ClientSession, api_url: str) -> set[str] | None:
     try:
@@ -34,17 +44,13 @@ def resolve_delivery_mode(paths: set[str] | None) -> str:
     if not paths:
         return PARTIAL_DELIVERY_MODE
 
-    new_required = {
-        "/couriers/me/location",
-        "/couriers/me/order",
-        "/orders/{order_id}/accept",
-        "/orders/{order_id}/ready",
-        "/orders/{order_id}/picked_up",
-        "/orders/{order_id}/delivered",
-    }
-    if new_required <= paths:
+    if REQUIRED_DELIVERY_PATHS <= paths:
         return NEW_DELIVERY_MODE
     return PARTIAL_DELIVERY_MODE
+
+
+def supports_delivered(paths: set[str] | None) -> bool:
+    return bool(paths and OPTIONAL_DELIVERED_PATH in paths)
 
 
 async def get_json(session: aiohttp.ClientSession, url: str) -> Any:
@@ -140,7 +146,12 @@ async def accept_order(session: aiohttp.ClientSession, api_url: str, order_id: i
         return False
 
 
-async def deliver_order_new(session: aiohttp.ClientSession, api_url: str, order: dict[str, Any]) -> bool:
+async def deliver_order_new(
+    session: aiohttp.ClientSession,
+    api_url: str,
+    order: dict[str, Any],
+    can_mark_delivered: bool,
+) -> bool:
     order_id = int(order["id"])
     merchant_id = int(order["merchant_id"])
     customer_id = int(order["customer_id"])
@@ -173,8 +184,9 @@ async def deliver_order_new(session: aiohttp.ClientSession, api_url: str, order:
     if not await update_courier_location(session, api_url, customer_address):
         return False
 
-    if not await mark_order_delivered(session, api_url, order_id):
-        return False
+    if can_mark_delivered:
+        if not await mark_order_delivered(session, api_url, order_id):
+            return False
 
     print(f"  ✓ Pedido {order_id} entregue com sucesso")
     return True
@@ -185,7 +197,8 @@ async def delivery_worker(api_url: str, username: str | None = None, password: s
     Simula um courier monitorando sua fila de pedidos.
 
     O worker tenta detectar qual contrato a API expõe:
-    - Contrato final: PUT /couriers/me/location + POST /orders/{id}/accept + POST /orders/{id}/ready + POST /orders/{id}/picked_up + POST /orders/{id}/delivered
+    - Contrato final mínimo: PUT /couriers/me/location + POST /orders/{id}/accept + POST /orders/{id}/ready + POST /orders/{id}/picked_up
+    - Contrato final estendido: inclui também POST /orders/{id}/delivered
     - Parcial: apenas monitora e registra que falta contrato
     """
     auth = None
@@ -197,9 +210,13 @@ async def delivery_worker(api_url: str, username: str | None = None, password: s
     async with aiohttp.ClientSession(auth=auth) as session:
         paths = await fetch_openapi_paths(session, api_url)
         delivery_mode = resolve_delivery_mode(paths)
+        can_mark_delivered = supports_delivered(paths)
 
         if delivery_mode == NEW_DELIVERY_MODE:
-            print("Iniciando courier worker com contrato final: accept + ready + couriers/me/location + picked_up + delivered")
+            if can_mark_delivered:
+                print("Iniciando courier worker com contrato final: accept + ready + couriers/me/location + picked_up + delivered")
+            else:
+                print("Iniciando courier worker com contrato final mínimo: accept + ready + couriers/me/location + picked_up")
         else:
             print("Iniciando courier worker em modo parcial: contrato de delivery incompleto")
 
@@ -227,13 +244,13 @@ async def delivery_worker(api_url: str, username: str | None = None, password: s
                     continue
 
                 if delivery_mode == NEW_DELIVERY_MODE:
-                    handled = await deliver_order_new(session, api_url, current_order)
+                    handled = await deliver_order_new(session, api_url, current_order, can_mark_delivered)
                     if handled:
                         last_handled_order_id = order_id
                 else:
                     print(
                         "  └─ Contrato de courier incompleto; aguardando /orders/{order_id}/accept, "
-                        "/orders/{order_id}/ready, /couriers/me/location, /orders/{order_id}/picked_up e /orders/{order_id}/delivered"
+                        "/orders/{order_id}/ready, /couriers/me/location e /orders/{order_id}/picked_up"
                     )
                     last_handled_order_id = order_id
 

@@ -24,9 +24,9 @@ RUN apt-get update && \
 COPY --from=builder /app/.venv /app/.venv
 ENV PATH="/app/.venv/bin:$PATH"
 
-# Copia o código do worker e a pasta shared
+# Copia o código do worker e o pacote shared (codigo Python)
 COPY services/worker/app ./app
-COPY shared ./shared
+COPY shared/shared ./shared
 
 # Define o PYTHONPATH para que os módulos em 'shared' sejam encontrados
 ENV PYTHONPATH="/app"

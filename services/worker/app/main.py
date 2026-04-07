@@ -5,7 +5,7 @@ import heapq
 from contextlib import asynccontextmanager
 from psycopg2 import pool
 from fastapi import FastAPI, HTTPException
-from shared.models.route_models import RouteRequest, RouteResponse
+from shared.route_models import RouteRequest, RouteResponse
 
 GRAPH = None
 GRAPH_LOAD_ERROR = None
