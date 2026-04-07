@@ -2,11 +2,14 @@
 FROM ghcr.io/astral-sh/uv:python3.14-trixie-slim as builder
 WORKDIR /app
 
-# Copia apenas os arquivos de dependências
-COPY services/worker/pyproject.toml services/worker/uv.lock ./
+# Copia o arquivo de dependências do worker
+COPY services/worker/pyproject.toml ./pyproject.toml
 
-# Gera um requirements.txt limpo sem dependências de dev
-RUN uv export --format requirements-txt --no-dev > requirements.txt
+# Desativa dependências de desenvolvimento
+ENV UV_NO_DEV=1
+
+# Cria a venv com as dependências do projeto
+RUN uv sync
 
 # Etapa de execução ------------------------------------------
 FROM python:3.14-slim
@@ -17,11 +20,9 @@ RUN apt-get update && \
     apt-get install -y --no-install-recommends libpq-dev && \
     rm -rf /var/lib/apt/lists/*
 
-# Copia o requirements.txt gerado no estágio de build
-COPY --from=builder /app/requirements.txt .
-
-# Instala as dependências diretamente no sistema do container
-RUN pip install --no-cache-dir -r requirements.txt
+# Copia a venv pronta da etapa de build
+COPY --from=builder /app/.venv /app/.venv
+ENV PATH="/app/.venv/bin:$PATH"
 
 # Copia o código do worker e a pasta shared
 COPY services/worker/app ./app
@@ -31,5 +32,5 @@ COPY shared ./shared
 ENV PYTHONPATH="/app"
 EXPOSE 80
 
-# Roda o servidor na porta 80
-CMD ["fastapi", "run", "app/main.py", "--port", "80"]
+# Roda o servidor na porta 80 com mais de um worker para suportar carga e health check.
+CMD ["fastapi", "run", "app/main.py", "--port", "80", "--workers", "2"]

@@ -1,3 +1,13 @@
-**/__pycache__/
+**/__pycache__
 **/*.egg-info/
 .env
+**/*.pkl
+local/cache/
+cache/
+.aws/
+.docker-local/
+.docker-local-test/
+.env
+.venv/
+**/.venv/
+enunciado.pdf
