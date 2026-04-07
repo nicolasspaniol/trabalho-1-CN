@@ -132,7 +132,7 @@ DynamoDep = Annotated[ServiceResource, Depends(get_dynamodb)]
 AdminDep = Annotated[str, Depends(get_auth)]
 UserDep = Annotated[em.User, Depends(get_user(em.User))]
 CustomerDep = Annotated[em.Customer, Depends(get_user(em.Customer))]
-MerchantDep = Annotated[em.User, Depends(get_user(em.User))]
+MerchantDep = Annotated[em.Merchant, Depends(get_user(em.Merchant))]
 CourierDep = Annotated[em.Courier, Depends(get_user(em.Courier))]
 
 Limit = Annotated[int, Query(ge=1, le=100)]
@@ -263,14 +263,14 @@ def get_all_merchants(session: SessionDep, _auth: AdminDep, offset: int = 0, lim
     return rest.get_all(session, em.Merchant, offset, limit)
 
 
+@merchants.get("/me", response_model=em.MerchantPublic)
+def get_own_merchant(merchant: MerchantDep, session: SessionDep):
+    return rest.get_one(session, em.Merchant, merchant.user_id)
+
+
 @merchants.get("/{id}", response_model=em.MerchantPublic, responses=NOT_FOUND)
 def get_merchant(id: int, session: SessionDep, _auth: AdminDep):
     return rest.get_one(session, em.Merchant, id)
-
-
-@merchants.get("/me", response_model=em.MerchantPublic)
-def get_own_merchant(merchant: MerchantDep, session: SessionDep):
-    return rest.get_one(session, em.Merchant, merchant.id)
 
 
 @merchants.put("/{id}", responses=NOT_FOUND)
@@ -561,7 +561,7 @@ def accept_order(order_id: int, session: SessionDep, merchant: MerchantDep):
     order = session.get(em.Order, order_id)
     if not order:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Order not found")
-    if order.merchant_id != merchant.id:
+    if order.merchant_id != merchant.user_id:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not your order")
 
     order_status_transition(order, em.OrderStatus.confirmed, em.OrderStatus.preparing)
@@ -576,10 +576,10 @@ def announce_order_is_ready(order_id: int, session: SessionDep, merchant: Mercha
     order = session.get(em.Order, order_id)
     if not order:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Order not found")
-    if order.merchant_id != merchant.id:
+    if order.merchant_id != merchant.user_id:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not your order")
 
-    merchant_db = session.get(em.Merchant, merchant.id)
+    merchant_db = session.get(em.Merchant, merchant.user_id)
     if not merchant_db:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Merchant not found")
 
