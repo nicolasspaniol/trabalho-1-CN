@@ -24,6 +24,9 @@ from local.aws_waiters import (
     wait_for_load_balancer_dns,
 )
 from local.constants import (
+    API_LOAD_BALANCER_NAME,
+    API_SERVICE_NAME,
+    API_TARGET_GROUP_NAME,
     CLUSTER_NAME,
     LOAD_BALANCER_NAME,
     REGION,
@@ -109,8 +112,23 @@ def resolve_api_auth(api_username: str | None, api_password: str | None, api_aut
         return api_username, api_password
 
     env_values = parse_simple_env_file(PROJECT_ROOT / api_auth_env_file)
-    username = api_username or env_values.get("ADMIN_USERNAME") or os.getenv("API_USERNAME")
-    password = api_password or env_values.get("ADMIN_PASSWORD") or os.getenv("API_PASSWORD")
+    username = (
+        api_username
+        or env_values.get("ADMIN_USERNAME")
+        or os.getenv("ADMIN_USERNAME")
+        or os.getenv("API_USERNAME")
+    )
+    password = (
+        api_password
+        or env_values.get("ADMIN_PASSWORD")
+        or os.getenv("ADMIN_PASSWORD")
+        or os.getenv("API_PASSWORD")
+    )
+
+    if not (username and password):
+        username = "admin"
+        password = "admin"
+        log("Simulacao: credenciais nao informadas; usando fallback admin/admin")
 
     if username and password:
         log("Simulacao: usando credenciais Basic Auth da API")
@@ -253,6 +271,13 @@ def run_simulation(
             log("Simulacao: pulando carga/sim_delivery/load-test por falta de endpoints de carga; deploy segue normalmente")
             return
 
+        log("Simulacao: preflight de endpoints (OpenAPI + fluxo critico)")
+        run_python_script(
+            PROJECT_ROOT / "local" / "validate_endpoints.py",
+            ["--api-url", base_url, *auth_args],
+            env=auth_env,
+        )
+
         log("Simulacao: populando base via API")
         run_python_script(
             PROJECT_ROOT / "local" / "load.py",
@@ -286,6 +311,14 @@ def run_simulation(
             log("Simulacao: encerrando sim_delivery")
             delivery_process.terminate()
             delivery_process.wait()
+
+
+def resolve_simulation_base_url(worker_base_url: str, override_api_url: str | None) -> str:
+    if override_api_url and override_api_url.strip():
+        chosen = override_api_url.strip().rstrip("/")
+        log(f"Simulacao: usando API dedicada em {chosen}")
+        return chosen
+    return worker_base_url
 
 
 def ensure_graph_in_s3(bucket_name: str, graph_file: str, graph_location: str) -> None:
@@ -328,6 +361,25 @@ def run_deployment(execution_role_arn: str, bucket_name: str) -> None:
         execution_role_arn=execution_role_arn,
     )
 
+    worker_alb_dns = str(
+        wait_for_load_balancer_dns(
+            boto3.client("elbv2", region_name=REGION),
+            LOAD_BALANCER_NAME,
+            log=log,
+        )
+    )
+
+    log("Deploy API: criando servico FastAPI de dominio")
+    create_infra.setup_api_infrastructure(
+        region=REGION,
+        cluster_name=CLUSTER_NAME,
+        service_name=API_SERVICE_NAME,
+        worker_base_url=f"http://{worker_alb_dns}",
+        db_host=os.environ["DB_HOST"],
+        db_password=os.environ["DB_PASSWORD"],
+        execution_role_arn=execution_role_arn,
+    )
+
 
 def run_pre_deploy_setup() -> None:
     setup_script = PROJECT_ROOT / "local" / "pre_deploy_setup.sh"
@@ -344,13 +396,22 @@ def require_execution_role() -> str:
     return execution_role_arn
 
 
-def wait_service_ready(alb_dns: str) -> None:
+def wait_service_ready(alb_dns: str, target_group_name: str) -> None:
     log("Resolucao DNS")
     wait_for_dns_resolution(alb_dns, log=log)
 
     log("Health do target")
     elbv2 = boto3.client("elbv2", region_name=REGION)
-    wait_for_healthy_targets(elbv2, TARGET_GROUP_NAME, log=log)
+    wait_for_healthy_targets(elbv2, target_group_name, log=log)
+
+
+def test_api_service(base_url: str) -> None:
+    health_url = f"{base_url}/health"
+    openapi_url = f"{base_url}/openapi.json"
+    log("Teste API /health")
+    wait_for_http_ok(health_url, log=log)
+    log("Teste API /openapi.json")
+    wait_for_http_ok(openapi_url, log=log)
 
 
 def test_service(
@@ -427,6 +488,11 @@ def main(argv=None) -> int:
         default="services/api/.env",
         help="Arquivo .env com ADMIN_USERNAME/ADMIN_PASSWORD para usar na simulacao",
     )
+    parser.add_argument(
+        "--simulation-api-url",
+        default=None,
+        help="URL base da API de dominio para simulacao (quando o ALB deste deploy aponta para worker)",
+    )
     args = parser.parse_args(argv)
 
     configure_aws_files()
@@ -454,22 +520,36 @@ def main(argv=None) -> int:
     log("Deploy")
     run_deployment(execution_role_arn, bucket_name)
 
-    log("ALB")
+    log("ALB worker")
     elbv2 = boto3.client("elbv2", region_name=REGION)
-    alb_dns = str(wait_for_load_balancer_dns(elbv2, LOAD_BALANCER_NAME, log=log))
-    log(f"DNS: {alb_dns}")
+    worker_alb_dns = str(wait_for_load_balancer_dns(elbv2, LOAD_BALANCER_NAME, log=log))
+    log(f"DNS worker: {worker_alb_dns}")
 
-    base_url = f"http://{alb_dns}"
+    log("ALB API")
+    api_alb_dns = str(wait_for_load_balancer_dns(elbv2, API_LOAD_BALANCER_NAME, log=log))
+    log(f"DNS API: {api_alb_dns}")
+
+    worker_base_url = f"http://{worker_alb_dns}"
+    api_base_url = f"http://{api_alb_dns}"
 
     if args.with_simulation:
-        log("Readiness")
-        wait_service_ready(alb_dns)
+        log("Readiness worker")
+        wait_service_ready(worker_alb_dns, TARGET_GROUP_NAME)
+        log("Readiness API")
+        wait_service_ready(api_alb_dns, API_TARGET_GROUP_NAME)
+
+        simulation_base_url = resolve_simulation_base_url(api_base_url, args.simulation_api_url)
+        if simulation_base_url == api_base_url and not supports_data_load(simulation_base_url):
+            raise RuntimeError(
+                "Simulacao indisponivel na URL atual: o endpoint publico da API nao expoe /customers, /merchants e /couriers. "
+                "Use --simulation-api-url apontando para a API FastAPI de dominio."
+            )
 
         rps_scenarios = parse_rps_scenarios(args.rps_scenarios)
         api_username, api_password = resolve_api_auth(args.api_username, args.api_password, args.api_auth_env_file)
         try:
             run_simulation(
-                base_url=base_url,
+                base_url=simulation_base_url,
                 num_users=args.num_users,
                 rps_scenarios=rps_scenarios,
                 duration=args.duration,
@@ -486,21 +566,24 @@ def main(argv=None) -> int:
 
         log("Testes")
         test_service(
-            alb_dns,
+            worker_alb_dns,
             include_readiness=False,
             require_graph_loaded=True,
             require_db_connected=True,
             require_tables_ok=True,
         )
+        test_api_service(api_base_url)
     else:
         log("Testes")
         test_service(
-            alb_dns,
+            worker_alb_dns,
             include_readiness=True,
             require_graph_loaded=True,
             require_db_connected=True,
             require_tables_ok=True,
         )
+        wait_service_ready(api_alb_dns, API_TARGET_GROUP_NAME)
+        test_api_service(api_base_url)
 
     if args.no_delete:
         log("Teardown: ignorado")

@@ -17,14 +17,13 @@ set -euo pipefail
 AWS_REGION="us-east-1"
 AWS_PROFILE="default"
 AWS_ACCOUNT_ID=""    
-ECR_REPO="worker"
 IMAGE_TAG="latest"
 EXECUTION_ROLE_NAME="LabRole"
 EXECUTION_ROLE_ARN=""
 ECR_AUTO_CREATE_REPO="false"
+DEPLOY_TARGETS="worker,api"
 
 WORKDIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-DOCKERFILE_PATH="services/worker/Dockerfile"
 BUILDER_NAME="xbuilder"
 
 
@@ -94,13 +93,66 @@ resolve_buildx() {
 }
 
 build_and_push_image_legacy() {
-  log "Build + push da imagem (legacy docker build)"
-  docker build \
-    -f "$DOCKERFILE_PATH" \
-    -t "$IMAGE_URI" \
-    .
+  local image_uri="$1"
+  local dockerfile_path="$2"
+  local no_cache_flag="$3"
 
-  docker push "$IMAGE_URI"
+  log "Build + push da imagem (legacy docker build)"
+  if [[ "$no_cache_flag" == "--no-cache" ]]; then
+    docker build \
+      --no-cache \
+      --pull \
+      -f "$dockerfile_path" \
+      -t "$image_uri" \
+      .
+  else
+    docker build \
+      -f "$dockerfile_path" \
+      -t "$image_uri" \
+      .
+  fi
+
+  docker push "$image_uri"
+}
+
+resolve_target_repo() {
+  local target="$1"
+  case "$target" in
+    worker) echo "worker" ;;
+    api) echo "api" ;;
+    *) fail "Target desconhecido: $target" ;;
+  esac
+}
+
+resolve_target_dockerfile() {
+  local target="$1"
+  case "$target" in
+    worker) echo "services/worker/Dockerfile" ;;
+    api) echo "services/api/Dockerfile" ;;
+    *) fail "Target desconhecido: $target" ;;
+  esac
+}
+
+resolve_target_no_cache() {
+  local target="$1"
+  case "$target" in
+    api) echo "--no-cache" ;;
+    *) echo "" ;;
+  esac
+}
+
+parse_targets() {
+  local raw="$1"
+  local cleaned
+  cleaned="$(echo "$raw" | tr '[:upper:]' '[:lower:]' | tr -d ' ' )"
+  if [[ -z "$cleaned" ]]; then
+    fail "DEPLOY_TARGETS vazio"
+  fi
+  IFS=',' read -r -a targets <<< "$cleaned"
+  if [[ "${#targets[@]}" -eq 0 ]]; then
+    fail "DEPLOY_TARGETS invalido"
+  fi
+  printf '%s\n' "${targets[@]}"
 }
 
 log "Validando comandos obrigatorios"
@@ -137,13 +189,11 @@ if [[ -z "$AWS_ACCOUNT_ID" ]]; then
   fail "Nao foi possivel descobrir AWS_ACCOUNT_ID"
 fi
 
-IMAGE_URI="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO}:${IMAGE_TAG}"
 if [[ -z "$EXECUTION_ROLE_ARN" ]]; then
   EXECUTION_ROLE_ARN="arn:aws:iam::${AWS_ACCOUNT_ID}:role/${EXECUTION_ROLE_NAME}"
 fi
 
 log "AWS_ACCOUNT_ID: $AWS_ACCOUNT_ID"
-log "IMAGE_URI: $IMAGE_URI"
 log "EXECUTION_ROLE_ARN: $EXECUTION_ROLE_ARN"
 
 log "Garantindo venv local"
@@ -154,10 +204,15 @@ fi
 log "Instalando boto3 na venv"
 ./.venv/bin/pip install --quiet --upgrade pip boto3
 
-log "Garantindo repositorio ECR"
-if ! run_aws ecr describe-repositories --repository-names "$ECR_REPO" --region "$AWS_REGION" >/dev/null 2>&1; then
-  run_aws ecr create-repository --repository-name "$ECR_REPO" --region "$AWS_REGION" >/dev/null
-fi
+TARGET_LIST=( $(parse_targets "$DEPLOY_TARGETS") )
+
+log "Garantindo repositorios ECR"
+for target in "${TARGET_LIST[@]}"; do
+  repo_name="$(resolve_target_repo "$target")"
+  if ! run_aws ecr describe-repositories --repository-names "$repo_name" --region "$AWS_REGION" >/dev/null 2>&1; then
+    run_aws ecr create-repository --repository-name "$repo_name" --region "$AWS_REGION" >/dev/null
+  fi
+done
 
 DOCKER_CONFIG_DIR="$(mktemp -d "${TMPDIR:-/tmp}/dijkfood-docker-config.XXXXXX")"
 trap cleanup_temp_docker_config EXIT
@@ -187,16 +242,40 @@ if [[ -n "$BUILDX_CMD" ]]; then
   $BUILDX_CMD create --name "$BUILDER_NAME" --use >/dev/null
   $BUILDX_CMD inspect --bootstrap >/dev/null
 
-  log "Build + push da imagem (linux/amd64)"
-  $BUILDX_CMD build \
-    --platform linux/amd64 \
-    -f "$DOCKERFILE_PATH" \
-    -t "$IMAGE_URI" \
-    --push \
-    .
+  for target in "${TARGET_LIST[@]}"; do
+    repo_name="$(resolve_target_repo "$target")"
+    dockerfile_path="$(resolve_target_dockerfile "$target")"
+    no_cache_flag="$(resolve_target_no_cache "$target")"
+    image_uri="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${repo_name}:${IMAGE_TAG}"
+
+    log "Build + push da imagem ${target} (linux/amd64)"
+    if [[ "$no_cache_flag" == "--no-cache" ]]; then
+      $BUILDX_CMD build \
+        --platform linux/amd64 \
+        --no-cache \
+        --pull \
+        -f "$dockerfile_path" \
+        -t "$image_uri" \
+        --push \
+        .
+    else
+      $BUILDX_CMD build \
+        --platform linux/amd64 \
+        -f "$dockerfile_path" \
+        -t "$image_uri" \
+        --push \
+        .
+    fi
+  done
 else
   log "Docker Buildx nao encontrado; usando build/push legado"
-  build_and_push_image_legacy
+  for target in "${TARGET_LIST[@]}"; do
+    repo_name="$(resolve_target_repo "$target")"
+    dockerfile_path="$(resolve_target_dockerfile "$target")"
+    no_cache_flag="$(resolve_target_no_cache "$target")"
+    image_uri="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${repo_name}:${IMAGE_TAG}"
+    build_and_push_image_legacy "$image_uri" "$dockerfile_path" "$no_cache_flag"
+  done
 fi
 
 log "Exportando variaveis para esta sessao"

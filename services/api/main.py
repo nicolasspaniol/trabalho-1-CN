@@ -2,7 +2,7 @@ from fastapi.responses import JSONResponse
 from sqlalchemy.exc import IntegrityError
 from fastapi import FastAPI, APIRouter, HTTPException, Depends, Request, Query, status, BackgroundTasks
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
-from sqlmodel import create_engine, Session, select, delete
+from sqlmodel import SQLModel, create_engine, Session, select, delete
 from secrets import compare_digest
 from os import getenv
 from typing import Annotated
@@ -125,6 +125,9 @@ async def integrity_exception_handler(_req: Request, _exc: IntegrityError):
 
 @app.on_event("startup")
 def ensure_table():
+    # Mantem o banco alinhado com os modelos atuais, mesmo quando schema.sql estiver desatualizado.
+    SQLModel.metadata.create_all(db_engine)
+
     existing = dynamodb.meta.client.list_tables()["TableNames"]
 
     if "CourierLocation" not in existing:
@@ -272,7 +275,7 @@ def get_merchant(id: int, session: SessionDep, _auth: AuthDep):
     return REST.get_one(session, em.Merchant, id)
 
 
-@customers.get("/me", response_model=em.CustomerPublic)
+@merchants.get("/me", response_model=em.MerchantPublic)
 def get_own_merchant(merchant: MerchantDep, session: SessionDep):
     return REST.get_one(session, em.Merchant, merchant.id)
 
@@ -652,6 +655,9 @@ def announce_order_is_ready(
 ):
     order = session.get(em.Order, order_id)
 
+    if not order:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Order not found")
+
     if order.merchant_id != merchant.id:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not your order")
 
@@ -676,6 +682,9 @@ def announce_order_picked_up(
 ):
     order = session.get(em.Order, order_id)
 
+    if not order:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Order not found")
+
     if order.courier_id != courier.id:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not your order")
 
@@ -696,6 +705,9 @@ def announce_order_in_transit(
     bg_tasks: BackgroundTasks
 ):
     order = session.get(em.Order, order_id)
+
+    if not order:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Order not found")
 
     if order.courier_id != courier.id:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not your order")
@@ -727,6 +739,9 @@ def announce_order_delivered(
     bg_tasks: BackgroundTasks
 ):
     order = session.get(em.Order, order_id)
+
+    if not order:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Order not found")
 
     if order.courier_id != courier.id:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not your order")

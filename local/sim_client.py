@@ -13,6 +13,30 @@ MERCHANTS_ENDPOINT = "/merchants/"
 ORDERS_ENDPOINT = "/orders/"
 
 
+def make_user_auth(user_id: int) -> aiohttp.BasicAuth:
+    return aiohttp.BasicAuth(str(user_id), "x")
+
+
+async def transition_order_for_dispatch(
+    session: aiohttp.ClientSession,
+    api_url: str,
+    order_id: int,
+    merchant_id: int,
+) -> bool:
+    try:
+        accept_url = f"{api_url.rstrip('/')}{ORDERS_ENDPOINT}{order_id}/accept"
+        async with session.post(accept_url, json={}, auth=make_user_auth(merchant_id)) as response:
+            response.raise_for_status()
+
+        ready_url = f"{api_url.rstrip('/')}{ORDERS_ENDPOINT}{order_id}/ready"
+        async with session.post(ready_url, json={}, auth=make_user_auth(merchant_id)) as response:
+            response.raise_for_status()
+
+        return True
+    except Exception:
+        return False
+
+
 async def place_order(
     session: aiohttp.ClientSession, api_url: str, customer_id: int, merchant_id: int, default_item_id: int
 ):
@@ -24,23 +48,28 @@ async def place_order(
     # Envia o POST para criar um pedido e espera a resposta para medir a latência de escrita
     try:
         url = f"{api_url.rstrip('/')}{ORDERS_ENDPOINT}"
-        async with session.post(url, json=payload) as response:
+        async with session.post(url, json=payload, auth=make_user_auth(customer_id)) as response:
             response.raise_for_status()
             result = await response.json()
-            latency = time.perf_counter() - start_time
-            return latency, result.get("id", result.get("order_id", "dummy_id"))
+            order_id = int(result.get("id", result.get("order_id", 0)) or 0)
+            write_latency = time.perf_counter() - start_time
+
+            if order_id and not await transition_order_for_dispatch(session, api_url, order_id, merchant_id):
+                return None, None, None
+
+            return write_latency, order_id, customer_id
     except Exception:
-        return None, None
+        return None, None, None
 
 
 async def check_order_status(
-    session: aiohttp.ClientSession, api_url: str, order_id: str
+    session: aiohttp.ClientSession, api_url: str, order_id: int, customer_id: int
 ):
     """Consulta eventos do pedido para medir a latência de leitura sob estresse"""
     start_time = time.perf_counter()
     try:
-        url = f"{api_url.rstrip('/')}{ORDERS_ENDPOINT}{order_id}/events"
-        async with session.get(url) as response:
+        url = f"{api_url.rstrip('/')}{ORDERS_ENDPOINT}{order_id}"
+        async with session.get(url, auth=make_user_auth(customer_id)) as response:
             response.raise_for_status()
             await response.json()
             return time.perf_counter() - start_time
@@ -70,7 +99,7 @@ async def run_load_test(
     """Executa o teste de carga gerando tráfego de pedidos e leituras concorrentes"""
     write_latencies = []
     read_latencies = []
-    active_orders = []
+    active_orders: list[tuple[int, int]] = []
     write_attempts = 0
     successful_writes = 0
     read_attempts = 0
@@ -102,21 +131,22 @@ async def run_load_test(
             # Dispara requisições concorrentes de leitura para provar isolamento do banco
             read_tasks = []
             if active_orders:
+                sampled_orders = [random.choice(active_orders) for _ in range(max(1, rps // 5))]
                 read_tasks = [
-                    check_order_status(session, api_url, random.choice(active_orders))
-                    for _ in range(max(1, rps // 5))
+                    check_order_status(session, api_url, order_id, owner_customer_id)
+                    for order_id, owner_customer_id in sampled_orders
                 ]
                 read_attempts += len(read_tasks)
 
             write_results = await asyncio.gather(*write_tasks)
             read_results = await asyncio.gather(*read_tasks) if read_tasks else []
 
-            for w_lat, o_id in write_results:
+            for w_lat, o_id, owner_customer_id in write_results:
                 if w_lat is not None:
                     write_latencies.append(w_lat)
                     successful_writes += 1
-                    if o_id != "dummy_id":
-                        active_orders.append(o_id)
+                    if o_id:
+                        active_orders.append((o_id, owner_customer_id))
 
             valid_reads = [r_lat for r_lat in read_results if r_lat is not None]
             read_latencies.extend(valid_reads)

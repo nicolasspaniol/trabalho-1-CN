@@ -59,9 +59,34 @@ async def get_json(session: aiohttp.ClientSession, url: str) -> Any:
         return await response.json()
 
 
+async def fetch_courier_ids(session: aiohttp.ClientSession, api_url: str) -> list[int]:
+    try:
+        payload = await get_json(session, f"{api_url.rstrip('/')}/couriers/")
+    except Exception as e:
+        print(f"  Erro ao buscar lista de couriers: {e}")
+        return []
+
+    if not isinstance(payload, list):
+        return []
+
+    courier_ids: list[int] = []
+    for item in payload:
+        if isinstance(item, dict) and "id" in item:
+            try:
+                courier_ids.append(int(item["id"]))
+            except (TypeError, ValueError):
+                continue
+    return courier_ids
+
+
 async def get_courier_current_order(session: aiohttp.ClientSession, api_url: str) -> dict[str, Any] | None:
     try:
         payload = await get_json(session, f"{api_url.rstrip('/')}/couriers/me/order")
+    except aiohttp.ClientResponseError as e:
+        if e.status == 404:
+            return None
+        print(f"  Erro ao buscar pedido atual: {e}")
+        return None
     except Exception as e:
         print(f"  Erro ao buscar pedido atual: {e}")
         return None
@@ -126,6 +151,16 @@ async def mark_order_ready(session: aiohttp.ClientSession, api_url: str, order_i
         return False
 
 
+async def mark_order_in_transit(session: aiohttp.ClientSession, api_url: str, order_id: int) -> bool:
+    try:
+        async with session.post(f"{api_url.rstrip('/')}/orders/{order_id}/in_transit", json={}) as response:
+            response.raise_for_status()
+            return True
+    except Exception as e:
+        print(f"  Erro ao marcar pedido {order_id} como in_transit: {e}")
+        return False
+
+
 async def mark_order_delivered(session: aiohttp.ClientSession, api_url: str, order_id: int) -> bool:
     try:
         async with session.post(f"{api_url.rstrip('/')}/orders/{order_id}/delivered", json={}) as response:
@@ -153,36 +188,25 @@ async def deliver_order_new(
     can_mark_delivered: bool,
 ) -> bool:
     order_id = int(order["id"])
-    merchant_id = int(order["merchant_id"])
-    customer_id = int(order["customer_id"])
-
-    merchant_address = await get_merchant_address(session, api_url, merchant_id)
-    customer_address = await get_customer_address(session, api_url, customer_id)
-
-    if merchant_address is None or customer_address is None:
-        return False
-
-    print(f"✓ Novo pedido atribuído: id={order_id}, merchant={merchant_id}, customer={customer_id}")
-
-    # No contrato completo, o accept continua válido antes do picked_up.
-    if not await accept_order(session, api_url, order_id):
-        return False
-
-    if not await mark_order_ready(session, api_url, order_id):
-        return False
-
-    print(f"  ↳ Movendo courier para restaurante no node {merchant_address}")
-    if not await update_courier_location(session, api_url, merchant_address):
-        return False
+    print(f"✓ Novo pedido atribuído: id={order_id}")
 
     if not await mark_order_picked_up(session, api_url, order_id):
         return False
 
+    if not await mark_order_in_transit(session, api_url, order_id):
+        return False
+
     await asyncio.sleep(1)
 
-    print(f"  ↳ Movendo courier para cliente no node {customer_address}")
-    if not await update_courier_location(session, api_url, customer_address):
-        return False
+    route = order.get("delivery_route") if isinstance(order, dict) else None
+    if isinstance(route, dict):
+        path_to_user = route.get("path_to_user")
+        if isinstance(path_to_user, list) and path_to_user:
+            try:
+                customer_node = int(path_to_user[-1])
+                await update_courier_location(session, api_url, customer_node)
+            except (TypeError, ValueError):
+                pass
 
     if can_mark_delivered:
         if not await mark_order_delivered(session, api_url, order_id):
@@ -190,6 +214,55 @@ async def deliver_order_new(
 
     print(f"  ✓ Pedido {order_id} entregue com sucesso")
     return True
+
+
+async def run_courier_loop(
+    api_url: str,
+    courier_username: str,
+    delivery_mode: str,
+    can_mark_delivered: bool,
+):
+    auth = aiohttp.BasicAuth(courier_username, "x")
+
+    async with aiohttp.ClientSession(auth=auth) as session:
+        last_handled_order_id: int | None = None
+
+        while True:
+            try:
+                current_order = await get_courier_current_order(session, api_url)
+
+                if not current_order:
+                    if last_handled_order_id is not None:
+                        print(f"✓ Pedido {last_handled_order_id} finalizado (courier={courier_username})")
+                        last_handled_order_id = None
+                    await asyncio.sleep(2)
+                    continue
+
+                order_id = int(current_order.get("id"))
+                status = current_order.get("status")
+
+                if order_id == last_handled_order_id:
+                    await asyncio.sleep(2)
+                    continue
+
+                if delivery_mode == NEW_DELIVERY_MODE:
+                    if status != "READY_FOR_PICKUP":
+                        await asyncio.sleep(2)
+                        continue
+                    handled = await deliver_order_new(session, api_url, current_order, can_mark_delivered)
+                    if handled:
+                        last_handled_order_id = order_id
+                else:
+                    print(
+                        "  └─ Contrato de courier incompleto; aguardando /orders/{order_id}/accept, "
+                        "/orders/{order_id}/ready, /couriers/me/location e /orders/{order_id}/picked_up"
+                    )
+                    last_handled_order_id = order_id
+
+            except Exception as e:
+                print(f"✗ Erro no courier worker ({courier_username}): {e}")
+
+            await asyncio.sleep(2)
 
 
 async def delivery_worker(api_url: str, username: str | None = None, password: str | None = None):
@@ -201,13 +274,25 @@ async def delivery_worker(api_url: str, username: str | None = None, password: s
     - Contrato final estendido: inclui também POST /orders/{id}/delivered
     - Parcial: apenas monitora e registra que falta contrato
     """
-    auth = None
     username = username or os.getenv("API_USERNAME")
     password = password or os.getenv("API_PASSWORD")
-    if username and password:
-        auth = aiohttp.BasicAuth(username, password)
 
-    async with aiohttp.ClientSession(auth=auth) as session:
+    admin_auth = aiohttp.BasicAuth(username, password) if username and password else None
+    async with aiohttp.ClientSession(auth=admin_auth) as admin_session:
+        courier_ids = await fetch_courier_ids(admin_session, api_url)
+
+    selected_couriers: list[str] = []
+    if courier_ids:
+        selected_couriers = [str(cid) for cid in courier_ids]
+        print(f"Iniciando courier worker com {len(selected_couriers)} couriers")
+    elif username and username.isnumeric():
+        selected_couriers = [username]
+        print(f"Iniciando courier worker usando courier_id informado: {username}")
+    else:
+        print("Nao foi possivel descobrir um courier valido; simulacao de entrega nao sera iniciada")
+        return
+
+    async with aiohttp.ClientSession(auth=admin_auth) as session:
         paths = await fetch_openapi_paths(session, api_url)
         delivery_mode = resolve_delivery_mode(paths)
         can_mark_delivered = supports_delivered(paths)
@@ -220,44 +305,18 @@ async def delivery_worker(api_url: str, username: str | None = None, password: s
         else:
             print("Iniciando courier worker em modo parcial: contrato de delivery incompleto")
 
-        last_handled_order_id: int | None = None
-
-        while True:
-            try:
-                current_order = await get_courier_current_order(session, api_url)
-
-                if not current_order:
-                    if last_handled_order_id is not None:
-                        print(f"✓ Pedido {last_handled_order_id} finalizado")
-                        last_handled_order_id = None
-                    else:
-                        print("  └─ Aguardando novo pedido...")
-                    await asyncio.sleep(2)
-                    continue
-
-                order_id = int(current_order.get("id"))
-                status = current_order.get("status")
-
-                if order_id == last_handled_order_id:
-                    print(f"  └─ Pedido {order_id} em andamento (status={status})")
-                    await asyncio.sleep(2)
-                    continue
-
-                if delivery_mode == NEW_DELIVERY_MODE:
-                    handled = await deliver_order_new(session, api_url, current_order, can_mark_delivered)
-                    if handled:
-                        last_handled_order_id = order_id
-                else:
-                    print(
-                        "  └─ Contrato de courier incompleto; aguardando /orders/{order_id}/accept, "
-                        "/orders/{order_id}/ready, /couriers/me/location e /orders/{order_id}/picked_up"
-                    )
-                    last_handled_order_id = order_id
-
-            except Exception as e:
-                print(f"✗ Erro no courier worker: {e}")
-
-            await asyncio.sleep(2)
+        tasks = [
+            asyncio.create_task(
+                run_courier_loop(
+                    api_url=api_url,
+                    courier_username=courier_username,
+                    delivery_mode=delivery_mode,
+                    can_mark_delivered=can_mark_delivered,
+                )
+            )
+            for courier_username in selected_couriers
+        ]
+        await asyncio.gather(*tasks)
 
 
 if __name__ == "__main__":

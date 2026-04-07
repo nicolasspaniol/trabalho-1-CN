@@ -1,15 +1,23 @@
 REGION = "us-east-1"
 CLUSTER_NAME = "DijkFood-Cluster"
 SERVICE_NAME = "Routing-Worker-Service"
+API_SERVICE_NAME = "DijkFood-Api-Service"
 TABLE_NAME = "Couriers"
 ECR_REPO = "worker"
+API_ECR_REPO = "api"
 IMAGE_TAG = "latest"
 TASK_FAMILY = "routing-worker-task"
+API_TASK_FAMILY = "dijkfood-api-task"
 LOAD_BALANCER_NAME = "alb-routing-worker"
+API_LOAD_BALANCER_NAME = "alb-dijkfood-api"
 TARGET_GROUP_NAME = "tg-routing-worker"
+API_TARGET_GROUP_NAME = "tg-dijkfood-api"
 LOG_GROUP_NAME = "/ecs/routing-worker"
+API_LOG_GROUP_NAME = "/ecs/dijkfood-api"
 ALB_SG_NAME = "routing-worker-alb"
 TASK_SG_NAME = "routing-worker-task"
+API_ALB_SG_NAME = "dijkfood-api-alb"
+API_TASK_SG_NAME = "dijkfood-api-task"
 # Overrides (recomendado deixar automatico)
 VPC_ID = None
 SUBNETS = []

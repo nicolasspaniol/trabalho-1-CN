@@ -172,6 +172,7 @@ def load_schema_to_rds(db_endpoint, sql_file_path):
     Conecta ao RDS via psycopg2 e executa o script SQL.
     """
     db_password = require_db_password()
+    reset_schema = os.getenv("DB_RESET_SCHEMA", "1").strip().lower() not in {"0", "false", "no"}
     print(f"🛠️ Conectando ao RDS para carregar o schema: {sql_file_path}...")
     
     try:
@@ -183,6 +184,13 @@ def load_schema_to_rds(db_endpoint, sql_file_path):
             password=db_password
         )
         cur = conn.cursor()
+
+        if reset_schema:
+            print("🧹 Limpando schema public para evitar colunas/tabelas legadas...")
+            cur.execute("DROP SCHEMA IF EXISTS public CASCADE;")
+            cur.execute("CREATE SCHEMA public;")
+            cur.execute("GRANT ALL ON SCHEMA public TO postgres;")
+            cur.execute("GRANT ALL ON SCHEMA public TO public;")
         
         print(f"📖 Lendo arquivo SQL...")
         with open(sql_file_path, 'r') as f:

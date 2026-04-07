@@ -5,6 +5,14 @@ import boto3
 
 from local.constants import (
     ALB_SG_NAME,
+    API_ALB_SG_NAME,
+    API_ECR_REPO,
+    API_LOAD_BALANCER_NAME,
+    API_LOG_GROUP_NAME,
+    API_SERVICE_NAME,
+    API_TARGET_GROUP_NAME,
+    API_TASK_FAMILY,
+    API_TASK_SG_NAME,
     CLUSTER_NAME,
     ECR_REPO,
     IMAGE_TAG,
@@ -31,10 +39,10 @@ def resolve_account_id(sts):
     return sts.get_caller_identity()["Account"]
 
 
-def resolve_image_uri(account_id, region):
-    if "IMAGE_URI" in os.environ and os.environ["IMAGE_URI"].strip():
-        return os.environ["IMAGE_URI"].strip()
-    return f"{account_id}.dkr.ecr.{region}.amazonaws.com/{ECR_REPO}:{IMAGE_TAG}"
+def resolve_image_uri(account_id, region, repo_name: str, env_var: str):
+    if env_var in os.environ and os.environ[env_var].strip():
+        return os.environ[env_var].strip()
+    return f"{account_id}.dkr.ecr.{region}.amazonaws.com/{repo_name}:{IMAGE_TAG}"
 
 
 def resolve_graph_file_key():
@@ -117,10 +125,10 @@ def allow_http(ec2, group_id, source_group_id=None):
             raise
 
 
-def get_or_create_target_group(elbv2, vpc_id):
+def get_or_create_target_group(elbv2, vpc_id, target_group_name: str):
     try:
         return elbv2.create_target_group(
-            Name=TARGET_GROUP_NAME,
+            Name=target_group_name,
             Protocol="HTTP",
             Port=80,
             VpcId=vpc_id,
@@ -128,13 +136,13 @@ def get_or_create_target_group(elbv2, vpc_id):
             TargetType="ip",
         )["TargetGroups"][0]["TargetGroupArn"]
     except elbv2.exceptions.DuplicateTargetGroupNameException:
-        return elbv2.describe_target_groups(Names=[TARGET_GROUP_NAME])["TargetGroups"][0]["TargetGroupArn"]
+        return elbv2.describe_target_groups(Names=[target_group_name])["TargetGroups"][0]["TargetGroupArn"]
 
 
-def get_or_create_load_balancer(elbv2, alb_sg_id, subnets):
+def get_or_create_load_balancer(elbv2, alb_sg_id, subnets, load_balancer_name: str):
     try:
         return elbv2.create_load_balancer(
-            Name=LOAD_BALANCER_NAME,
+            Name=load_balancer_name,
             Subnets=subnets,
             SecurityGroups=[alb_sg_id],
             Scheme="internet-facing",
@@ -142,7 +150,7 @@ def get_or_create_load_balancer(elbv2, alb_sg_id, subnets):
             IpAddressType="ipv4",
         )["LoadBalancers"][0]["LoadBalancerArn"]
     except elbv2.exceptions.DuplicateLoadBalancerNameException:
-        lb = elbv2.describe_load_balancers(Names=[LOAD_BALANCER_NAME])["LoadBalancers"][0]
+        lb = elbv2.describe_load_balancers(Names=[load_balancer_name])["LoadBalancers"][0]
         if alb_sg_id not in lb.get("SecurityGroups", []):
             elbv2.set_security_groups(LoadBalancerArn=lb["LoadBalancerArn"], SecurityGroups=[alb_sg_id])
         return lb["LoadBalancerArn"]
@@ -236,7 +244,7 @@ def setup_worker_infrastructure(region, cluster_name, service_name, table_name, 
     account_id = resolve_account_id(sts)
     vpc_id = resolve_vpc_id(ec2)
     subnets = resolve_subnets(ec2, vpc_id)
-    image_uri = resolve_image_uri(account_id, region)
+    image_uri = resolve_image_uri(account_id, region, ECR_REPO, "IMAGE_URI")
     graph_file_key = resolve_graph_file_key()
     db_host = resolve_db_host()
     db_password = resolve_db_password()
@@ -275,8 +283,8 @@ def setup_worker_infrastructure(region, cluster_name, service_name, table_name, 
     except dynamodb.exceptions.ResourceInUseException:
         pass
 
-    tg_arn = get_or_create_target_group(elbv2, vpc_id)
-    lb_arn = get_or_create_load_balancer(elbv2, alb_sg_id, subnets)
+    tg_arn = get_or_create_target_group(elbv2, vpc_id, TARGET_GROUP_NAME)
+    lb_arn = get_or_create_load_balancer(elbv2, alb_sg_id, subnets, LOAD_BALANCER_NAME)
     ensure_listener(elbv2, lb_arn, tg_arn)
 
     task_arn = ecs.register_task_definition(
@@ -323,6 +331,137 @@ def setup_worker_infrastructure(region, cluster_name, service_name, table_name, 
         "launchType": "FARGATE",
         "networkConfiguration": {"awsvpcConfiguration": {"subnets": subnets, "securityGroups": [task_sg_id], "assignPublicIp": "ENABLED"}},
         "loadBalancers": [{"targetGroupArn": tg_arn, "containerName": "worker-container", "containerPort": 80}],
+    }
+
+    if status == "ACTIVE":
+        update_kwargs = dict(service_kwargs)
+        update_kwargs.pop("launchType", None)
+        ecs.update_service(service=service_name, forceNewDeployment=True, **update_kwargs)
+    else:
+        ecs.create_service(serviceName=service_name, **service_kwargs)
+
+    ensure_service_autoscaling(
+        autoscaling=autoscaling,
+        cluster_name=cluster_name,
+        service_name=service_name,
+        min_capacity=2,
+        max_capacity=20,
+        cpu_target=70.0,
+        memory_target=75.0,
+        scale_out_cooldown=30,
+        scale_in_cooldown=300,
+    )
+    return True
+
+
+def setup_api_infrastructure(
+    region,
+    cluster_name,
+    service_name,
+    worker_base_url,
+    db_host,
+    db_password,
+    execution_role_arn,
+):
+    if not execution_role_arn:
+        raise ValueError("execution_role_arn is required")
+
+    sts = boto3.client("sts", region_name=region)
+    ec2 = boto3.client("ec2", region_name=region)
+    elbv2 = boto3.client("elbv2", region_name=region)
+    ecs = boto3.client("ecs", region_name=region)
+    logs = boto3.client("logs", region_name=region)
+    autoscaling = boto3.client("application-autoscaling", region_name=region)
+
+    account_id = resolve_account_id(sts)
+    vpc_id = resolve_vpc_id(ec2)
+    subnets = resolve_subnets(ec2, vpc_id)
+    image_uri = resolve_image_uri(account_id, region, API_ECR_REPO, "API_IMAGE_URI")
+
+    admin_username = os.getenv("ADMIN_USERNAME", "admin")
+    admin_password = os.getenv("ADMIN_PASSWORD", "admin")
+
+    alb_sg_id = ensure_security_group(ec2, vpc_id, API_ALB_SG_NAME, "Ingress publico HTTP para ALB da API")
+    task_sg_id = ensure_security_group(ec2, vpc_id, API_TASK_SG_NAME, "Ingress HTTP do ALB para tasks ECS da API")
+    allow_http(ec2, alb_sg_id)
+    allow_http(ec2, task_sg_id, source_group_id=alb_sg_id)
+
+    cluster_info = ecs.describe_clusters(clusters=[cluster_name]).get("clusters", [])
+    cluster_status = cluster_info[0].get("status") if cluster_info else None
+    if cluster_status != "ACTIVE":
+        ecs.create_cluster(clusterName=cluster_name)
+
+    for _ in range(12):
+        current = ecs.describe_clusters(clusters=[cluster_name]).get("clusters", [])
+        if current and current[0].get("status") == "ACTIVE":
+            break
+        time.sleep(2)
+
+    try:
+        logs.create_log_group(logGroupName=API_LOG_GROUP_NAME)
+    except logs.exceptions.ResourceAlreadyExistsException:
+        pass
+
+    tg_arn = get_or_create_target_group(elbv2, vpc_id, API_TARGET_GROUP_NAME)
+    lb_arn = get_or_create_load_balancer(elbv2, alb_sg_id, subnets, API_LOAD_BALANCER_NAME)
+    ensure_listener(elbv2, lb_arn, tg_arn)
+
+    task_arn = ecs.register_task_definition(
+        family=API_TASK_FAMILY,
+        networkMode="awsvpc",
+        requiresCompatibilities=["FARGATE"],
+        cpu="1024",
+        memory="2048",
+        executionRoleArn=execution_role_arn,
+        taskRoleArn=execution_role_arn,
+        containerDefinitions=[
+            {
+                "name": "api-container",
+                "image": image_uri,
+                "portMappings": [{"containerPort": 80}],
+                "environment": [
+                    {"name": "WORKER_URL", "value": worker_base_url},
+                    {"name": "DB_USERNAME", "value": "postgres"},
+                    {"name": "DB_PASSWORD", "value": db_password},
+                    {"name": "DB_HOST", "value": db_host},
+                    {"name": "DB_PORT", "value": "5432"},
+                    {"name": "DB_NAME", "value": "postgres"},
+                    {"name": "DYNAMODB_REGION", "value": region},
+                    {"name": "ADMIN_USERNAME", "value": admin_username},
+                    {"name": "ADMIN_PASSWORD", "value": admin_password},
+                ],
+                "logConfiguration": {
+                    "logDriver": "awslogs",
+                    "options": {
+                        "awslogs-group": API_LOG_GROUP_NAME,
+                        "awslogs-region": region,
+                        "awslogs-stream-prefix": "ecs",
+                    },
+                },
+            }
+        ],
+    )["taskDefinition"]["taskDefinitionArn"]
+
+    services = ecs.describe_services(cluster=cluster_name, services=[service_name]).get("services", [])
+    status = services[0].get("status") if services else None
+    if status == "DRAINING":
+        ecs.delete_service(cluster=cluster_name, service=service_name, force=True)
+        wait_service_gone(ecs, cluster_name, service_name)
+        status = None
+
+    service_kwargs = {
+        "cluster": cluster_name,
+        "taskDefinition": task_arn,
+        "desiredCount": 2,
+        "launchType": "FARGATE",
+        "networkConfiguration": {
+            "awsvpcConfiguration": {
+                "subnets": subnets,
+                "securityGroups": [task_sg_id],
+                "assignPublicIp": "ENABLED",
+            }
+        },
+        "loadBalancers": [{"targetGroupArn": tg_arn, "containerName": "api-container", "containerPort": 80}],
     }
 
     if status == "ACTIVE":

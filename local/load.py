@@ -18,6 +18,13 @@ MERCHANTS_ENDPOINT = "/merchants/"
 COURIERS_ENDPOINT = "/couriers/"
 
 
+class EndpointRequestError(RuntimeError):
+    def __init__(self, endpoint: str, status: int, message: str):
+        super().__init__(f"{endpoint} -> HTTP {status}: {message}")
+        self.endpoint = endpoint
+        self.status = status
+
+
 def load_graph_from_pickle(filepath: str):
     """
     Lê e carrega o arquivo pickle para retornar o grafo
@@ -61,7 +68,9 @@ async def create_entity(
     """
     url = f"{api_url.rstrip('/')}{endpoint}"
     async with session.post(url, json=payload) as response:
-        response.raise_for_status()
+        if response.status >= 400:
+            body = (await response.text())[:500]
+            raise EndpointRequestError(endpoint, response.status, body)
         return await response.json()
 
 
@@ -117,7 +126,18 @@ async def populate_database(api_url: str, graph_path: str, num_users: int, usern
             tasks.append(create_entity(session, api_url, MERCHANTS_ENDPOINT, payload))
 
         print(f"Enviando {len(tasks)} requisições de cadastro para a API...")
-        results = await asyncio.gather(*tasks)
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        failures = [err for err in results if isinstance(err, Exception)]
+        if failures:
+            print("Falhas detectadas durante carga inicial:")
+            for failure in failures:
+                if isinstance(failure, EndpointRequestError):
+                    print(f"  - {failure}")
+                else:
+                    print(f"  - erro inesperado: {failure}")
+            raise RuntimeError(f"Carga inicial falhou em {len(failures)} requisicoes")
+
         print(f"Banco populado! {len(results)} registros criados.")
 
 
