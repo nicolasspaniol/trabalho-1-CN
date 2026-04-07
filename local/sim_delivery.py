@@ -85,7 +85,7 @@ async def get_courier_current_order(session: aiohttp.ClientSession, api_url: str
     try:
         payload = await get_json(session, f"{api_url.rstrip('/')}/couriers/me/order")
     except aiohttp.ClientResponseError as e:
-        if e.status == 404:
+        if e.status in (404, 500, 502, 503, 504):
             return None
         print(f"  Erro ao buscar pedido atual: {e}")
         return None
