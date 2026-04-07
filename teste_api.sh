@@ -1,113 +1,102 @@
-alias curl="sleep .1; curl -s"
+url="http://127.0.0.1:8000"
+url_loc="http:/127.0.0.1:8050"
 
-# Criar cliente
-curl -X 'POST' \
-  'http://127.0.0.1:8000/customers/' \
-  -H 'accept: application/json' \
-  -H 'Content-Type: application/json' \
-  -d '{
-  "name": "nome",
-  "email": "customer@email",
-  "phone": "019239238",
-  "address": 10
-}' -u admin:123 | jq
+req() {
+  echo "----------------" >&2
+  sleep .5
+  echo "$3" >&2
+  res=$(curl -s -H 'Content-Type: application/json' "$@")
+  echo "$res" | jq -C >&2
+  echo "$res"
+}
 
-# Criar restaurante
-curl -X 'POST' \
-  'http://127.0.0.1:8000/merchants/' \
-  -H 'accept: application/json' \
-  -H 'Content-Type: application/json' \
-  -d '{
-  "name": "los pollos hermanos",
-  "type": "mexicana",
-  "address": 20,
-  "items": [
-    {
-      "name": "taco",
-      "preparation_time": 10,
-      "price": 14
-    }
-  ]
-}' -u admin:123 | jq
+get() {
+  echo "$1" | jq -r "$2"
+}
 
-# Criar entregador
-curl -X 'POST' \
-  'http://127.0.0.1:8000/couriers/' \
-  -H 'accept: application/json' \
-  -H 'Content-Type: application/json' \
-  -d '{
-  "name": "jame",
-  "location": 50,
-  "vehicle_type": "carro",
-  "availability": true
-}' -u admin:123 | jq
+# Criar cliente (ADMIN)
+email="customer$RANDOM@email"
+res=$(req -X POST "$url/customers/" \
+  -d "{\"name\":\"nome\",\"email\":\"$email\",\"phone\":\"019239238\",\"address\":10}" \
+  -u admin:123)
 
-# Fazer pedido (CLIENTE)
-curl -X 'POST' \
-  'http://127.0.0.1:8000/orders/' \
-  -H 'accept: application/json' \
-  -H 'Content-Type: application/json' \
-  -d '{
-  "merchant_id": 1,
-  "item_ids": [1]
-}' -u 1: | jq
+customer_id=$(get "$res" '.user_id')
+echo "ID: $customer_id"
+
+# Criar restaurante (ADMIN)
+res=$(req -X POST "$url/merchants/" \
+  -d '{"name":"los pollos hermanos","type":"mexicana","address":20,"items":[{"name":"taco","preparation_time":10,"price":14}]}' \
+  -u admin:123)
+
+merchant_id=$(get "$res" '.user_id')
+echo "ID: $merchant_id"
+
+# Criar entregador (ADMIN)
+res=$(req -X POST "$url/couriers/" \
+  -d '{"name":"jame","location":50,"vehicle_type":"carro","availability":true}' \
+  -u admin:123)
+
+courier_id=$(get "$res" '.user_id')
+echo "ID: $courier_id"
+
+# Criar pedido (CLIENTE)
+res=$(req -X POST "$url/orders/" \
+  -d "{\"merchant_id\": $merchant_id, \"item_ids\": [1]}" \
+  -u "$customer_id":)
+
+order_id=$(get "$res" '.id')
 
 # Pedido aceito (RESTAURANTE)
-curl -X 'POST' \
-  'http://127.0.0.1:8000/orders/1/accept' \
-  -H 'accept: application/json' \
-  -u 1: | jq
+req -X PATCH "$url/orders/$order_id" \
+  -d '{"status":"preparing"}' \
+  -u "$merchant_id":
 
 # Pedido pronto (RESTAURANTE)
-curl -X 'POST' \
-  'http://127.0.0.1:8000/orders/1/ready' \
-  -H 'accept: application/json' \
-  -u 1: | jq
+req -X PATCH "$url/orders/$order_id" \
+  -d '{"status":"ready_for_pickup"}' \
+  -u "$merchant_id":
+
+# Ver todos os pedidos feitos (CLIENTE)
+req -X GET "$url/orders/" \
+  -u "$customer_id":
 
 # Ver pedido atribuido (ENTREGADOR)
-curl -X 'GET' \
-  'http://127.0.0.1:8000/couriers/me/order' \
-  -H 'accept: application/json' \
-  -u 1: | jq
+req -X GET "$url/orders/?status=ready_for_pickup" \
+  -u "$courier_id":
 
 # Pedido recolhido (ENTREGADOR)
-curl -X 'POST' \
-  'http://127.0.0.1:8000/orders/1/picked_up' \
-  -H 'accept: application/json' \
-  -u 1: | jq
+req -X PATCH "$url/orders/$order_id" \
+  -d '{"status":"picked_up"}' \
+  -u "$courier_id":
 
 # Pedido em trânsito (ENTREGADOR)
-curl -X 'POST' \
-  'http://127.0.0.1:8000/orders/1/in_transit' \
-  -H 'accept: application/json' \
-  -u 1: | jq
+req -X PATCH "$url/orders/$order_id" \
+  -d '{"status":"in_transit"}' \
+  -u "$courier_id":
 
 # Atualiza posição (ENTREGADOR)
-curl -X 'PUT' \
-  'http://127.0.0.1:8000/couriers/me/location?location=23' \
-  -H 'accept: application/json' \
-  -u 1: | jq
+req -X PUT "$url_loc?order_id=$order_id" \
+  -d '{"location": 23}' \
+  -u "$courier_id":
+
+req -X PUT "$url_loc?order_id=$order_id" \
+  -d '{"location": 28}' \
+  -u "$courier_id":
+
+# Consultar entrega (CLIENTE)
+req -X GET "$url/orders/$order_id" \
+  -u "$customer_id":
 
 # Atualiza posição (ENTREGADOR)
-curl -X 'PUT' \
-  'http://127.0.0.1:8000/couriers/me/location?location=31' \
-  -H 'accept: application/json' \
-  -u 1: | jq
-
-# Consulta entrega (CLIENTE)
-curl -X 'GET' \
-  'http://127.0.0.1:8000/orders/1' \
-  -H 'accept: application/json' \
-  -u 1: | jq
-
-# Atualiza posição (ENTREGADOR)
-curl -X 'PUT' \
-  'http://127.0.0.1:8000/couriers/me/location?location=8' \
-  -H 'accept: application/json' \
-  -u 1: | jq
+req -X PUT "$url_loc?order_id=$order_id" \
+  -d '{"location": 43}' \
+  -u "$courier_id":
 
 # Pedido entregue (ENTREGADOR)
-curl -X 'POST' \
-  'http://127.0.0.1:8000/orders/1/delivered' \
-  -H 'accept: application/json' \
-  -u 1: | jq
+req -X PATCH "$url/orders/$order_id" \
+  -d '{"status":"delivered"}' \
+  -u "$courier_id":
+
+# Ver todos os pedidos feitos (CLIENTE)
+req -X GET "$url/orders/" \
+  -u "$customer_id":

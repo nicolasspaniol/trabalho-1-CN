@@ -1,69 +1,90 @@
--- 1. Tabela de Clientes
-CREATE TABLE CUSTOMER (
-    ID SERIAL PRIMARY KEY,
-    Name VARCHAR(255) NOT NULL,
-    Email VARCHAR(255) UNIQUE NOT NULL,
-    Phone VARCHAR(20) NOT NULL,
-    Address INTEGER NOT NULL -- Armazena o ID do Nó do grafo (OSMNX)
+CREATE TYPE user_role AS ENUM (
+    'customer',
+    'merchant',
+    'courier'
 );
 
--- 2. Tabela de Restaurantes (Merchants)
-CREATE TABLE MERCHANT (
-    ID SERIAL PRIMARY KEY,
-    Name VARCHAR(255) NOT NULL,
-    Type VARCHAR(100) NOT NULL, -- Ex: Italiana, Japonesa
-    Address INTEGER NOT NULL -- Armazena o ID do Nó do grafo
+CREATE TYPE order_status AS ENUM (
+    'confirmed',
+    'preparing',
+    'ready_for_pickup',
+    'picked_up',
+    'in_transit',
+    'delivered'
 );
 
--- 3. Tabela de Itens (Cardápio)
+-- Tabela de Usuários
+CREATE TABLE "user" (
+    id SERIAL PRIMARY KEY,
+    role user_role NOT NULL
+);
+
+-- Tabela de Clientes
+CREATE TABLE customer (
+    user_id INTEGER PRIMARY KEY REFERENCES "user" (id) ON DELETE CASCADE,
+    name VARCHAR(255) NOT NULL,
+    email VARCHAR(255) UNIQUE NOT NULL,
+    phone VARCHAR(20) NOT NULL,
+    address INTEGER NOT NULL -- Armazena o ID do Nó do grafo (OSMNX)
+);
+
+-- Tabela de Restaurantes (Merchants)
+CREATE TABLE merchant (
+    user_id INTEGER PRIMARY KEY REFERENCES "user" (id) ON DELETE CASCADE,
+    name VARCHAR(255) NOT NULL,
+    type VARCHAR(100) NOT NULL, -- Ex: Italiana, Japonesa
+    address INTEGER NOT NULL -- Armazena o ID do Nó do grafo
+);
+
+-- Tabela de Entregadores (Couriers)
+CREATE TABLE courier (
+    user_id INTEGER PRIMARY KEY REFERENCES "user" (id) ON DELETE CASCADE,
+    name VARCHAR(255) NOT NULL,
+    vehicle_type VARCHAR(50) NOT NULL, -- Ex: Moto, Bicicleta
+    location INTEGER NOT NULL, -- ID do Nó inicial/atual
+    availability BOOLEAN -- TRUE = AVAILABLE, FALSE = BUSY
+);
+
+-- Tabela de Itens (Cardápio)
 -- Regra: Um item está atrelado a exatamente 1 restaurante
-CREATE TABLE ITEM (
-    ID SERIAL PRIMARY KEY,
-    Name VARCHAR(255) NOT NULL,
-    Merchant_ID INTEGER NOT NULL REFERENCES MERCHANT (ID),
-    Preparation_Time INTEGER NOT NULL, -- Tempo somado para definir transição de status
-    Price DECIMAL(10, 2) NOT NULL
+CREATE TABLE item (
+    id SERIAL PRIMARY KEY,
+    name VARCHAR(255) NOT NULL,
+    merchant_id INTEGER NOT NULL REFERENCES merchant (user_id),
+    preparation_time INTEGER NOT NULL, -- Tempo somado para definir transição de status
+    price DECIMAL(10, 2) NOT NULL
 );
 
--- 4. Tabela de Entregadores (Couriers)
-CREATE TABLE COURIER (
-    ID SERIAL PRIMARY KEY,
-    Name VARCHAR(255) NOT NULL,
-    Vehicle_Type VARCHAR(50) NOT NULL, -- Ex: Moto, Bicicleta
-    Location INTEGER NOT NULL, -- ID do Nó inicial/atual
-    Availability BOOLEAN DEFAULT TRUE -- TRUE = AVAILABLE, FALSE = BUSY
-);
-
--- 5. Tabela de Pedidos (Orders)
+-- Tabela de Pedidos (Orders)
 -- Regra: O Courier_ID é opcional (NULL) até o estado READY_FOR_PICKUP
-CREATE TABLE "ORDER" (
-    ID SERIAL PRIMARY KEY,
-    Customer_ID INTEGER NOT NULL REFERENCES CUSTOMER (ID),
-    Merchant_ID INTEGER NOT NULL REFERENCES MERCHANT (ID),
-    Courier_ID INTEGER REFERENCES COURIER (ID) NULL,
-    Status VARCHAR(50) NOT NULL DEFAULT 'CONFIRMED',
-    Order_Time TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+CREATE TABLE "order" (
+    id SERIAL PRIMARY KEY,
+    customer_id INTEGER NOT NULL REFERENCES customer (user_id),
+    merchant_id INTEGER NOT NULL REFERENCES merchant (user_id),
+    courier_id INTEGER REFERENCES courier (user_id) NULL,
+    status order_status NOT NULL,
+    order_time TIMESTAMP
 );
 
--- 6. Tabela de Itens do Pedido (N:N entre Order e Item)
+-- Tabela de Itens do Pedido (N:N entre Order e Item)
 -- Regra: Um cliente pode pedir uma lista de itens de um merchant
-CREATE TABLE ORDER_LIST (
-    Order_ID INTEGER NOT NULL REFERENCES "ORDER" (ID) ON DELETE CASCADE,
-    Item_ID INTEGER NOT NULL REFERENCES ITEM (ID),
-    Items_Quantity INTEGER NOT NULL CHECK (Items_Quantity > 0),
-    Total_Price DECIMAL(10, 2) NOT NULL,
-    PRIMARY KEY (Order_ID, Item_ID)
+CREATE TABLE order_item (
+    order_id INTEGER NOT NULL REFERENCES "order" (id) ON DELETE CASCADE,
+    item_id INTEGER NOT NULL REFERENCES item (id),
+    amount INTEGER NOT NULL CHECK (amount > 0),
+    total_price DECIMAL(10, 2) NOT NULL,
+    PRIMARY KEY (order_id, item_id)
 );
 
--- 7. Tabela de Histórico de Eventos (Para consulta do Administrador)
-CREATE TABLE ORDER_EVENTS (
-    ID SERIAL PRIMARY KEY,
-    Order_ID INTEGER NOT NULL REFERENCES "ORDER" (ID) ON DELETE CASCADE,
-    Status_Change VARCHAR(50) NOT NULL,
-    Change_Time TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+-- Tabela de Histórico de Eventos (Para consulta do Administrador)
+CREATE TABLE order_event (
+    id SERIAL PRIMARY KEY,
+    order_id INTEGER NOT NULL REFERENCES "order" (id) ON DELETE CASCADE,
+    updated_status order_status NOT NULL,
+    change_time TIMESTAMP
 );
 
 -- Índices para Performance em Alta Carga (200 req/s)
-CREATE INDEX idx_courier_availability ON COURIER (Availability);
-CREATE INDEX idx_order_status ON "ORDER" (Status);
-CREATE INDEX idx_events_order_time ON ORDER_EVENTS (Order_ID, Change_Time);
+CREATE INDEX idx_courier_availability ON courier (availability);
+CREATE INDEX idx_order_status ON "order" (status);
+CREATE INDEX idx_events_order_time ON order_event (order_id, change_time);

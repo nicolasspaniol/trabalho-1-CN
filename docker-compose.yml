@@ -24,6 +24,16 @@ services:
     ports:
       - "8010:8010"
 
+  location:
+    env_file: ".env"
+    build:
+      context: .
+      dockerfile: services/location/Dockerfile
+    ports:
+      - "8050:80"
+    depends_on:
+      - dynamodb
+
   api:
     env_file: ".env"
     build:
@@ -32,6 +42,7 @@ services:
     ports:
       - "8000:80"
     depends_on:
+      - location
       - dynamodb
       - worker
       - db

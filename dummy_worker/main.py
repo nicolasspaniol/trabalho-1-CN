@@ -30,7 +30,7 @@ def health():
 @app.post("/calculate-route", response_model=RouteResponse)
 def calculate_route(_: RouteRequest):
     return RouteResponse(
-        courier_id=1,
+        courier_id=3,
         distance_to_merchant=1.23,
         path_to_merchant=[1, 2, 3],
         distance_to_user=4.56,
