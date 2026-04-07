@@ -1,5 +1,5 @@
 [project]
-name="dijkfood_api"
+name="dijkfood-api"
 version="0.1.0"
 requires-python = ">=3.13"
 dependencies = [
@@ -9,9 +9,3 @@ dependencies = [
     "requests>=2.33.1",
     "sqlmodel>=0.0.37",
 ]
-
-[dependency-groups]
-local = ["shared"]
-
-[tool.uv.sources]
-shared = { path = "../../shared", editable = true }
