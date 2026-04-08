@@ -1,184 +1,221 @@
-# Trabalho 1 - Tracker Temporario
+# DijkFood - Trabalho A1 (Computacao em Nuvem)
 
-Este arquivo serve como guia rapido de execucao e checklist de alinhamento entre os grupos.
+Este repositorio implementa a plataforma DijkFood, um sistema de delivery com:
 
-## 1) Comando unico de deploy
+- API REST para clientes, restaurantes, entregadores e pedidos.
+- Calculo de rotas no grafo viario de Sao Paulo.
+- Ciclo de vida completo do pedido.
+- Deploy automatizado na AWS com simulacao de carga.
 
-Entrada oficial:
+O foco do trabalho (conforme enunciado) e validar disponibilidade, escalabilidade horizontal e latencia P95 abaixo de 500 ms nos cenarios de carga.
 
-- uv run --project local local/deploy.py
+## Integrantes do Grupo
+- [Gabrielly Chacara](https://github.com/gabriellyepc)
+- [Henrique Coelho](https://github.com/riqueu)
+- [Henrique Gasparelo](https://github.com/HenryGasparelo)
+- [Nícolas Spaniol](https://github.com/nicolasspaniol)
 
-Variacoes uteis:
+## Resumo rapido
 
-- uv run --project local local/deploy.py --no-delete
-- uv run --project local local/deploy.py --only-delete
-- uv run --project local local/deploy.py --with-simulation
-- uv run --project local local/deploy.py --with-simulation --graph-file <arquivo.pkl> --graph-location "<regiao>"
+- Entrada principal: local/deploy.py
+- Servicos: worker, api, location
+- Infra principal: ECS/Fargate, ALB, RDS, DynamoDB, S3, CloudWatch
+- Simulacao de carga: local/load.py + local/sim_delivery.py
 
-Para simulacao com Basic Auth (sem export manual):
+## Arquitetura
 
-- usar credenciais do services/api/.env automaticamente:
-	uv run --project local local/deploy.py --with-simulation
-- ou informar no comando:
-	uv run --project local local/deploy.py --with-simulation --api-username <usuario> --api-password <senha>
+### Componentes
 
-## 2) Checklist funcional
+- worker:
+Responsavel por calcular rota e selecionar courier.
 
-### Já entregue
+- api:
+Servico de dominio (clientes, restaurantes, couriers, pedidos e transicoes de status).
 
-- [x] Cadastro/listagem de customers, merchants e couriers alinhados nos scripts locais.
-- [x] `local/sim_client.py` alinhado com o contrato atual de pedidos (`merchant_id`, `item_ids`, leitura por `/orders/{order_id}/events`).
-- [x] `local/sim_delivery.py` adaptado para detectar contrato novo ou legado de entregador.
-- [x] Deploy automatizado com credenciais AWS locais, bucket por conta, schema idempotente e teardown completo.
-- [x] Simulador configurável com `--graph-file` e `--graph-location`.
+- location:
+Servico para atualizacao/consulta de localizacao de courier durante entrega.
 
-### Ainda aberto
+### Dados
 
-- [ ] Contrato final de couriers/me/location definido no OpenAPI.
-- [ ] Contrato final de picked_up e delivered definido no OpenAPI.
-- [ ] Confirmar campo de retorno do pedido criado (`id` vs `order_id`).
-- [ ] Confirmar regra final de `item_ids` no pedido.
-- [ ] Fechar o fluxo final de atribuição de courier ao pedido.
+- RDS (PostgreSQL)
+Persistencia transacional do dominio: usuarios, restaurantes, couriers, pedidos e eventos.
 
-### Publicação esperada no OpenAPI
+- DynamoDB
+Dados operacionais de rota e localizacao em tempo real.
 
-- [ ] POST /orders/ (criar pedido)
-- [ ] GET /orders/{id} (consulta pedido)
-- [ ] GET /orders?status=... (fila por status)
-- [ ] PUT /couriers/me/location (telemetria do courier)
-- [ ] POST /orders/{order_id}/picked_up (transicao para retirada)
-- [ ] POST /orders/{order_id}/delivered (finalizacao da entrega)
+- S3
+Armazena o arquivo de grafo usado no calculo de rota.
 
-## 3) Checklist não-funcional
+### Fluxo simplificado
 
-### Já entregue
+1. Cliente cria pedido na API.
+2. Restaurante aceita e marca pedido como pronto.
+3. API aciona busca assincrona de courier (worker).
+4. Courier executa eventos de entrega e atualiza localizacao.
+5. Cliente consulta estado e progresso do pedido.
 
-- [x] População do sistema com customers, merchants e couriers através da API.
-- [x] Execução do teste de carga com taxa configurável de pedidos por segundo.
-- [x] Teardown remove bucket S3, RDS, DynamoDB e ECR por padrão.
-- [x] Teardown faz retry simples para DependencyViolation em security groups.
-- [x] Pipeline de deploy/teste/simulação/limpeza em um único script.
+## Estrutura do repositorio
 
-### Ainda aberto
+- local/: scripts de deploy, setup, validacao e simulacao
+- services/api/: API de dominio (FastAPI)
+- services/worker/: servico de roteamento
+- services/location/: servico de localizacao
+- shared/: modelos compartilhados
 
-- [ ] Validar formalmente os três cenários do simulador: 10, 50 e 200 RPS.
-- [ ] Confirmar que entregadores reportam posição a cada 100ms no fluxo final.
-- [ ] Demonstrar p95 abaixo de 500ms para consultas e registros.
-- [ ] Demonstrar que a saturação de um componente não degrada os demais.
-- [ ] Demonstrar escalabilidade horizontal automática em apresentação.
-- [ ] Demonstrar tolerância a falhas encerrando uma instância ao vivo.
-- [ ] Fechar o modelo de custos mensal em us-east-1 para o relatório.
+## Pre-requisitos
 
-## 4) Checklist de infraestrutura
+### 1) Ferramentas locais
 
-- [ ] Automatizar policy/versioning/lifecycle do bucket S3 do grafo.
-- [ ] Esperar remocao completa de tarefas/ENIs antes de delete de cluster e SG.
-- [x] Remoção completa de service, load balancer, target group, tabela DynamoDB, RDS e bucket S3 já automatizada.
+- Python 3.13+
+- uv
+- Docker (daemon ativo)
+- AWS CLI v2
 
-## 5) Entregáveis e apresentação
+### 2) Credenciais AWS (obrigatorio)
 
-### Ainda aberto
+Voce precisa de credenciais validas com permissao para ECS, ECR, IAM (uso de role), ELBv2, EC2, RDS, DynamoDB, S3 e CloudWatch.
 
-- [ ] Relatório PDF com diagrama de arquitetura.
-- [ ] Relatório PDF com decisões de projeto e justificativas.
-- [ ] Relatório PDF com resultados experimentais dos cenários de carga.
-- [ ] Relatório PDF com análise de custos mensais.
-- [ ] Demonstração ao vivo da criação de pedido, cálculo de rota, histórico e eventos.
-- [ ] Demonstração ao vivo de escalabilidade e tolerância a falhas.
+Formas aceitas no projeto:
 
-## 6) Fluxo recomendado de execução
+- Variaveis de ambiente AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN
+- Arquivos locais .aws/credentials e .aws/config na raiz do repo
+- Configuracao padrao do usuario em ~/.aws
 
-1. Validar credenciais AWS em .aws/credentials e .aws/config na raiz.
-2. Rodar deploy com smoke tests:
-	uv run --project local local/deploy.py
-3. Rodar experimento com carga:
-	uv run --project local local/deploy.py --with-simulation --no-delete
-4. Encerrar e limpar recursos:
-	uv run --project local local/deploy.py --only-delete
+Observacao importante para AWS Academy:
 
-Observacao:
+- Use credenciais temporarias com session token.
+- Se expirar, o deploy falha logo no pre-setup.
 
-- O modo `--with-simulation` exige o contrato final de entrega:
-	- `/orders/{order_id}/accept` + `/orders/{order_id}/ready` + `/couriers/me/location` + `/orders/{order_id}/picked_up` + `/orders/{order_id}/delivered`
-- O endpoint `accept` nao foi removido: ele continua coexistindo com `ready`, `picked_up` e `delivered` no contrato final.
-- Se o ALB apontar para o worker de smoke tests, a simulacao completa nao roda; apenas o fluxo de carga inicial e populacao pode ser validado.
+### 3) Role de execucao
 
-Estado resumido do projeto:
+Por padrao o deploy usa a role LabRole.
+Se necessario, ajuste por variavel de ambiente EXECUTION_ROLE_NAME.
 
-- Já entregue: deploy, smoke tests, populacao de dados, teste de carga, teardown completo e adaptacao inicial do courier worker.
-- Falta fechar: contrato final do courier no OpenAPI e a logica de roteamento/entrega que dependa dele.
+## Execucao
 
-## 7) Arquivos chave
+### Fluxo recomendado (com simulacao)
 
-- local/deploy.py: orquestrador unico do ciclo (deploy, smoke, simulacao, teardown).
-- local/load.py: populacao de customers, merchants e couriers.
-- local/sim_client.py: gerador de carga para pedidos.
-- local/sim_delivery.py: simulacao de entregadores e telemetria.
-- local/create_infra.py: provisionamento principal da infraestrutura.
-- local/delete.py: teardown dos recursos.
+```bash
+uv run --project local local/deploy.py --with-simulation
+```
 
-## 8) Runbook de autoscaling (ECS)
+Esse comando faz:
 
-Objetivo: validar escala horizontal para todos os servicos de conteiner (os atuais e os novos).
+1. Pre-setup (ECR login/build/push).
+2. Provisionamento/atualizacao da infraestrutura.
+3. Readiness checks dos 3 servicos.
+4. Preflight de endpoints.
+5. Populacao da base e simulacao de carga.
+6. Smoke tests finais.
+7. Teardown (delete) dos serviços AWS.
 
-1. Garantir autoscaling CPU + memoria para todos os servicos ECS:
+### Outros modos uteis
 
-	uv run --project local local/autoscaling_demo.py \
-	  --cluster DijkFood-Cluster \
-	  --services Routing-Worker-Service,<SERVICO_2>,<SERVICO_NOVO> \
-	  --min-capacity 2 \
-	  --max-capacity 20 \
-	  --cpu-target 70 \
-	  --memory-target 75
+```bash
+# Deploy + testes sem simulacao + sem teardown
+uv run --project local local/deploy.py --no-delete
 
-2. Inspecionar configuracao aplicada (sem alterar):
+# Executa apenas teardown
+uv run --project local local/deploy.py --only-delete
 
-	uv run --project local local/autoscaling_demo.py \
-	  --cluster DijkFood-Cluster \
-	  --services Routing-Worker-Service,<SERVICO_2>,<SERVICO_NOVO> \
-	  --show-only
+# Simulacao com cenarios customizados
+uv run --project local local/deploy.py \
+	--with-simulation \
+	--rps-scenarios 10,50,200 \
+	--duration 30 \
+	--cooldown-seconds 5 \
+	--no-delete
+```
 
-3. Rodar carga para disparar escala:
+### Parametros frequentes
 
-	uv run --project local local/deploy.py --with-simulation --no-delete --rps-scenarios 10,50,200
+- --with-simulation: liga validacao + simulador
+- --no-delete: mantem recursos ativos ao final
+- --only-delete: remove recursos
+- --api-username e --api-password: credenciais Basic Auth da API
+- --graph-file e --graph-location: arquivo/regiao do grafo
+- --simulation-api-url: URL alternativa da API para simulacao
 
-4. Evidencias recomendadas para apresentar:
+### Escopo geografico da simulacao (bairro vs cidade inteira)
 
-- DesiredTaskCount, RunningTaskCount, CPUUtilization e MemoryUtilization por servico ECS.
-- RequestCountPerTarget e TargetResponseTime no ALB.
-- p95 das operacoes de escrita/leitura durante 10, 50 e 200 RPS.
+Durante os testes iniciais, o projeto usou um grafo menor (Alto de Pinheiros) para reduzir tempo de build e custo.
+Voce pode rodar com Sao Paulo inteira via --graph-location.
 
-## 9) Runbook de tolerancia a falhas
+Exemplo com bairro (mais rapido e barato):
 
-Objetivo: provar continuidade de servico ao vivo para ECS e RDS.
+```bash
+uv run --project local local/deploy.py \
+	--with-simulation \
+	--graph-location "Alto de Pinheiros, Sao Paulo, Brazil" \
+	--graph-file sp_altodepinheiros.pkl \
+	--no-delete
+```
 
-1. Iniciar carga continua (para observar impacto real durante falha).
+Exemplo com cidade inteira (enunciado):
 
-2. Parar 1 task por servico ECS e aguardar recuperacao automatica:
+```bash
+uv run --project local local/deploy.py \
+	--with-simulation \
+	--graph-location "Sao Paulo, Sao Paulo, Brazil" \
+	--graph-file sp_cidade.pkl \
+	--no-delete
+```
 
-	uv run --project local local/fault_tolerance_demo.py \
-	  --cluster DijkFood-Cluster \
-	  --services Routing-Worker-Service,<SERVICO_2>,<SERVICO_NOVO> \
-	  --dynamodb-table Couriers \
-	  --skip-rds
+Aviso:
 
-3. Forcar failover do RDS (requer Multi-AZ habilitado):
+- O grafo da cidade inteira pode aumentar bastante tempo de extração/upload e custo de execução.
 
-	uv run --project local local/fault_tolerance_demo.py \
-	  --skip-ecs \
-	  --dynamodb-table Couriers \
-	  --db-instance-id dijkfood-postgres
+## API na interface web
 
-4. Executar teste combinado ECS + RDS:
+Quando o deploy finalizar, abra o DNS do ALB da API:
 
-	uv run --project local local/fault_tolerance_demo.py \
-	  --cluster DijkFood-Cluster \
-	  --services Routing-Worker-Service,<SERVICO_2>,<SERVICO_NOVO> \
-	  --dynamodb-table Couriers \
-	  --db-instance-id dijkfood-postgres
+- Swagger UI: /docs
+- ReDoc: /redoc
+- OpenAPI: /openapi.json
 
-Notas importantes:
+Exemplo real de endpoint:
 
-- DynamoDB nao tem "instancia" para encerrar (servico gerenciado regional).
-- O script `fault_tolerance_demo.py` faz check de disponibilidade de DynamoDB com put/get antes e depois dos testes de falha.
-- Para o relatorio, manter tambem a evidencia de retry/backoff da aplicacao para erros transitorios.
+- http://alb-dijkfood-api-896780006.us-east-1.elb.amazonaws.com/docs
+
+## Observacoes de comportamento
+
+- O endpoint /couriers/me/order existe e e usado no preflight.
+- O aviso de preflight sobre courier sem pedido ativo pode acontecer por assincronia na atribuicao do courier.
+- Esse aviso, isoladamente, nao significa endpoint removido.
+
+## Execucao local com Docker Compose (ambiente de desenvolvimento)
+
+Opcionalmente, voce pode subir componentes locais para desenvolvimento:
+
+```bash
+docker compose up --build
+```
+
+Servicos expostos localmente:
+
+- API: http://localhost:8000/docs
+- Location: http://localhost:8050/docs
+- DynamoDB local: http://localhost:8020
+
+## Criterios de validacao do trabalho
+
+Os scripts de simulacao ajudam a demonstrar os pontos do enunciado:
+
+- throughput alvo por cenario
+- latencia P95 de leitura/escrita
+- isolamento de degradacao entre componentes
+- ciclo de entrega com transicoes de status validas
+
+## Troubleshooting rapido
+
+- Erro de credencial AWS
+Verifique token expirado, perfil e permissao de acesso.
+
+- Falha no build/push
+Confirme Docker ativo e permissao para ECR.
+
+- Erro de readiness no ALB
+Verifique logs no CloudWatch e health checks dos target groups.
+
+- Falha em transicao de status
+Confirme sequencia valida: CONFIRMED -> PREPARING -> READY_FOR_PICKUP -> PICKED_UP -> IN_TRANSIT -> DELIVERED.
