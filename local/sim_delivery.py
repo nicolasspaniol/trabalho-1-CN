@@ -129,7 +129,8 @@ async def update_courier_location(
     try:
         async with session.put(
             f"{location_api_url.rstrip('/')}/couriers/me/location",
-            params={"order_id": order_id, "location": location},
+            params={"order_id": order_id},
+            json={"location": location},
         ) as response:
             response.raise_for_status()
             return True
