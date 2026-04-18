@@ -2,6 +2,8 @@ import boto3
 import os
 import pickle
 import heapq
+import time
+import asyncio
 from contextlib import asynccontextmanager
 from psycopg2 import pool
 from fastapi import FastAPI, HTTPException
@@ -177,56 +179,19 @@ def reconstruct_path(predecessors: dict, target: int) -> list[int]:
     path.append(current)
     return path[::-1]
 
-@app.post("/calculate-route", response_model=RouteResponse)
-async def calculate_route(request: RouteRequest):
-    if GRAPH is None:
-        try_load_graph_from_s3()
-    if GRAPH is None:
-        raise HTTPException(status_code=503, detail="Grafo não disponível: " + (GRAPH_LOAD_ERROR or "Erro desconhecido"))
 
-    try:
-        available_couriers = fetch_available_couriers()
-        couriers_map = {location: courier_id for courier_id, location in available_couriers}
-    except Exception:
-        raise HTTPException(status_code=500, detail="Falha ao consultar o couriers disponiveis")
-
-    origin = request.merchant_node
-    user = request.user_node
-
+def find_reachable_nodes(origin: int):
+    """Executa Dijkstra completo a partir do restaurante sem parada antecipada."""
     distances = {origin: 0}
     predecessors = {origin: origin}
     p_queue = [(0, origin)]
-    selected_courier = None
-    node_of_courier = None
 
-    user_visited = False
     while p_queue:
         distance_node, node = heapq.heappop(p_queue)
 
         if distance_node > distances.get(node, float('inf')):
             continue
 
-        # Se ainda não foi encontrado um entregador e o nó atual é um entregador
-        courier_id = couriers_map.get(node)
-        if selected_courier is None and courier_id is not None:
-            # Tenta reservar o entregador
-            if reserve_courier(courier_id): # Se ele estiver disponivel
-                # Define o entregador escolido
-                selected_courier = courier_id
-                node_of_courier = node
-                # Verifica se o cliente já foi descoberto
-                if user_visited: # Se sim, termina a busca
-                    break
-            else:
-                couriers_map.pop(node, None)
-
-        # Se o nó atual é o cliente e o entregador já foi descoberto termina a busca
-        if node == user:
-            user_visited = True
-            if selected_courier:
-                break
-
-        # Visita dos os nós conectados no nó atual
         if node in GRAPH:
             for unvisited_node, edge_info in GRAPH[node].items():
                 distance = get_edge_length(edge_info)
@@ -236,9 +201,65 @@ async def calculate_route(request: RouteRequest):
                     predecessors[unvisited_node] = node
                     heapq.heappush(p_queue, (new_dist, unvisited_node))
 
-    # Se a busca terminou em nenhum entregador foi encontrado, um erro é chamado
-    if not selected_courier or not user_visited:
-        raise HTTPException(status_code=404, detail="Sem rota disponível: " + ("Nenhum entregador disponível" if not selected_courier else "Cliente inalcançável"))
+    return distances, predecessors
+
+
+def find_route_with_available_couriers(origin: int, user: int, available_couriers: list[tuple[int, int]]):
+    """Busca todas as rotas alcançáveis e reserva o courier mais perto do restaurante."""
+    distances, predecessors = find_reachable_nodes(origin)
+
+    if user not in distances:
+        return None, None, distances, predecessors
+
+    candidate_couriers = []
+    for courier_id, location in available_couriers:
+        if location in distances:
+            candidate_couriers.append((distances[location], courier_id, location))
+
+    candidate_couriers.sort(key=lambda item: (item[0], item[1]))
+
+    for _distance_to_merchant, courier_id, location in candidate_couriers:
+        if reserve_courier(courier_id):
+            return courier_id, location, distances, predecessors
+
+    return None, None, distances, predecessors
+
+@app.post("/calculate-route", response_model=RouteResponse)
+async def calculate_route(request: RouteRequest):
+    if GRAPH is None:
+        try_load_graph_from_s3()
+    if GRAPH is None:
+        raise HTTPException(status_code=503, detail="Grafo não disponível: " + (GRAPH_LOAD_ERROR or "Erro desconhecido"))
+
+    queue_wait_seconds = max(0.0, float(os.getenv('ROUTE_QUEUE_WAIT_SECONDS', '10')))
+    retry_interval_seconds = max(0.1, float(os.getenv('ROUTE_QUEUE_RETRY_INTERVAL_SECONDS', '0.1')))
+    deadline = time.monotonic() + queue_wait_seconds
+
+    origin = request.merchant_node
+    user = request.user_node
+    while True:
+        try:
+            available_couriers = fetch_available_couriers()
+        except Exception:
+            raise HTTPException(status_code=500, detail="Falha ao consultar o couriers disponiveis")
+
+        selected_courier, node_of_courier, distances, predecessors = find_route_with_available_couriers(
+            origin,
+            user,
+            available_couriers,
+        )
+
+        if selected_courier and node_of_courier is not None:
+            break
+
+        if user not in distances:
+            raise HTTPException(status_code=404, detail="Sem rota disponível: Cliente inalcançável")
+
+        if selected_courier is None and time.monotonic() < deadline:
+            await asyncio.sleep(retry_interval_seconds)
+            continue
+
+        raise HTTPException(status_code=503, detail="Fila de despacho esgotada: nenhum entregador disponível no momento")
 
     # Retorna na forma esperada
     return RouteResponse(

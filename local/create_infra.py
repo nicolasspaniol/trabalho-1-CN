@@ -111,6 +111,29 @@ def resolve_subnets(ec2, vpc_id):
     return selected
 
 
+def ensure_cluster_active(ecs, cluster_name: str):
+    container_insights = os.getenv("ECS_CONTAINER_INSIGHTS", "enhanced").strip() or "enhanced"
+
+    cluster_info = ecs.describe_clusters(clusters=[cluster_name]).get("clusters", [])
+    cluster_status = cluster_info[0].get("status") if cluster_info else None
+    if cluster_status != "ACTIVE":
+        ecs.create_cluster(
+            clusterName=cluster_name,
+            settings=[{"name": "containerInsights", "value": container_insights}],
+        )
+
+    for _ in range(12):
+        current = ecs.describe_clusters(clusters=[cluster_name]).get("clusters", [])
+        if current and current[0].get("status") == "ACTIVE":
+            break
+        time.sleep(2)
+
+    ecs.update_cluster_settings(
+        cluster=cluster_name,
+        settings=[{"name": "containerInsights", "value": container_insights}],
+    )
+
+
 def ensure_security_group(ec2, vpc_id, name, description):
     groups = ec2.describe_security_groups(
         Filters=[{"Name": "group-name", "Values": [name]}, {"Name": "vpc-id", "Values": [vpc_id]}]
@@ -164,6 +187,12 @@ def get_or_create_load_balancer(elbv2, alb_sg_id, subnets, load_balancer_name: s
         return lb["LoadBalancerArn"]
 
 
+def build_alb_resource_label(load_balancer_arn: str, target_group_arn: str) -> str:
+    lb_suffix = load_balancer_arn.split("loadbalancer/", 1)[1]
+    tg_suffix = target_group_arn.split("targetgroup/", 1)[1]
+    return f"{lb_suffix}/targetgroup/{tg_suffix}"
+
+
 def ensure_listener(elbv2, lb_arn, tg_arn):
     listeners = elbv2.describe_listeners(LoadBalancerArn=lb_arn).get("Listeners", [])
     actions = [{"Type": "forward", "TargetGroupArn": tg_arn}]
@@ -186,8 +215,10 @@ def ensure_service_autoscaling(
     autoscaling,
     cluster_name,
     service_name,
+    resource_label=None,
     min_capacity=2,
     max_capacity=20,
+    request_target=None,
     cpu_target=70.0,
     memory_target=75.0,
     scale_out_cooldown=30,
@@ -236,6 +267,24 @@ def ensure_service_autoscaling(
         },
     )
 
+    if resource_label and request_target is not None:
+        autoscaling.put_scaling_policy(
+            PolicyName="AlbRequestScaling",
+            ServiceNamespace="ecs",
+            ResourceId=resource_id,
+            ScalableDimension="ecs:service:DesiredCount",
+            PolicyType="TargetTrackingScaling",
+            TargetTrackingScalingPolicyConfiguration={
+                "TargetValue": request_target,
+                "PredefinedMetricSpecification": {
+                    "PredefinedMetricType": "ALBRequestCountPerTarget",
+                    "ResourceLabel": resource_label,
+                },
+                "ScaleOutCooldown": scale_out_cooldown,
+                "ScaleInCooldown": scale_in_cooldown,
+            },
+        )
+
 
 def setup_worker_infrastructure(region, cluster_name, service_name, table_name, bucket_name, execution_role_arn):
     if not execution_role_arn:
@@ -262,16 +311,7 @@ def setup_worker_infrastructure(region, cluster_name, service_name, table_name, 
     allow_http(ec2, alb_sg_id)
     allow_http(ec2, task_sg_id, source_group_id=alb_sg_id)
 
-    cluster_info = ecs.describe_clusters(clusters=[cluster_name]).get("clusters", [])
-    cluster_status = cluster_info[0].get("status") if cluster_info else None
-    if cluster_status != "ACTIVE":
-        ecs.create_cluster(clusterName=cluster_name)
-
-    for _ in range(12):
-        current = ecs.describe_clusters(clusters=[cluster_name]).get("clusters", [])
-        if current and current[0].get("status") == "ACTIVE":
-            break
-        time.sleep(2)
+    ensure_cluster_active(ecs, cluster_name)
 
     try:
         logs.create_log_group(logGroupName=LOG_GROUP_NAME)
@@ -294,6 +334,7 @@ def setup_worker_infrastructure(region, cluster_name, service_name, table_name, 
     tg_arn = get_or_create_target_group(elbv2, vpc_id, TARGET_GROUP_NAME)
     lb_arn = get_or_create_load_balancer(elbv2, alb_sg_id, subnets, LOAD_BALANCER_NAME)
     ensure_listener(elbv2, lb_arn, tg_arn)
+    resource_label = build_alb_resource_label(lb_arn, tg_arn)
 
     task_arn = ecs.register_task_definition(
         family=TASK_FAMILY,
@@ -352,8 +393,10 @@ def setup_worker_infrastructure(region, cluster_name, service_name, table_name, 
         autoscaling=autoscaling,
         cluster_name=cluster_name,
         service_name=service_name,
+        resource_label=resource_label,
         min_capacity=2,
         max_capacity=20,
+        request_target=1000.0,
         cpu_target=70.0,
         memory_target=75.0,
         scale_out_cooldown=30,
@@ -396,16 +439,7 @@ def setup_api_infrastructure(
     allow_http(ec2, alb_sg_id)
     allow_http(ec2, task_sg_id, source_group_id=alb_sg_id)
 
-    cluster_info = ecs.describe_clusters(clusters=[cluster_name]).get("clusters", [])
-    cluster_status = cluster_info[0].get("status") if cluster_info else None
-    if cluster_status != "ACTIVE":
-        ecs.create_cluster(clusterName=cluster_name)
-
-    for _ in range(12):
-        current = ecs.describe_clusters(clusters=[cluster_name]).get("clusters", [])
-        if current and current[0].get("status") == "ACTIVE":
-            break
-        time.sleep(2)
+    ensure_cluster_active(ecs, cluster_name)
 
     try:
         logs.create_log_group(logGroupName=API_LOG_GROUP_NAME)
@@ -415,6 +449,7 @@ def setup_api_infrastructure(
     tg_arn = get_or_create_target_group(elbv2, vpc_id, API_TARGET_GROUP_NAME)
     lb_arn = get_or_create_load_balancer(elbv2, alb_sg_id, subnets, API_LOAD_BALANCER_NAME)
     ensure_listener(elbv2, lb_arn, tg_arn)
+    resource_label = build_alb_resource_label(lb_arn, tg_arn)
 
     task_arn = ecs.register_task_definition(
         family=API_TASK_FAMILY,
@@ -486,8 +521,10 @@ def setup_api_infrastructure(
         autoscaling=autoscaling,
         cluster_name=cluster_name,
         service_name=service_name,
+        resource_label=resource_label,
         min_capacity=2,
         max_capacity=20,
+        request_target=120.0,
         cpu_target=70.0,
         memory_target=75.0,
         scale_out_cooldown=30,
@@ -517,16 +554,7 @@ def setup_location_infrastructure(region, cluster_name, service_name, execution_
     allow_http(ec2, alb_sg_id)
     allow_http(ec2, task_sg_id, source_group_id=alb_sg_id)
 
-    cluster_info = ecs.describe_clusters(clusters=[cluster_name]).get("clusters", [])
-    cluster_status = cluster_info[0].get("status") if cluster_info else None
-    if cluster_status != "ACTIVE":
-        ecs.create_cluster(clusterName=cluster_name)
-
-    for _ in range(12):
-        current = ecs.describe_clusters(clusters=[cluster_name]).get("clusters", [])
-        if current and current[0].get("status") == "ACTIVE":
-            break
-        time.sleep(2)
+    ensure_cluster_active(ecs, cluster_name)
 
     try:
         logs.create_log_group(logGroupName=LOCATION_LOG_GROUP_NAME)
@@ -536,6 +564,7 @@ def setup_location_infrastructure(region, cluster_name, service_name, execution_
     tg_arn = get_or_create_target_group(elbv2, vpc_id, LOCATION_TARGET_GROUP_NAME)
     lb_arn = get_or_create_load_balancer(elbv2, alb_sg_id, subnets, LOCATION_LOAD_BALANCER_NAME)
     ensure_listener(elbv2, lb_arn, tg_arn)
+    resource_label = build_alb_resource_label(lb_arn, tg_arn)
 
     task_arn = ecs.register_task_definition(
         family=LOCATION_TASK_FAMILY,
@@ -598,8 +627,10 @@ def setup_location_infrastructure(region, cluster_name, service_name, execution_
         autoscaling=autoscaling,
         cluster_name=cluster_name,
         service_name=service_name,
+        resource_label=resource_label,
         min_capacity=2,
         max_capacity=20,
+        request_target=200.0,
         cpu_target=70.0,
         memory_target=75.0,
         scale_out_cooldown=30,

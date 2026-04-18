@@ -14,8 +14,10 @@ if str(PROJECT_ROOT) not in sys.path:
 import boto3
 
 import local.create as create_data
+import local.autoscaling_demo as autoscaling_demo
 import local.create_infra as create_infra
 import local.delete as delete
+import local.fault_tolerance_demo as fault_tolerance_demo
 from local.aws_waiters import (
     http_get_json,
     wait_for_dns_resolution,
@@ -454,6 +456,22 @@ def test_location_service(base_url: str) -> None:
     wait_for_http_ok(health_url, log=log)
 
 
+def run_autoscaling_demo(wait_seconds: int) -> None:
+    log("Demo autoscaling: exibindo estado dos servicos ECS")
+    autoscaling_demo.main(["--wait-seconds", str(wait_seconds)])
+
+
+def run_fault_demo(api_base_url: str, worker_base_url: str, location_base_url: str) -> None:
+    log("Demo fault tolerance: derrubando uma task por servico e validando disponibilidade no ALB")
+    fault_tolerance_demo.main(
+        [
+            "--skip-rds",
+            "--health-urls",
+            f"{api_base_url}/health,{worker_base_url}/health,{location_base_url}/health",
+        ]
+    )
+
+
 def test_service(
     alb_dns: str,
     target_group_name: str,
@@ -517,6 +535,22 @@ def main(argv=None) -> int:
     parser.add_argument("--cooldown-seconds", type=int, default=5, help="Pausa entre cenarios para o autoscaling respirar")
     parser.add_argument("--api-username", default=None, help="Usuario Basic Auth da API para simulacao")
     parser.add_argument("--api-password", default=None, help="Senha Basic Auth da API para simulacao")
+    parser.add_argument(
+        "--with-autoscaling-demo",
+        action="store_true",
+        help="Exibe o estado/configuracao do autoscaling apos a simulacao.",
+    )
+    parser.add_argument(
+        "--autoscaling-wait-seconds",
+        type=int,
+        default=90,
+        help="Tempo de espera antes de coletar o estado do autoscaling.",
+    )
+    parser.add_argument(
+        "--with-fault-demo",
+        action="store_true",
+        help="Derruba uma task por servico e valida recuperacao com o ALB.",
+    )
     parser.add_argument(
         "--graph-file",
         default="sp_altodepinheiros.pkl",
@@ -618,6 +652,12 @@ def main(argv=None) -> int:
             log(str(error))
             return 2
 
+        if args.with_autoscaling_demo:
+            run_autoscaling_demo(args.autoscaling_wait_seconds)
+
+        if args.with_fault_demo:
+            run_fault_demo(api_base_url, worker_base_url, location_base_url)
+
         log("Testes")
         test_service(
             worker_alb_dns,
@@ -655,6 +695,12 @@ def main(argv=None) -> int:
             require_db_connected=False,
             require_tables_ok=False,
         )
+
+        if args.with_autoscaling_demo:
+            run_autoscaling_demo(args.autoscaling_wait_seconds)
+
+        if args.with_fault_demo:
+            run_fault_demo(api_base_url, worker_base_url, location_base_url)
 
     if args.no_delete:
         log("Teardown: ignorado")

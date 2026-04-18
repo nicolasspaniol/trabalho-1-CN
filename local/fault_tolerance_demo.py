@@ -1,12 +1,15 @@
 """Executa testes de tolerancia a falhas para ECS e RDS."""
 
 import argparse
+import threading
 import time
 import uuid
+from urllib.error import HTTPError, URLError
+from urllib.request import urlopen
 
 import boto3
 
-from local.constants import CLUSTER_NAME, REGION, SERVICE_NAME
+from local.constants import API_SERVICE_NAME, CLUSTER_NAME, LOCATION_SERVICE_NAME, REGION, SERVICE_NAME
 
 
 def parse_csv(value: str | None) -> list[str]:
@@ -19,7 +22,54 @@ def resolve_services(raw_services: str | None) -> list[str]:
     from_arg = parse_csv(raw_services)
     if from_arg:
         return from_arg
-    return [SERVICE_NAME]
+    return [API_SERVICE_NAME, SERVICE_NAME, LOCATION_SERVICE_NAME]
+
+
+class AvailabilityProbe:
+    def __init__(self, urls: list[str], interval_seconds: float):
+        self.urls = urls
+        self.interval_seconds = interval_seconds
+        self.attempts = 0
+        self.failures = 0
+        self.samples: list[tuple[str, int | None, str | None]] = []
+        self._stop_event = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        if not self.urls:
+            return
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        if self._thread is not None:
+            self._thread.join(timeout=max(1.0, self.interval_seconds * 2))
+
+    def _run(self) -> None:
+        while not self._stop_event.is_set():
+            for url in self.urls:
+                self.attempts += 1
+                try:
+                    with urlopen(url, timeout=5) as response:
+                        status = getattr(response, "status", None)
+                        if status is not None and status >= 400:
+                            self.failures += 1
+                            self.samples.append((url, status, None))
+                except (HTTPError, URLError, OSError) as error:
+                    status = getattr(error, "code", None)
+                    self.failures += 1
+                    self.samples.append((url, status, str(error)))
+
+            self._stop_event.wait(self.interval_seconds)
+
+    def summary(self) -> str:
+        success = max(0, self.attempts - self.failures)
+        availability = (success / self.attempts * 100.0) if self.attempts else 100.0
+        return (
+            f"attempts={self.attempts} failures={self.failures} "
+            f"availability={availability:.2f}%"
+        )
 
 
 def stop_one_task_per_service(ecs, cluster_name: str, services: list[str], reason: str) -> None:
@@ -143,6 +193,17 @@ def main(argv=None) -> int:
     parser.add_argument("--skip-ecs", action="store_true", help="Nao executa stop de tasks ECS")
     parser.add_argument("--skip-rds", action="store_true", help="Nao executa failover de RDS")
     parser.add_argument("--reason", default="Chaos test demo")
+    parser.add_argument(
+        "--health-urls",
+        default=None,
+        help="Lista CSV de endpoints HTTP para provar disponibilidade durante a falha.",
+    )
+    parser.add_argument(
+        "--probe-interval-seconds",
+        type=float,
+        default=2.0,
+        help="Intervalo entre sondas HTTP de disponibilidade.",
+    )
     args = parser.parse_args(argv)
 
     session = boto3.Session(region_name=args.region)
@@ -151,22 +212,34 @@ def main(argv=None) -> int:
     dynamodb = session.client("dynamodb")
 
     services = resolve_services(args.services)
+    probe = AvailabilityProbe(parse_csv(args.health_urls), args.probe_interval_seconds)
 
     if args.dynamodb_table:
         check_dynamodb_rw(dynamodb, args.dynamodb_table, label="before")
 
-    if not args.skip_ecs:
-        stop_one_task_per_service(ecs, args.cluster, services, args.reason)
-        wait_service_recovery(ecs, args.cluster, services)
+    probe.start()
+    try:
+        if not args.skip_ecs:
+            stop_one_task_per_service(ecs, args.cluster, services, args.reason)
+            wait_service_recovery(ecs, args.cluster, services)
 
-    if not args.skip_rds:
-        if not args.db_instance_id:
-            raise ValueError("--db-instance-id e obrigatorio quando --skip-rds nao for usado")
-        force_rds_failover(rds, args.db_instance_id)
-        wait_rds_available(rds, args.db_instance_id)
+        if not args.skip_rds:
+            if not args.db_instance_id:
+                raise ValueError("--db-instance-id e obrigatorio quando --skip-rds nao for usado")
+            force_rds_failover(rds, args.db_instance_id)
+            wait_rds_available(rds, args.db_instance_id)
+    finally:
+        probe.stop()
 
     if args.dynamodb_table:
         check_dynamodb_rw(dynamodb, args.dynamodb_table, label="after")
+
+    if probe.urls:
+        print(f"[fault] availability probe: {probe.summary()}")
+        if probe.samples:
+            print("[fault] availability probe samples:")
+            for url, status, error in probe.samples[:10]:
+                print(f"  - url={url} status={status} error={error}")
 
     print("[fault] demo de tolerancia a falhas concluida")
     return 0
