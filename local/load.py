@@ -8,8 +8,24 @@ import argparse
 import os
 from faker import Faker
 
-COURIER_PER_USER = 3  # REGRA: 3 entregadores por cliente
-MERCHANT_PER_USER = 0.1  # 1 restaurante para cada 10 clientes
+
+def _read_float_env(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _read_int_env(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
+COURIER_PER_USER = _read_float_env("SIM_COURIER_PER_USER", 3.0)
+COURIER_CAP = _read_int_env("SIM_COURIER_CAP", 0)
+MERCHANT_PER_USER = _read_float_env("SIM_MERCHANT_PER_USER", 0.1)
 fake = Faker("pt_BR")
 
 API_URL_ENV = "API_URL"
@@ -55,7 +71,9 @@ def sample_valid_locations(graph_path: str, num_users: int):
     G = load_graph_from_pickle(graph_path)
     node_ids = [int(node_id) for node_id in G.nodes()]
 
-    num_couriers = num_users * COURIER_PER_USER
+    num_couriers = max(1, int(num_users * max(0.0, COURIER_PER_USER)))
+    if COURIER_CAP > 0:
+        num_couriers = min(num_couriers, COURIER_CAP)
     num_merchants = max(1, int(num_users * MERCHANT_PER_USER))
     total_entities = num_users + num_couriers + num_merchants
 

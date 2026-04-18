@@ -31,7 +31,11 @@ session = get_session()
 
 
 def should_use_multi_az() -> bool:
-    return os.getenv("DB_MULTI_AZ", "true").strip().lower() not in {"0", "false", "no"}
+    return os.getenv("DB_MULTI_AZ", "false").strip().lower() not in {"0", "false", "no"}
+
+
+def resolve_db_instance_class() -> str:
+    return os.getenv("DB_INSTANCE_CLASS", "db.t3.small").strip() or "db.t3.small"
 
 # SECURITY GROUP
 def setup_security_group(name):
@@ -140,13 +144,14 @@ def setup_rds(db_instance_id, sg_id):
     rds = session.client('rds')
     db_password = require_db_password()
     desired_multi_az = should_use_multi_az()
+    desired_instance_class = resolve_db_instance_class()
     
     print(f"🐘 Provisionando instância RDS: {db_instance_id}...")
     try:
         rds.create_db_instance(
             DBInstanceIdentifier=db_instance_id,
             AllocatedStorage=20,
-            DBInstanceClass='db.t3.micro',
+            DBInstanceClass=desired_instance_class,
             Engine='postgres',
             MasterUsername='postgres',
             MasterUserPassword=db_password,
@@ -169,13 +174,19 @@ def setup_rds(db_instance_id, sg_id):
         desc = rds.describe_db_instances(DBInstanceIdentifier=db_instance_id)
         db_instance = desc['DBInstances'][0]
         current_multi_az = bool(db_instance.get('MultiAZ'))
+        current_instance_class = db_instance.get('DBInstanceClass', '')
         current_sg_ids = [group['VpcSecurityGroupId'] for group in db_instance.get('VpcSecurityGroups', [])]
 
-        needs_update = current_multi_az != desired_multi_az or sg_id not in current_sg_ids
+        needs_update = (
+            current_multi_az != desired_multi_az
+            or sg_id not in current_sg_ids
+            or current_instance_class != desired_instance_class
+        )
         if needs_update:
             print(
                 "🛠️ Atualizando configuracao do RDS existente: "
-                f"MultiAZ {current_multi_az} -> {desired_multi_az}"
+                f"MultiAZ {current_multi_az} -> {desired_multi_az} | "
+                f"Classe {current_instance_class} -> {desired_instance_class}"
             )
             new_sg_ids = current_sg_ids or []
             if sg_id not in new_sg_ids:
@@ -183,6 +194,7 @@ def setup_rds(db_instance_id, sg_id):
 
             rds.modify_db_instance(
                 DBInstanceIdentifier=db_instance_id,
+                DBInstanceClass=desired_instance_class,
                 MultiAZ=desired_multi_az,
                 VpcSecurityGroupIds=new_sg_ids,
                 ApplyImmediately=True,

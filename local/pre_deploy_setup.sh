@@ -14,14 +14,14 @@ set -euo pipefail
 
 # Preencha os campos abaixo antes de executar.
 
-AWS_REGION="us-east-1"
-AWS_PROFILE="default"
-AWS_ACCOUNT_ID=""    
-IMAGE_TAG="latest"
-EXECUTION_ROLE_NAME="LabRole"
-EXECUTION_ROLE_ARN=""
-ECR_AUTO_CREATE_REPO="false"
-DEPLOY_TARGETS="worker,api,location"
+AWS_REGION="${AWS_REGION:-us-east-1}"
+AWS_PROFILE="${AWS_PROFILE:-default}"
+AWS_ACCOUNT_ID="${AWS_ACCOUNT_ID:-}"
+IMAGE_TAG="${IMAGE_TAG:-latest}"
+EXECUTION_ROLE_NAME="${EXECUTION_ROLE_NAME:-LabRole}"
+EXECUTION_ROLE_ARN="${EXECUTION_ROLE_ARN:-}"
+ECR_AUTO_CREATE_REPO="${ECR_AUTO_CREATE_REPO:-false}"
+DEPLOY_TARGETS="${DEPLOY_TARGETS:-worker,api,location}"
 NO_CACHE_TARGETS="${NO_CACHE_TARGETS:-}"
 
 WORKDIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

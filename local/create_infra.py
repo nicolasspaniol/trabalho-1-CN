@@ -43,6 +43,56 @@ def parse_csv_env(value):
     return [item.strip() for item in value.split(",") if item.strip()]
 
 
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw_value = os.getenv(name)
+    if raw_value is None:
+        return default
+    return raw_value.strip().lower() not in {"", "0", "false", "no", "off"}
+
+
+def _read_int_env(name: str, default: int, *, minimum: int | None = None, maximum: int | None = None) -> int:
+    try:
+        value = int(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        value = default
+
+    if minimum is not None:
+        value = max(minimum, value)
+    if maximum is not None:
+        value = min(maximum, value)
+    return value
+
+
+def resolve_desired_count(configured_desired: int, service_description: dict | None, prefix: str) -> int:
+    preserve_current = _env_flag(
+        f"{prefix}_PRESERVE_CURRENT_DESIRED",
+        default=_env_flag("ECS_PRESERVE_CURRENT_DESIRED", default=True),
+    )
+
+    if not preserve_current or not service_description:
+        return configured_desired
+
+    try:
+        current_desired = int(service_description.get("desiredCount", configured_desired))
+    except (TypeError, ValueError):
+        current_desired = configured_desired
+
+    return max(configured_desired, current_desired)
+
+
+def build_service_deployment_settings(prefix: str, default_grace_seconds: int) -> tuple[int, dict]:
+    grace_seconds = _read_int_env(f"{prefix}_HEALTHCHECK_GRACE_SECONDS", default_grace_seconds, minimum=0)
+    min_healthy_percent = _read_int_env(f"{prefix}_DEPLOYMENT_MIN_HEALTHY_PERCENT", 50, minimum=0, maximum=100)
+    max_percent = _read_int_env(f"{prefix}_DEPLOYMENT_MAX_PERCENT", 300, minimum=100)
+
+    deployment_configuration = {
+        "minimumHealthyPercent": min_healthy_percent,
+        "maximumPercent": max_percent,
+        "deploymentCircuitBreaker": {"enable": True, "rollback": True},
+    }
+    return grace_seconds, deployment_configuration
+
+
 def resolve_account_id(sts):
     return sts.get_caller_identity()["Account"]
 
@@ -157,17 +207,52 @@ def allow_http(ec2, group_id, source_group_id=None):
 
 
 def get_or_create_target_group(elbv2, vpc_id, target_group_name: str):
+    health_check_path = os.getenv("ALB_HEALTHCHECK_PATH", "/health").strip() or "/health"
+    health_check_interval = _read_int_env("ALB_HEALTHCHECK_INTERVAL_SECONDS", 15, minimum=5)
+    health_check_timeout = _read_int_env("ALB_HEALTHCHECK_TIMEOUT_SECONDS", 5, minimum=2)
+    healthy_threshold = _read_int_env("ALB_HEALTHCHECK_HEALTHY_THRESHOLD", 2, minimum=2)
+    unhealthy_threshold = _read_int_env("ALB_HEALTHCHECK_UNHEALTHY_THRESHOLD", 2, minimum=2)
+    deregistration_delay = _read_int_env("ALB_DEREGISTRATION_DELAY_SECONDS", 30, minimum=0)
+
+    # O timeout precisa ser menor que o intervalo para ser aceito pelo ELBv2.
+    health_check_timeout = min(health_check_timeout, max(2, health_check_interval - 1))
+
     try:
-        return elbv2.create_target_group(
+        tg_arn = elbv2.create_target_group(
             Name=target_group_name,
             Protocol="HTTP",
             Port=80,
             VpcId=vpc_id,
-            HealthCheckPath="/health",
+            HealthCheckPath=health_check_path,
+            HealthCheckIntervalSeconds=health_check_interval,
+            HealthCheckTimeoutSeconds=health_check_timeout,
+            HealthyThresholdCount=healthy_threshold,
+            UnhealthyThresholdCount=unhealthy_threshold,
+            Matcher={"HttpCode": "200-399"},
             TargetType="ip",
         )["TargetGroups"][0]["TargetGroupArn"]
     except elbv2.exceptions.DuplicateTargetGroupNameException:
-        return elbv2.describe_target_groups(Names=[target_group_name])["TargetGroups"][0]["TargetGroupArn"]
+        tg_arn = elbv2.describe_target_groups(Names=[target_group_name])["TargetGroups"][0]["TargetGroupArn"]
+
+    elbv2.modify_target_group(
+        TargetGroupArn=tg_arn,
+        HealthCheckPath=health_check_path,
+        HealthCheckIntervalSeconds=health_check_interval,
+        HealthCheckTimeoutSeconds=health_check_timeout,
+        HealthyThresholdCount=healthy_threshold,
+        UnhealthyThresholdCount=unhealthy_threshold,
+        Matcher={"HttpCode": "200-399"},
+    )
+    elbv2.modify_target_group_attributes(
+        TargetGroupArn=tg_arn,
+        Attributes=[
+            {
+                "Key": "deregistration_delay.timeout_seconds",
+                "Value": str(deregistration_delay),
+            }
+        ],
+    )
+    return tg_arn
 
 
 def get_or_create_load_balancer(elbv2, alb_sg_id, subnets, load_balancer_name: str):
@@ -306,11 +391,18 @@ def setup_worker_infrastructure(region, cluster_name, service_name, table_name, 
     db_host = resolve_db_host()
     db_password = resolve_db_password()
     # Defaults mais "parrudos" para simulação: evita fila no worker ao consultar/reservar couriers.
-    worker_db_pool_max_connections = os.getenv("WORKER_DB_POOL_MAX_CONNECTIONS", "10").strip() or "10"
+    worker_db_pool_max_connections = os.getenv("WORKER_DB_POOL_MAX_CONNECTIONS", "4").strip() or "4"
+    worker_route_max_available_couriers = os.getenv("WORKER_ROUTE_MAX_AVAILABLE_COURIERS", "500").strip() or "500"
+    worker_route_queue_wait_seconds = os.getenv("WORKER_ROUTE_QUEUE_WAIT_SECONDS", "1.5").strip() or "1.5"
+    worker_route_queue_retry_interval_seconds = os.getenv("WORKER_ROUTE_QUEUE_RETRY_INTERVAL_SECONDS", "0.2").strip() or "0.2"
     worker_desired = int(os.getenv("WORKER_DESIRED_COUNT", "4"))
     worker_min_capacity = int(os.getenv("WORKER_AUTOSCALING_MIN_CAPACITY", "4"))
     worker_max_capacity = int(os.getenv("WORKER_AUTOSCALING_MAX_CAPACITY", "20"))
     worker_request_target = float(os.getenv("WORKER_REQUEST_TARGET", "20"))
+    worker_health_grace_seconds, worker_deployment_configuration = build_service_deployment_settings(
+        "WORKER",
+        default_grace_seconds=180,
+    )
 
     alb_sg_id = ensure_security_group(ec2, vpc_id, ALB_SG_NAME, "Ingress publico HTTP para ALB do worker")
     task_sg_id = ensure_security_group(ec2, vpc_id, TASK_SG_NAME, "Ingress HTTP do ALB para tasks ECS")
@@ -363,6 +455,9 @@ def setup_worker_infrastructure(region, cluster_name, service_name, table_name, 
                     {"name": "DB_NAME", "value": "postgres"},
                     {"name": "DB_PASSWORD", "value": db_password},
                     {"name": "DB_POOL_MAX_CONNECTIONS", "value": worker_db_pool_max_connections},
+                    {"name": "ROUTE_MAX_AVAILABLE_COURIERS", "value": worker_route_max_available_couriers},
+                    {"name": "ROUTE_QUEUE_WAIT_SECONDS", "value": worker_route_queue_wait_seconds},
+                    {"name": "ROUTE_QUEUE_RETRY_INTERVAL_SECONDS", "value": worker_route_queue_retry_interval_seconds},
                     {"name": "TABLE_NAME", "value": table_name},
                 ],
                 "logConfiguration": {
@@ -374,17 +469,28 @@ def setup_worker_infrastructure(region, cluster_name, service_name, table_name, 
     )["taskDefinition"]["taskDefinitionArn"]
 
     services = ecs.describe_services(cluster=cluster_name, services=[service_name]).get("services", [])
-    status = services[0].get("status") if services else None
+    service_description = services[0] if services else None
+    status = service_description.get("status") if service_description else None
     if status == "DRAINING":
         ecs.delete_service(cluster=cluster_name, service=service_name, force=True)
         wait_service_gone(ecs, cluster_name, service_name)
+        service_description = None
         status = None
+
+    resolved_worker_desired = resolve_desired_count(worker_desired, service_description, "WORKER")
+    if resolved_worker_desired != worker_desired:
+        print(
+            f"[infra] Worker desired preservado: {worker_desired} -> {resolved_worker_desired}",
+            flush=True,
+        )
 
     service_kwargs = {
         "cluster": cluster_name,
         "taskDefinition": task_arn,
-        "desiredCount": worker_desired,
+        "desiredCount": resolved_worker_desired,
         "launchType": "FARGATE",
+        "healthCheckGracePeriodSeconds": worker_health_grace_seconds,
+        "deploymentConfiguration": worker_deployment_configuration,
         "networkConfiguration": {"awsvpcConfiguration": {"subnets": subnets, "securityGroups": [task_sg_id], "assignPublicIp": "ENABLED"}},
         "loadBalancers": [{"targetGroupArn": tg_arn, "containerName": "worker-container", "containerPort": 80}],
     }
@@ -441,13 +547,22 @@ def setup_api_infrastructure(
     admin_password = os.getenv("ADMIN_PASSWORD", "admin")
     location_url = location_base_url or os.getenv("LOCATION_URL", "").strip()
     # Defaults conservadores para evitar esgotar conexoes do RDS em conta/lab pequena.
-    api_db_pool_size = os.getenv("API_DB_POOL_SIZE", "3").strip() or "3"
-    api_db_max_overflow = os.getenv("API_DB_MAX_OVERFLOW", "0").strip() or "0"
-    api_db_pool_timeout = os.getenv("API_DB_POOL_TIMEOUT", "30").strip() or "30"
-    api_desired = int(os.getenv("API_DESIRED_COUNT", "2"))
-    api_min_capacity = int(os.getenv("API_AUTOSCALING_MIN_CAPACITY", "2"))
-    api_max_capacity = int(os.getenv("API_AUTOSCALING_MAX_CAPACITY", "8"))
-    api_request_target = float(os.getenv("API_REQUEST_TARGET", "120"))
+    api_db_pool_size = os.getenv("API_DB_POOL_SIZE", "4").strip() or "4"
+    api_db_max_overflow = os.getenv("API_DB_MAX_OVERFLOW", "2").strip() or "2"
+    api_db_pool_timeout = os.getenv("API_DB_POOL_TIMEOUT", "10").strip() or "10"
+    api_worker_connect_timeout = os.getenv("API_WORKER_CONNECT_TIMEOUT_SECONDS", "1.0").strip() or "1.0"
+    api_worker_read_timeout = os.getenv("API_WORKER_READ_TIMEOUT_SECONDS", "4.0").strip() or "4.0"
+    api_dispatch_workers = os.getenv("API_DISPATCH_WORKERS", "4").strip() or "4"
+    api_auth_cache_ttl_seconds = os.getenv("API_AUTH_CACHE_TTL_SECONDS", "30").strip() or "30"
+    api_auth_cache_max_size = os.getenv("API_AUTH_CACHE_MAX_SIZE", "50000").strip() or "50000"
+    api_desired = int(os.getenv("API_DESIRED_COUNT", "3"))
+    api_min_capacity = int(os.getenv("API_AUTOSCALING_MIN_CAPACITY", "3"))
+    api_max_capacity = int(os.getenv("API_AUTOSCALING_MAX_CAPACITY", "10"))
+    api_request_target = float(os.getenv("API_REQUEST_TARGET", "80"))
+    api_health_grace_seconds, api_deployment_configuration = build_service_deployment_settings(
+        "API",
+        default_grace_seconds=90,
+    )
 
     alb_sg_id = ensure_security_group(ec2, vpc_id, API_ALB_SG_NAME, "Ingress publico HTTP para ALB da API")
     task_sg_id = ensure_security_group(ec2, vpc_id, API_TASK_SG_NAME, "Ingress HTTP do ALB para tasks ECS da API")
@@ -490,6 +605,11 @@ def setup_api_infrastructure(
                     {"name": "DB_POOL_SIZE", "value": api_db_pool_size},
                     {"name": "DB_MAX_OVERFLOW", "value": api_db_max_overflow},
                     {"name": "DB_POOL_TIMEOUT", "value": api_db_pool_timeout},
+                    {"name": "WORKER_CONNECT_TIMEOUT_SECONDS", "value": api_worker_connect_timeout},
+                    {"name": "WORKER_READ_TIMEOUT_SECONDS", "value": api_worker_read_timeout},
+                    {"name": "DISPATCH_WORKERS", "value": api_dispatch_workers},
+                    {"name": "AUTH_CACHE_TTL_SECONDS", "value": api_auth_cache_ttl_seconds},
+                    {"name": "AUTH_CACHE_MAX_SIZE", "value": api_auth_cache_max_size},
                     {"name": "DYNAMODB_REGION", "value": region},
                     {"name": "ADMIN_USERNAME", "value": admin_username},
                     {"name": "ADMIN_PASSWORD", "value": admin_password},
@@ -507,17 +627,28 @@ def setup_api_infrastructure(
     )["taskDefinition"]["taskDefinitionArn"]
 
     services = ecs.describe_services(cluster=cluster_name, services=[service_name]).get("services", [])
-    status = services[0].get("status") if services else None
+    service_description = services[0] if services else None
+    status = service_description.get("status") if service_description else None
     if status == "DRAINING":
         ecs.delete_service(cluster=cluster_name, service=service_name, force=True)
         wait_service_gone(ecs, cluster_name, service_name)
+        service_description = None
         status = None
+
+    resolved_api_desired = resolve_desired_count(api_desired, service_description, "API")
+    if resolved_api_desired != api_desired:
+        print(
+            f"[infra] API desired preservado: {api_desired} -> {resolved_api_desired}",
+            flush=True,
+        )
 
     service_kwargs = {
         "cluster": cluster_name,
         "taskDefinition": task_arn,
-        "desiredCount": api_desired,
+        "desiredCount": resolved_api_desired,
         "launchType": "FARGATE",
+        "healthCheckGracePeriodSeconds": api_health_grace_seconds,
+        "deploymentConfiguration": api_deployment_configuration,
         "networkConfiguration": {
             "awsvpcConfiguration": {
                 "subnets": subnets,
@@ -570,6 +701,10 @@ def setup_location_infrastructure(region, cluster_name, service_name, execution_
     location_min_capacity = int(os.getenv("LOCATION_AUTOSCALING_MIN_CAPACITY", "4"))
     location_max_capacity = int(os.getenv("LOCATION_AUTOSCALING_MAX_CAPACITY", "20"))
     location_request_target = float(os.getenv("LOCATION_REQUEST_TARGET", "30"))
+    location_health_grace_seconds, location_deployment_configuration = build_service_deployment_settings(
+        "LOCATION",
+        default_grace_seconds=60,
+    )
 
     alb_sg_id = ensure_security_group(ec2, vpc_id, LOCATION_ALB_SG_NAME, "Ingress publico HTTP para ALB da location API")
     task_sg_id = ensure_security_group(ec2, vpc_id, LOCATION_TASK_SG_NAME, "Ingress HTTP do ALB para tasks ECS da location API")
@@ -617,17 +752,28 @@ def setup_location_infrastructure(region, cluster_name, service_name, execution_
     )["taskDefinition"]["taskDefinitionArn"]
 
     services = ecs.describe_services(cluster=cluster_name, services=[service_name]).get("services", [])
-    status = services[0].get("status") if services else None
+    service_description = services[0] if services else None
+    status = service_description.get("status") if service_description else None
     if status == "DRAINING":
         ecs.delete_service(cluster=cluster_name, service=service_name, force=True)
         wait_service_gone(ecs, cluster_name, service_name)
+        service_description = None
         status = None
+
+    resolved_location_desired = resolve_desired_count(location_desired, service_description, "LOCATION")
+    if resolved_location_desired != location_desired:
+        print(
+            f"[infra] Location desired preservado: {location_desired} -> {resolved_location_desired}",
+            flush=True,
+        )
 
     service_kwargs = {
         "cluster": cluster_name,
         "taskDefinition": task_arn,
-        "desiredCount": location_desired,
+        "desiredCount": resolved_location_desired,
         "launchType": "FARGATE",
+        "healthCheckGracePeriodSeconds": location_health_grace_seconds,
+        "deploymentConfiguration": location_deployment_configuration,
         "networkConfiguration": {
             "awsvpcConfiguration": {
                 "subnets": subnets,

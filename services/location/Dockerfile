@@ -39,5 +39,5 @@ COPY services/location/*.py ./
 
 EXPOSE 80
 
-# Roda o servidor na porta 80
-CMD ["fastapi", "run", "main.py", "--port", "80"]
+# Roda o servidor na porta 80 com mais de um worker para absorver burst de atualizacoes.
+CMD ["fastapi", "run", "main.py", "--port", "80", "--workers", "2"]

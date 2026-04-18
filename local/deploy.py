@@ -1,6 +1,7 @@
 """Entrypoint unificado para o ciclo de deploy local."""
 
 import argparse
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 import json
 import os
 import subprocess
@@ -15,6 +16,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 import boto3
+from botocore.exceptions import ClientError
 
 import local.create as create_data
 import local.autoscaling_demo as autoscaling_demo
@@ -55,7 +57,7 @@ DB_SCHEMA_FILE = os.getenv("DB_SCHEMA_FILE", "local/schema.sql")
 
 
 def log(message: str) -> None:
-    print(f"[cycle] {message}")
+    print(f"[cycle] {message}", flush=True)
 
 
 def parse_simple_env_file(env_file: Path) -> dict[str, str]:
@@ -73,6 +75,13 @@ def parse_simple_env_file(env_file: Path) -> dict[str, str]:
         if key:
             values[key] = value
     return values
+
+
+def env_flag(name: str, default: bool = False) -> bool:
+    raw_value = os.getenv(name)
+    if raw_value is None:
+        return default
+    return raw_value.strip().lower() not in {"", "0", "false", "no", "off"}
 
 
 SIM_DURATION_S = int(os.getenv("SIM_DURATION_S", "300"))
@@ -339,6 +348,10 @@ def run_simulation(
     delivery_process = None
     can_load_data = supports_data_load(base_url)
     full_simulation_supported = ensure_simulation_contract(base_url, location_base_url)
+    # Mantem oferta suficiente sem transformar polling de couriers em gargalo de banco.
+    target_couriers = max(60, min(300, rps * 6))
+    active_delivery_couriers = max(40, min(target_couriers, rps * 4))
+    courier_per_user = target_couriers / max(1, num_users)
     auth_env: dict[str, str] = {}
     if api_username and api_password:
         auth_env = {"API_USERNAME": api_username, "API_PASSWORD": api_password}
@@ -348,17 +361,36 @@ def run_simulation(
             return
 
         log("Simulacao: preflight de endpoints (OpenAPI + fluxo critico)")
-        run_python_script(
-            PROJECT_ROOT / "local" / "validate_endpoints.py",
-            ["--api-url", base_url, "--username", api_username or "admin", "--password", api_password or "admin"],
-            env=auth_env,
-        )
+        preflight_attempts = max(1, int(os.getenv("SIM_PREFLIGHT_ATTEMPTS", "3")))
+        for attempt in range(1, preflight_attempts + 1):
+            try:
+                run_python_script(
+                    PROJECT_ROOT / "local" / "validate_endpoints.py",
+                    ["--api-url", base_url, "--username", api_username or "admin", "--password", api_password or "admin"],
+                    env=auth_env,
+                )
+                break
+            except subprocess.CalledProcessError as exc:
+                if attempt >= preflight_attempts:
+                    raise exc
+                backoff_seconds = min(30, 5 * attempt)
+                log(
+                    "Simulacao: preflight falhou na tentativa "
+                    f"{attempt}/{preflight_attempts}; nova tentativa em {backoff_seconds}s"
+                )
+                time.sleep(backoff_seconds)
 
         log("Simulacao: populando base via API")
         run_python_script(
             PROJECT_ROOT / "local" / "load.py",
             ["--api-url", base_url, "--num-users", str(num_users)],
-            env={**auth_env, "SIM_GRAPH_PATH": graph_file},
+            env={
+                **auth_env,
+                "SIM_GRAPH_PATH": graph_file,
+                "SIM_COURIER_PER_USER": f"{courier_per_user:.6f}",
+                "SIM_COURIER_CAP": str(target_couriers),
+                "SIM_MERCHANT_PER_USER": "0.1",
+            },
         )
 
         if not full_simulation_supported:
@@ -366,6 +398,12 @@ def run_simulation(
             return
 
         log("Simulacao: iniciando sim_delivery em background")
+        delivery_env = {**os.environ, "PYTHONUNBUFFERED": "1", **auth_env}
+        # Reduz polling agressivo para evitar pressao excessiva no path de autenticacao/DB.
+        delivery_env.setdefault("SIM_COURIER_MAX", str(active_delivery_couriers))
+        delivery_env.setdefault("SIM_COURIER_POLL_SECONDS", "1.2")
+        delivery_env.setdefault("SIM_COURIER_POLL_JITTER_SECONDS", "0.4")
+        delivery_env.setdefault("SIM_API_PAGE_SIZE", "100")
         delivery_process = subprocess.Popen(
             [
                 sys.executable,
@@ -377,7 +415,7 @@ def run_simulation(
                 location_base_url or base_url,
             ],
             cwd=str(PROJECT_ROOT),
-            env={**os.environ, "PYTHONUNBUFFERED": "1", **auth_env},
+            env=delivery_env,
         )
 
         time.sleep(3)
@@ -402,7 +440,14 @@ def run_simulation(
             run_python_script(
                 PROJECT_ROOT / "local" / "sim_client.py",
                 ["--api-url", base_url, "--rps", str(rps), "--duration", str(sim_duration_s)],
-                env={**auth_env, "SIM_METRICS_PATH": metrics_path, "SIM_REPORT_INTERVAL_S": str(SIM_REPORT_INTERVAL_S)},
+                env={
+                    **auth_env,
+                    "SIM_METRICS_PATH": metrics_path,
+                    "SIM_REPORT_INTERVAL_S": str(SIM_REPORT_INTERVAL_S),
+                    "SIM_MAX_IN_FLIGHT_WRITES": str(max(100, rps * 6)),
+                    "SIM_MAX_IN_FLIGHT_READS": str(max(50, rps * 3)),
+                    "SIM_API_PAGE_SIZE": "100",
+                },
                 timeout_seconds=sim_duration_s + 300,
             )
         finally:
@@ -423,7 +468,26 @@ def resolve_simulation_base_url(worker_base_url: str, override_api_url: str | No
     return worker_base_url
 
 
+def s3_object_exists(bucket_name: str, object_key: str) -> bool:
+    s3 = boto3.client("s3", region_name=REGION)
+    try:
+        s3.head_object(Bucket=bucket_name, Key=object_key)
+        return True
+    except ClientError as error:
+        code = str(error.response.get("Error", {}).get("Code", ""))
+        if code in {"404", "NoSuchKey", "NotFound"}:
+            return False
+        raise
+
+
 def ensure_graph_in_s3(bucket_name: str, graph_file: str, graph_location: str) -> None:
+    if not env_flag("FORCE_GRAPH_REBUILD", default=False) and s3_object_exists(bucket_name, graph_file):
+        log(
+            "Dados: grafo ja existe no S3; pulando geracao/upload "
+            "(use FORCE_GRAPH_REBUILD=1 para forcar)"
+        )
+        return
+
     log("Dados: gerando grafo e enviando para S3")
     run_python_script(
         PROJECT_ROOT / "local" / "create.py",
@@ -515,13 +579,227 @@ def require_execution_role() -> str:
     return execution_role_arn
 
 
-def wait_service_ready(alb_dns: str, target_group_name: str) -> None:
-    log("Resolucao DNS")
+def wait_service_ready(alb_dns: str, target_group_name: str, service_name: str | None = None) -> None:
+    label = service_name or target_group_name
+
+    if service_name:
+        log(f"ECS stable ({service_name})")
+        wait_for_ecs_service_stable(service_name)
+
+    log(f"Resolucao DNS ({label})")
     wait_for_dns_resolution(alb_dns, log=log)
 
-    log("Health do target")
+    log(f"Health do target ({label})")
     elbv2 = boto3.client("elbv2", region_name=REGION)
     wait_for_healthy_targets(elbv2, target_group_name, log=log)
+
+
+def wait_services_ready(service_targets: list[tuple[str, str, str]]) -> None:
+    if not service_targets:
+        return
+
+    if len(service_targets) == 1:
+        alb_dns, target_group_name, service_name = service_targets[0]
+        wait_service_ready(alb_dns, target_group_name, service_name=service_name)
+        return
+
+    timeout_seconds = max(
+        120,
+        int(
+            os.getenv(
+                "SERVICES_READINESS_TIMEOUT_SECONDS",
+                str(max(300, int(os.getenv("ECS_STABLE_TIMEOUT_SECONDS", "1200")))),
+            )
+        ),
+    )
+    heartbeat_seconds = max(10, int(os.getenv("SERVICES_READINESS_HEARTBEAT_SECONDS", "20")))
+
+    errors: list[str] = []
+    max_workers = min(4, len(service_targets))
+    started_at = time.time()
+    last_heartbeat_at = started_at
+
+    # Nao use context-manager aqui: em Ctrl+C, shutdown(wait=True) pode bloquear
+    # enquanto threads de readiness ainda estao em polling.
+    executor = ThreadPoolExecutor(max_workers=max_workers)
+    future_to_service: dict[Any, str] = {}
+    try:
+        future_to_service = {
+            executor.submit(wait_service_ready, alb_dns, target_group_name, service_name): service_name
+            for alb_dns, target_group_name, service_name in service_targets
+        }
+        pending_futures = set(future_to_service.keys())
+
+        while pending_futures:
+            elapsed = time.time() - started_at
+            if elapsed >= timeout_seconds:
+                waiting_services = ", ".join(sorted(future_to_service[item] for item in pending_futures))
+                raise TimeoutError(
+                    "Readiness global expirou em "
+                    f"{timeout_seconds}s; servicos ainda pendentes: {waiting_services}"
+                )
+
+            done, pending_futures = wait(
+                pending_futures,
+                timeout=5,
+                return_when=FIRST_COMPLETED,
+            )
+
+            if not done:
+                now = time.time()
+                if now - last_heartbeat_at >= heartbeat_seconds:
+                    waiting_services = ", ".join(sorted(future_to_service[item] for item in pending_futures))
+                    log(
+                        "Readiness aguardando "
+                        f"({int(now - started_at)}s): {waiting_services}"
+                    )
+                    last_heartbeat_at = now
+                continue
+
+            for future in done:
+                service_name = future_to_service[future]
+                try:
+                    future.result()
+                    log(f"Readiness concluido ({service_name})")
+                except Exception as error:
+                    errors.append(f"{service_name}: {error}")
+    except KeyboardInterrupt:
+        remaining = [
+            future_to_service[item]
+            for item in future_to_service
+            if not item.done()
+        ]
+        remaining_text = ", ".join(sorted(remaining)) if remaining else "nenhum"
+        log(f"Readiness interrompido pelo usuario; pendentes: {remaining_text}")
+        raise
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
+
+    if errors:
+        raise RuntimeError("Falha no readiness dos servicos: " + " | ".join(errors))
+
+
+def wait_for_ecs_service_stable(service_name: str) -> None:
+    timeout_seconds = max(60, int(os.getenv("ECS_STABLE_TIMEOUT_SECONDS", "1200")))
+    poll_seconds = max(3, int(os.getenv("ECS_STABLE_POLL_SECONDS", "10")))
+    heartbeat_seconds = max(poll_seconds, int(os.getenv("ECS_STABLE_HEARTBEAT_SECONDS", "45")))
+    require_full_stability = env_flag("ECS_REQUIRE_FULL_STABILITY", default=False)
+
+    ecs = boto3.client("ecs", region_name=REGION)
+    started_at = time.time()
+    deadline = time.time() + timeout_seconds
+    last_snapshot: tuple[int, int, int, int, str, int, int, int] | None = None
+    last_event_message: str | None = None
+    last_heartbeat_at = started_at
+
+    while time.time() < deadline:
+        response = ecs.describe_services(cluster=CLUSTER_NAME, services=[service_name])
+        services = response.get("services", [])
+        failures = response.get("failures", [])
+
+        if failures:
+            reasons = ", ".join(str(item.get("reason", "unknown")) for item in failures)
+            raise RuntimeError(f"Falha ao consultar servico ECS {service_name}: {reasons}")
+
+        if not services:
+            raise RuntimeError(f"Servico ECS nao encontrado: {service_name}")
+
+        service = services[0]
+        status = str(service.get("status", "UNKNOWN"))
+        desired = int(service.get("desiredCount", 0))
+        running = int(service.get("runningCount", 0))
+        pending = int(service.get("pendingCount", 0))
+        deployments = service.get("deployments", [])
+
+        primary = next((item for item in deployments if item.get("status") == "PRIMARY"), None)
+        primary_rollout = str((primary or {}).get("rolloutState") or "UNKNOWN")
+        primary_running = int((primary or {}).get("runningCount", 0))
+        primary_desired = int((primary or {}).get("desiredCount", desired))
+        primary_pending = int((primary or {}).get("pendingCount", 0))
+
+        failed_deployments = [
+            item
+            for item in deployments
+            if str(item.get("rolloutState") or "").upper() == "FAILED"
+        ]
+        if failed_deployments:
+            reasons = [
+                str(item.get("rolloutStateReason") or "motivo nao informado")
+                for item in failed_deployments
+            ]
+            raise RuntimeError(
+                f"Servico ECS {service_name} com rollout FAILED: "
+                + " | ".join(reasons)
+            )
+
+        in_progress = [item for item in deployments if item.get("rolloutState") != "COMPLETED"]
+        snapshot = (
+            running,
+            desired,
+            pending,
+            len(deployments),
+            primary_rollout,
+            primary_running,
+            primary_desired,
+            primary_pending,
+        )
+
+        now = time.time()
+        should_log_heartbeat = (now - last_heartbeat_at) >= heartbeat_seconds
+        if snapshot != last_snapshot or should_log_heartbeat:
+            elapsed = int(now - started_at)
+            log(
+                f"ECS {service_name}: status={status} running={running}/{desired} "
+                f"pending={pending} deployments={len(deployments)} "
+                f"primary={primary_rollout} ({primary_running}/{primary_desired}, pend={primary_pending}) "
+                f"elapsed={elapsed}s"
+            )
+            last_snapshot = snapshot
+            last_heartbeat_at = now
+
+        latest_event = (service.get("events") or [{}])[0].get("message")
+        if latest_event and latest_event != last_event_message:
+            log(f"ECS evento ({service_name}): {latest_event}")
+            last_event_message = latest_event
+
+        expected_primary_running = max(desired, primary_desired)
+        primary_ready_for_traffic = (
+            primary is not None
+            and primary_running >= expected_primary_running
+            and primary_pending == 0
+            and primary_rollout in {"IN_PROGRESS", "COMPLETED"}
+        )
+
+        ready_for_checks = (
+            status == "ACTIVE"
+            and running >= desired
+            and pending == 0
+            and primary_ready_for_traffic
+        )
+
+        fully_stable = (
+            status == "ACTIVE"
+            and running == desired
+            and pending == 0
+            and not in_progress
+            and len(deployments) == 1
+            and primary_rollout == "COMPLETED"
+        )
+
+        if require_full_stability and fully_stable:
+            return
+
+        if not require_full_stability and ready_for_checks:
+            return
+
+        time.sleep(poll_seconds)
+
+    raise TimeoutError(
+        f"Servico ECS {service_name} nao atingiu readiness em {timeout_seconds}s "
+        f"(running={last_snapshot[0] if last_snapshot else 'NA'}/"
+        f"{last_snapshot[1] if last_snapshot else 'NA'}, pending={last_snapshot[2] if last_snapshot else 'NA'}). "
+        f"Ultimo evento: {last_event_message!r}"
+    )
 
 
 def test_api_service(base_url: str) -> None:
@@ -562,11 +840,12 @@ def test_service(
     require_graph_loaded: bool = True,
     require_db_connected: bool = True,
     require_tables_ok: bool = True,
+    service_name: str | None = None,
 ) -> None:
     base_url = f"http://{alb_dns}"
 
     if include_readiness:
-        wait_service_ready(alb_dns, target_group_name)
+        wait_service_ready(alb_dns, target_group_name, service_name=service_name)
 
     health_url = f"{base_url}/health"
     log("Teste /health")
@@ -658,6 +937,11 @@ def main(argv=None) -> int:
         default=None,
         help="URL base da API de dominio para simulacao (quando o ALB deste deploy aponta para worker)",
     )
+    parser.add_argument(
+        "--skip-pre-setup",
+        action="store_true",
+        help="Pula o pre-setup (build/push de imagens) e reutiliza imagens ja publicadas no ECR.",
+    )
     args = parser.parse_args(argv)
 
     configure_aws_files()
@@ -668,7 +952,10 @@ def main(argv=None) -> int:
         log("Fim")
         return 0
 
-    run_pre_deploy_setup()
+    if args.skip_pre_setup or env_flag("SKIP_PRE_SETUP", default=False):
+        log("Pre-setup ignorado (--skip-pre-setup ou SKIP_PRE_SETUP=1)")
+    else:
+        run_pre_deploy_setup()
 
     account_id = resolve_account_id()
     bucket_name = resolve_bucket_name(account_id)
@@ -705,12 +992,14 @@ def main(argv=None) -> int:
     location_base_url = f"http://{location_alb_dns}"
 
     if args.with_simulation:
-        log("Readiness worker")
-        wait_service_ready(worker_alb_dns, TARGET_GROUP_NAME)
-        log("Readiness API")
-        wait_service_ready(api_alb_dns, API_TARGET_GROUP_NAME)
-        log("Readiness location")
-        wait_service_ready(location_alb_dns, LOCATION_TARGET_GROUP_NAME)
+        log("Readiness dos servicos")
+        wait_services_ready(
+            [
+                (worker_alb_dns, TARGET_GROUP_NAME, SERVICE_NAME),
+                (api_alb_dns, API_TARGET_GROUP_NAME, API_SERVICE_NAME),
+                (location_alb_dns, LOCATION_TARGET_GROUP_NAME, LOCATION_SERVICE_NAME),
+            ]
+        )
 
         simulation_base_url = resolve_simulation_base_url(api_base_url, args.simulation_api_url)
         if simulation_base_url == api_base_url and not supports_data_load(simulation_base_url):
@@ -755,11 +1044,20 @@ def main(argv=None) -> int:
         test_api_service(api_base_url)
         test_location_service(location_base_url)
     else:
+        log("Readiness dos servicos")
+        wait_services_ready(
+            [
+                (worker_alb_dns, TARGET_GROUP_NAME, SERVICE_NAME),
+                (api_alb_dns, API_TARGET_GROUP_NAME, API_SERVICE_NAME),
+                (location_alb_dns, LOCATION_TARGET_GROUP_NAME, LOCATION_SERVICE_NAME),
+            ]
+        )
+
         log("Testes")
         test_service(
             worker_alb_dns,
             TARGET_GROUP_NAME,
-            include_readiness=True,
+            include_readiness=False,
             require_graph_loaded=True,
             require_db_connected=True,
             require_tables_ok=True,
@@ -767,7 +1065,7 @@ def main(argv=None) -> int:
         test_service(
             api_alb_dns,
             API_TARGET_GROUP_NAME,
-            include_readiness=True,
+            include_readiness=False,
             require_graph_loaded=False,
             require_db_connected=False,
             require_tables_ok=False,
@@ -775,7 +1073,7 @@ def main(argv=None) -> int:
         test_service(
             location_alb_dns,
             LOCATION_TARGET_GROUP_NAME,
-            include_readiness=True,
+            include_readiness=False,
             require_graph_loaded=False,
             require_db_connected=False,
             require_tables_ok=False,

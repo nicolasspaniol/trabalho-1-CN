@@ -5,9 +5,9 @@ services:
     shm_size: 128mb
     env_file: ".env"
     environment:
-      POSTGRES_PASSWORD: "${DB_PASSWORD}"
-      POSTGRES_USER: "${DB_USERNAME}"
-      POSTGRES_DB: "${DB_NAME}"
+      POSTGRES_PASSWORD: "${DB_PASSWORD:-postgres}"
+      POSTGRES_USER: "${DB_USERNAME:-postgres}"
+      POSTGRES_DB: "${DB_NAME:-postgres}"
     volumes:
       - ./init.sql:/docker-entrypoint-initdb.d/init.sql
 
@@ -18,17 +18,30 @@ services:
     command: "-jar DynamoDBLocal.jar -inMemory -sharedDb"
 
   worker:
+    env_file: ".env"
     build:
       context: .
-      dockerfile: dummy_worker/Dockerfile
+      dockerfile: services/worker/Dockerfile
+    environment:
+      DB_HOST: "${DB_HOST:-db}"
+      DB_NAME: "${DB_NAME:-postgres}"
+      DB_USER: "${DB_USERNAME:-postgres}"
+      DB_PASSWORD: "${DB_PASSWORD:-postgres}"
+      MAPAS_BUCKET: "${MAPAS_BUCKET:-}"
+      MAPAS_FILE: "${MAPAS_FILE:-sp_altodepinheiros.pkl}"
     ports:
-      - "8010:8010"
+      - "8010:80"
+    depends_on:
+      - db
 
   location:
     env_file: ".env"
     build:
       context: .
       dockerfile: services/location/Dockerfile
+    environment:
+      DYNAMODB_URL: "${DYNAMODB_URL:-http://dynamodb:8000}"
+      DYNAMODB_REGION: "${DYNAMODB_REGION:-us-east-1}"
     ports:
       - "8050:80"
     depends_on:
@@ -39,6 +52,18 @@ services:
     build:
       context: .
       dockerfile: services/api/Dockerfile
+    environment:
+      WORKER_URL: "${WORKER_URL:-http://worker:80}"
+      LOCATION_URL: "${LOCATION_URL:-http://location:80}"
+      DB_HOST: "${DB_HOST:-db}"
+      DB_PORT: "${DB_PORT:-5432}"
+      DB_NAME: "${DB_NAME:-postgres}"
+      DB_USERNAME: "${DB_USERNAME:-postgres}"
+      DB_PASSWORD: "${DB_PASSWORD:-postgres}"
+      DYNAMODB_URL: "${DYNAMODB_URL:-http://dynamodb:8000}"
+      DYNAMODB_REGION: "${DYNAMODB_REGION:-us-east-1}"
+      ADMIN_USERNAME: "${ADMIN_USERNAME:-admin}"
+      ADMIN_PASSWORD: "${ADMIN_PASSWORD:-admin}"
     ports:
       - "8000:80"
     depends_on:

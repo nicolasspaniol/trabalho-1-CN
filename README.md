@@ -121,9 +121,10 @@ uv run --project local local/deploy.py --only-delete
 # Simulacao com cenarios customizados
 uv run --project local local/deploy.py \
 	--with-simulation \
-	--rps-scenarios 10,50,200 \
-	--duration 30 \
-	--cooldown-seconds 5 \
+	--num-users 1000 \
+	--rps 25 \
+	--sim-duration 120 \
+	--skip-pre-setup \
 	--no-delete
 ```
 
@@ -132,6 +133,7 @@ uv run --project local local/deploy.py \
 - --with-simulation: liga validacao + simulador
 - --no-delete: mantem recursos ativos ao final
 - --only-delete: remove recursos
+- --skip-pre-setup: reaproveita imagens ja publicadas no ECR (evita build/push no inicio)
 - --api-username e --api-password: credenciais Basic Auth da API
 - --graph-file e --graph-location: arquivo/regiao do grafo
 - --simulation-api-url: URL alternativa da API para simulacao
@@ -164,6 +166,8 @@ uv run --project local local/deploy.py \
 Aviso:
 
 - O grafo da cidade inteira pode aumentar bastante tempo de extração/upload e custo de execução.
+- Se o arquivo ja existir no S3 com a mesma chave, o deploy reaproveita o objeto para acelerar o ciclo.
+- Para forcar regeneracao/upload do grafo, execute com `FORCE_GRAPH_REBUILD=1`.
 
 ## API na interface web
 

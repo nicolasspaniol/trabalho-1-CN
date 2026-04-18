@@ -26,6 +26,10 @@ REQUIRED_OPENAPI_PATHS = {
     "/orders/{order_id}/delivered",
 }
 
+RETRYABLE_STATUS_CODES = {502, 503, 504}
+MAX_RETRIES = int(os.getenv("SIM_PREFLIGHT_MAX_RETRIES", "4"))
+RETRY_BACKOFF_SECONDS = float(os.getenv("SIM_PREFLIGHT_RETRY_BACKOFF_SECONDS", "2"))
+
 
 def auth_header(username: str, password: str) -> dict[str, str]:
     raw = f"{username}:{password}".encode("utf-8")
@@ -44,17 +48,33 @@ async def request_json(
     headers: dict[str, str] | None = None,
 ) -> Any:
     url = f"{api_url.rstrip('/')}{path}"
-    async with session.request(method, url, json=json, params=params, headers=headers) as response:
-        body = await response.text()
-        if expected_status is not None and response.status != expected_status:
-            raise RuntimeError(
-                f"{method} {path} retornou {response.status}, esperado {expected_status}. Body: {body[:500]}"
-            )
-        if response.status >= 400:
-            raise RuntimeError(f"{method} {path} falhou com {response.status}. Body: {body[:500]}")
-        if not body.strip():
-            return None
-        return await response.json()
+    for attempt in range(1, MAX_RETRIES + 2):
+        try:
+            async with session.request(method, url, json=json, params=params, headers=headers) as response:
+                body = await response.text()
+
+                if expected_status is not None and response.status != expected_status:
+                    if response.status in RETRYABLE_STATUS_CODES and attempt <= MAX_RETRIES:
+                        await asyncio.sleep(RETRY_BACKOFF_SECONDS * attempt)
+                        continue
+                    raise RuntimeError(
+                        f"{method} {path} retornou {response.status}, esperado {expected_status}. Body: {body[:500]}"
+                    )
+
+                if response.status >= 400:
+                    if response.status in RETRYABLE_STATUS_CODES and attempt <= MAX_RETRIES:
+                        await asyncio.sleep(RETRY_BACKOFF_SECONDS * attempt)
+                        continue
+                    raise RuntimeError(f"{method} {path} falhou com {response.status}. Body: {body[:500]}")
+
+                if not body.strip():
+                    return None
+                return await response.json()
+        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            if attempt <= MAX_RETRIES:
+                await asyncio.sleep(RETRY_BACKOFF_SECONDS * attempt)
+                continue
+            raise RuntimeError(f"{method} {path} falhou por erro de conexao: {exc}")
 
 
 def get_resource_id(resource: dict[str, Any], resource_name: str) -> int:
@@ -202,27 +222,26 @@ async def validate(api_url: str, username: str, password: str) -> None:
             json={},
         )
 
-        # Recupera pedido atribuído para autenticar fluxo do courier.
+        # Recupera o courier efetivamente atribuído ao pedido.
         # A atribuicao acontece de forma assincrona e pode demorar alguns segundos.
-        courier_order = None
+        assigned_courier_id = None
         for _ in range(15):
-            try:
-                courier_order = await request_json(
-                    session,
-                    "GET",
-                    api_url,
-                    "/couriers/me/order",
-                    expected_status=200,
-                    headers=auth_header(str(courier_id), "x"),
-                )
-                break
-            except RuntimeError as exc:
-                message = str(exc)
-                if "retornou 404" not in message and "retornou 500" not in message:
-                    raise
-                await asyncio.sleep(2)
+            order_state = await request_json(
+                session,
+                "GET",
+                api_url,
+                f"/orders/{order_id}",
+                expected_status=200,
+                headers=auth_header(str(customer_id), "x"),
+            )
+            if isinstance(order_state, dict):
+                assigned_value = order_state.get("courier_id")
+                if assigned_value is not None:
+                    assigned_courier_id = int(assigned_value)
+                    break
+            await asyncio.sleep(2)
 
-        if courier_order is None:
+        if assigned_courier_id is None:
             print("[preflight] Aviso: /couriers/me/order nao encontrou pedido ativo; seguindo sem validar etapas de courier")
             await request_json(
                 session,
@@ -246,6 +265,15 @@ async def validate(api_url: str, username: str, password: str) -> None:
             print("[preflight] Validacao de endpoints concluida com avisos (sem atribuicao de courier).")
             return
 
+        courier_order = await request_json(
+            session,
+            "GET",
+            api_url,
+            "/couriers/me/order",
+            expected_status=200,
+            headers=auth_header(str(assigned_courier_id), "x"),
+        )
+
         if int(courier_order["id"]) != order_id:
             raise RuntimeError(
                 f"/couriers/me/order retornou pedido {courier_order.get('id')} em vez de {order_id}"
@@ -257,7 +285,7 @@ async def validate(api_url: str, username: str, password: str) -> None:
             api_url,
             f"/orders/{order_id}/picked_up",
             expected_status=200,
-            headers=auth_header(str(courier_id), "x"),
+            headers=auth_header(str(assigned_courier_id), "x"),
             json={},
         )
         await request_json(
@@ -266,7 +294,7 @@ async def validate(api_url: str, username: str, password: str) -> None:
             api_url,
             f"/orders/{order_id}/in_transit",
             expected_status=200,
-            headers=auth_header(str(courier_id), "x"),
+            headers=auth_header(str(assigned_courier_id), "x"),
             json={},
         )
         await request_json(
@@ -275,7 +303,7 @@ async def validate(api_url: str, username: str, password: str) -> None:
             api_url,
             "/couriers/me/location",
             expected_status=200,
-            headers=auth_header(str(courier_id), "x"),
+            headers=auth_header(str(assigned_courier_id), "x"),
             params={"location": 5454738291},
         )
         await request_json(
@@ -284,7 +312,7 @@ async def validate(api_url: str, username: str, password: str) -> None:
             api_url,
             f"/orders/{order_id}/delivered",
             expected_status=200,
-            headers=auth_header(str(courier_id), "x"),
+            headers=auth_header(str(assigned_courier_id), "x"),
             json={},
         )
 

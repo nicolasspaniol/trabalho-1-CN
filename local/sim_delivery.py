@@ -11,9 +11,9 @@ import aiohttp
 
 API_URL_ENV = "API_URL"
 
-COURIER_MAX = int(os.getenv("SIM_COURIER_MAX", "50"))
-COURIER_POLL_SECONDS = float(os.getenv("SIM_COURIER_POLL_SECONDS", "5"))
-COURIER_POLL_JITTER_SECONDS = float(os.getenv("SIM_COURIER_POLL_JITTER_SECONDS", "1"))
+COURIER_MAX = int(os.getenv("SIM_COURIER_MAX", "200"))
+COURIER_POLL_SECONDS = float(os.getenv("SIM_COURIER_POLL_SECONDS", "1"))
+COURIER_POLL_JITTER_SECONDS = float(os.getenv("SIM_COURIER_POLL_JITTER_SECONDS", "0.25"))
 ERROR_BACKOFF_MAX_SECONDS = float(os.getenv("SIM_COURIER_ERROR_BACKOFF_MAX_SECONDS", "30"))
 
 NEW_DELIVERY_MODE = "new"
@@ -192,23 +192,36 @@ async def _request_with_retry(
 
 async def fetch_courier_ids(session: aiohttp.ClientSession, api_url: str) -> list[int]:
     try:
-        payload = await get_json(session, f"{api_url.rstrip('/')}/couriers/")
+        page_size = min(100, max(1, int(os.getenv("SIM_API_PAGE_SIZE", "100"))))
+    except (TypeError, ValueError):
+        page_size = 100
+    offset = 0
+    courier_ids: list[int] = []
+
+    try:
+        while True:
+            payload = await get_json(
+                session,
+                f"{api_url.rstrip('/')}/couriers/?offset={offset}&limit={page_size}",
+            )
+            if not isinstance(payload, list) or not payload:
+                break
+
+            for item in payload:
+                if isinstance(item, dict):
+                    value = item.get("id", item.get("user_id"))
+                    try:
+                        if value is not None:
+                            courier_ids.append(int(value))
+                    except (TypeError, ValueError):
+                        continue
+
+            if len(payload) < page_size:
+                break
+            offset += page_size
     except Exception as e:
         print(f"  Erro ao buscar lista de couriers: {e}")
         return []
-
-    if not isinstance(payload, list):
-        return []
-
-    courier_ids: list[int] = []
-    for item in payload:
-        if isinstance(item, dict):
-            value = item.get("id", item.get("user_id"))
-            try:
-                if value is not None:
-                    courier_ids.append(int(value))
-            except (TypeError, ValueError):
-                continue
     return courier_ids
 
 
@@ -493,7 +506,8 @@ async def delivery_worker(
     selected_couriers: list[str] = []
     if courier_ids:
         if COURIER_MAX > 0:
-            courier_ids = courier_ids[:COURIER_MAX]
+            if len(courier_ids) > COURIER_MAX:
+                courier_ids = random.sample(courier_ids, COURIER_MAX)
         selected_couriers = [str(cid) for cid in courier_ids]
         print(f"Iniciando courier worker com {len(selected_couriers)} couriers")
     elif username and username.isnumeric():
