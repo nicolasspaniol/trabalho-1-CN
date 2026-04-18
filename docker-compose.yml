@@ -20,9 +20,9 @@ services:
   worker:
     build:
       context: .
-      dockerfile: dummy_worker/Dockerfile
+      dockerfile: services/worker/Dockerfile
     ports:
-      - "8010:8010"
+      - "8010:80"
 
   location:
     env_file: ".env"

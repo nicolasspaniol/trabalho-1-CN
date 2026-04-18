@@ -32,7 +32,7 @@ def put(session, model, id, obj):
     session.add(obj_db)
     session.commit()
     session.refresh(obj_db)
-    return
+    return obj_db
 
 
 def patch(session, model, id, obj):
@@ -43,7 +43,7 @@ def patch(session, model, id, obj):
     session.add(obj_db)
     session.commit()
     session.refresh(obj_db)
-    return
+    return obj_db
 
 
 def delete(session, model, id):

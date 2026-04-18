@@ -117,12 +117,18 @@ def setup_dynamo(table_name):
         dynamo.create_table(
             TableName=table_name,
             KeySchema=[
-                {'AttributeName': 'Order_ID', 'KeyType': 'HASH'},
-                {'AttributeName': 'Timestamp', 'KeyType': 'RANGE'}
+                {'AttributeName': 'id', 'KeyType': 'HASH'}
             ],
             AttributeDefinitions=[
-                {'AttributeName': 'Order_ID', 'AttributeType': 'N'},
-                {'AttributeName': 'Timestamp', 'AttributeType': 'N'}
+                {'AttributeName': 'id', 'AttributeType': 'S'},
+                {'AttributeName': 'status', 'AttributeType': 'S'}
+            ],
+            GlobalSecondaryIndexes=[
+                {
+                    'IndexName': 'StatusIndex',
+                    'KeySchema': [{'AttributeName': 'status', 'KeyType': 'HASH'}],
+                    'Projection': {'ProjectionType': 'ALL'}
+                }
             ],
             BillingMode="PAY_PER_REQUEST"
         )

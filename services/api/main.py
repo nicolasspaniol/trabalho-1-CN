@@ -9,7 +9,7 @@ from botocore.config import Config
 from fastapi import APIRouter, BackgroundTasks, Depends, FastAPI, HTTPException, Query, Request, status
 from fastapi.responses import JSONResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlmodel import SQLModel, Session, create_engine, delete, select
 
 import models as em
@@ -176,6 +176,15 @@ async def integrity_exception_handler(_req: Request, _exc: IntegrityError):
     return JSONResponse(
         status_code=status.HTTP_400_BAD_REQUEST,
         content={"detail": "Database constraint violation"},
+    )
+
+
+@app.exception_handler(OperationalError)
+async def operational_exception_handler(_req: Request, _exc: OperationalError):
+    # Sob pressão no RDS (slots de conexão), preferimos 503 para habilitar retry no cliente.
+    return JSONResponse(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        content={"detail": "Database temporarily unavailable"},
     )
 
 
@@ -494,7 +503,14 @@ def look_for_courier(order_id: int, customer_address: int, merchant_address: int
 
 
 @orders.get("/{order_id}", response_model=em.OrderPublicComplete)
-def get_order(order_id: int, session: SessionDep, user: UserDep, dynamo: DynamoDep):
+def get_order(
+    order_id: int,
+    session: SessionDep,
+    user: UserDep,
+    dynamo: DynamoDep,
+    include_route: bool = Query(True, description="Inclui delivery_route (DynamoDB)."),
+    include_location: bool = Query(True, description="Inclui courier_location (DynamoDB)."),
+):
     order: em.Order = session.get(em.Order, order_id)
     assert_exists(order, order_id, "order")
 
@@ -503,11 +519,12 @@ def get_order(order_id: int, session: SessionDep, user: UserDep, dynamo: DynamoD
 
     order_public = em.OrderPublicComplete.model_validate(order, from_attributes=True)
 
-    if order.status.idx() > em.OrderStatus.ready_for_pickup.idx():
+    if include_route and order.status.idx() > em.OrderStatus.ready_for_pickup.idx():
         delivery_route = get_dynamo_item(dynamo.Table(DELIVERY_ROUTE_TABLE), order.id)
         if delivery_route:
             order_public.delivery_route = em.DeliveryRoute.from_dynamo(delivery_route)
 
+    if include_location and order.status.idx() > em.OrderStatus.ready_for_pickup.idx():
         courier_location = get_dynamo_item(dynamo.Table(COURIER_LOCATION_TABLE), order.id)
         if courier_location:
             order_public.courier_location = em.CourierLocation.from_dynamo(courier_location)
@@ -706,4 +723,26 @@ app.include_router(orders)
 
 @app.get("/health", tags=["Other"])
 def health():
-    return True
+    sql_ok = True
+    dynamo_ok = True
+
+    try:
+        with Session(db_engine) as session:
+            session.exec(select(1)).first()
+    except Exception:
+        sql_ok = False
+
+    try:
+        get_dynamodb().meta.client.list_tables(Limit=1)
+    except Exception:
+        dynamo_ok = False
+
+    payload = {
+        "status": "ok" if (sql_ok and dynamo_ok) else "degraded",
+        "sql_ok": sql_ok,
+        "dynamo_ok": dynamo_ok,
+    }
+
+    if sql_ok and dynamo_ok:
+        return payload
+    return JSONResponse(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, content=payload)

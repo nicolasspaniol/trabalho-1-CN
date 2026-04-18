@@ -71,4 +71,5 @@ CREATE TABLE IF NOT EXISTS order_item (
 
 CREATE INDEX IF NOT EXISTS idx_courier_availability ON courier(availability);
 CREATE INDEX IF NOT EXISTS idx_order_status ON "order"(status);
+CREATE INDEX IF NOT EXISTS idx_order_courier_status ON "order"(courier_id, status);
 CREATE INDEX IF NOT EXISTS idx_order_event_order_time ON order_event(order_id, change_time);

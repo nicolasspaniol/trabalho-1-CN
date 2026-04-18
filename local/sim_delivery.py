@@ -12,8 +12,12 @@ import aiohttp
 API_URL_ENV = "API_URL"
 
 COURIER_MAX = int(os.getenv("SIM_COURIER_MAX", "50"))
-COURIER_POLL_SECONDS = float(os.getenv("SIM_COURIER_POLL_SECONDS", "5"))
-COURIER_POLL_JITTER_SECONDS = float(os.getenv("SIM_COURIER_POLL_JITTER_SECONDS", "1"))
+COURIER_POLL_SECONDS = float(os.getenv("SIM_COURIER_POLL_SECONDS", "1.0"))
+COURIER_POLL_JITTER_SECONDS = float(os.getenv("SIM_COURIER_POLL_JITTER_SECONDS", "0.3"))
+COURIER_IDLE_POLL_MAX_SECONDS = float(os.getenv("SIM_COURIER_IDLE_POLL_MAX_SECONDS", "15.0"))
+COURIER_IDLE_BACKOFF_MULTIPLIER = float(os.getenv("SIM_COURIER_IDLE_BACKOFF_MULTIPLIER", "1.8"))
+COURIER_BUSY_POLL_MAX_SCALE = float(os.getenv("SIM_COURIER_BUSY_POLL_MAX_SCALE", "6.0"))
+COURIER_BUSY_BACKOFF_MULTIPLIER = float(os.getenv("SIM_COURIER_BUSY_BACKOFF_MULTIPLIER", "1.5"))
 ERROR_BACKOFF_MAX_SECONDS = float(os.getenv("SIM_COURIER_ERROR_BACKOFF_MAX_SECONDS", "30"))
 
 NEW_DELIVERY_MODE = "new"
@@ -24,6 +28,7 @@ REQUIRED_DELIVERY_PATHS = {
     "/couriers/me/order",
     "/orders/{order_id}/accept",
     "/orders/{order_id}/ready",
+    "/orders/{order_id}/in_transit",
     "/orders/{order_id}/picked_up",
 }
 
@@ -91,7 +96,7 @@ async def get_json(session: aiohttp.ClientSession, url: str) -> Any:
         return await response.json()
 
 
-_RETRY_STATUSES = {429, 502, 503, 504}
+_RETRY_STATUSES = {429, 500, 502, 503, 504}
 
 
 _STATUS_ORDER = {
@@ -404,6 +409,8 @@ async def run_courier_loop(
     async with aiohttp.ClientSession(auth=auth, timeout=timeout) as session:
         last_handled_order_id: int | None = None
         error_backoff = 0.0
+        idle_backoff_factor = 1.0
+        busy_backoff_factor = 1.0
         last_error_log = 0.0
 
         while True:
@@ -413,8 +420,15 @@ async def run_courier_loop(
 
                 if not current_order:
                     last_handled_order_id = None
-                    await asyncio.sleep(_poll_sleep_seconds())
+                    busy_backoff_factor = 1.0
+                    idle_backoff_factor = min(
+                        COURIER_IDLE_POLL_MAX_SECONDS / max(0.1, COURIER_POLL_SECONDS),
+                        idle_backoff_factor * COURIER_IDLE_BACKOFF_MULTIPLIER,
+                    )
+                    await asyncio.sleep(_poll_sleep_seconds(scale=idle_backoff_factor))
                     continue
+
+                idle_backoff_factor = 1.0
 
                 order_id_value = current_order.get("id")
                 if order_id_value is None:
@@ -424,12 +438,20 @@ async def run_courier_loop(
                 status = current_order.get("status")
 
                 if order_id == last_handled_order_id:
-                    await asyncio.sleep(_poll_sleep_seconds())
+                    busy_backoff_factor = min(
+                        COURIER_BUSY_POLL_MAX_SCALE,
+                        busy_backoff_factor * COURIER_BUSY_BACKOFF_MULTIPLIER,
+                    )
+                    await asyncio.sleep(_poll_sleep_seconds(scale=busy_backoff_factor))
                     continue
 
                 if delivery_mode == NEW_DELIVERY_MODE:
                     if not str(status).upper().endswith("READY_FOR_PICKUP"):
-                        await asyncio.sleep(_poll_sleep_seconds())
+                        busy_backoff_factor = min(
+                            COURIER_BUSY_POLL_MAX_SCALE,
+                            busy_backoff_factor * COURIER_BUSY_BACKOFF_MULTIPLIER,
+                        )
+                        await asyncio.sleep(_poll_sleep_seconds(scale=busy_backoff_factor))
                         continue
                     handled = await deliver_order_new(
                         session,
@@ -441,8 +463,10 @@ async def run_courier_loop(
                     )
                     if handled:
                         last_handled_order_id = order_id
+                        busy_backoff_factor = 1.0
                 else:
                     last_handled_order_id = order_id
+                    busy_backoff_factor = 1.0
 
             except Exception as e:
                 # Backoff por courier: evita que timeouts em cascata virem DDoS no ALB/API.
@@ -453,7 +477,7 @@ async def run_courier_loop(
                     print(f"✗ Erro no courier worker ({courier_username}): {e} (backoff={error_backoff:.1f}s)")
                     last_error_log = now
 
-            await asyncio.sleep(_poll_sleep_seconds() + error_backoff)
+            await asyncio.sleep(_poll_sleep_seconds(scale=idle_backoff_factor) + error_backoff)
 
 
 async def report_delivery_progress(stats: DeliveryStats, interval_seconds: int) -> None:
@@ -541,10 +565,10 @@ async def delivery_worker(
         await asyncio.gather(*tasks)
 
 
-def _poll_sleep_seconds() -> float:
+def _poll_sleep_seconds(scale: float = 1.0) -> float:
     base = max(0.1, COURIER_POLL_SECONDS)
     jitter = max(0.0, COURIER_POLL_JITTER_SECONDS)
-    return base + (random.random() * jitter)
+    return (base * max(0.1, scale)) + (random.random() * jitter)
 
 
 if __name__ == "__main__":

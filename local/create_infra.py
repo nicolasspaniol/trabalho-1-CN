@@ -306,7 +306,7 @@ def setup_worker_infrastructure(region, cluster_name, service_name, table_name, 
     db_host = resolve_db_host()
     db_password = resolve_db_password()
     # Defaults mais "parrudos" para simulação: evita fila no worker ao consultar/reservar couriers.
-    worker_db_pool_max_connections = os.getenv("WORKER_DB_POOL_MAX_CONNECTIONS", "10").strip() or "10"
+    worker_db_pool_max_connections = os.getenv("WORKER_DB_POOL_MAX_CONNECTIONS", "5").strip() or "5"
     worker_desired = int(os.getenv("WORKER_DESIRED_COUNT", "4"))
     worker_min_capacity = int(os.getenv("WORKER_AUTOSCALING_MIN_CAPACITY", "4"))
     worker_max_capacity = int(os.getenv("WORKER_AUTOSCALING_MAX_CAPACITY", "20"))
@@ -441,11 +441,11 @@ def setup_api_infrastructure(
     admin_password = os.getenv("ADMIN_PASSWORD", "admin")
     location_url = location_base_url or os.getenv("LOCATION_URL", "").strip()
     # Defaults conservadores para evitar esgotar conexoes do RDS em conta/lab pequena.
-    api_db_pool_size = os.getenv("API_DB_POOL_SIZE", "3").strip() or "3"
-    api_db_max_overflow = os.getenv("API_DB_MAX_OVERFLOW", "0").strip() or "0"
+    api_db_pool_size = os.getenv("API_DB_POOL_SIZE", "5").strip() or "5"
+    api_db_max_overflow = os.getenv("API_DB_MAX_OVERFLOW", "2").strip() or "2"
     api_db_pool_timeout = os.getenv("API_DB_POOL_TIMEOUT", "30").strip() or "30"
-    api_desired = int(os.getenv("API_DESIRED_COUNT", "2"))
-    api_min_capacity = int(os.getenv("API_AUTOSCALING_MIN_CAPACITY", "2"))
+    api_desired = int(os.getenv("API_DESIRED_COUNT", "3"))
+    api_min_capacity = int(os.getenv("API_AUTOSCALING_MIN_CAPACITY", "3"))
     api_max_capacity = int(os.getenv("API_AUTOSCALING_MAX_CAPACITY", "8"))
     api_request_target = float(os.getenv("API_REQUEST_TARGET", "120"))
 

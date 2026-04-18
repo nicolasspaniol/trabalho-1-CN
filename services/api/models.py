@@ -217,7 +217,7 @@ class OrderPublic(OrderBase):
     merchant_id: int
     customer_id: int
     courier_id: Optional[int]
-    status: str
+    status: OrderStatus
     order_time: datetime = Field(default_factory=datetime.now)
 
 class OrderPublicComplete(OrderPublic):

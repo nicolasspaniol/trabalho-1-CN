@@ -75,6 +75,31 @@ def parse_simple_env_file(env_file: Path) -> dict[str, str]:
     return values
 
 
+def parse_rps_scenarios(raw_value: str | None, fallback_rps: int) -> list[int]:
+    if not raw_value or not raw_value.strip():
+        return [max(1, fallback_rps)]
+
+    values: list[int] = []
+    for chunk in raw_value.split(","):
+        token = chunk.strip()
+        if not token:
+            continue
+        values.append(max(1, int(token)))
+
+    if not values:
+        raise ValueError("--rps-scenarios invalido: informe uma lista CSV de inteiros positivos")
+    return values
+
+
+def estimate_sim_courier_max(num_users: int, rps_scenarios: list[int]) -> int:
+    # Regra de carga local: 3 couriers por user (ver local/load.py).
+    total_couriers = max(1, num_users * 3)
+    peak_rps = max(rps_scenarios) if rps_scenarios else 1
+    # Mantem folga para despacho sem poluir a API com polling excessivo.
+    target = max(20, peak_rps * 4)
+    return min(total_couriers, target)
+
+
 SIM_DURATION_S = int(os.getenv("SIM_DURATION_S", "300"))
 SIM_REPORT_INTERVAL_S = int(os.getenv("SIM_REPORT_INTERVAL_S", "30"))
 
@@ -274,8 +299,8 @@ def ensure_simulation_contract(base_url: str, location_base_url: str | None = No
         hello_payload = http_get_json(f"{base_url}/hello")
         if isinstance(hello_payload, dict) and hello_payload.get("service") == "routing-worker":
             raise RuntimeError(
-                "Simulacao indisponivel: o ALB atual aponta para o worker em modo teste "
-                "(services/worker/app/main2.py), sem endpoints de dominio (/customers, /merchants, /couriers, /orders, /couriers/me/location, /orders/{order_id}/ready, /orders/{order_id}/picked_up)."
+                "Simulacao indisponivel: a URL configurada aponta para o worker de roteamento, "
+                "sem endpoints de dominio (/customers, /merchants, /couriers, /orders, /couriers/me/location, /orders/{order_id}/ready, /orders/{order_id}/in_transit, /orders/{order_id}/picked_up)."
             )
     except RuntimeError:
         raise
@@ -308,12 +333,13 @@ def ensure_simulation_contract(base_url: str, location_base_url: str | None = No
         "/couriers/me/order",
         "/orders/{order_id}/accept",
         "/orders/{order_id}/ready",
+        "/orders/{order_id}/in_transit",
         "/couriers/me/location",
         "/orders/{order_id}/picked_up",
     }
 
     if required_new_delivery_paths <= normalized_paths:
-        log("Simulacao: contrato completo de courier detectado (accept + ready + couriers/me/location + picked_up)")
+        log("Simulacao: contrato completo de courier detectado (accept + ready + in_transit + couriers/me/location + picked_up)")
         return True
 
     missing_new_paths = sorted(required_new_delivery_paths - normalized_paths)
@@ -327,8 +353,9 @@ def ensure_simulation_contract(base_url: str, location_base_url: str | None = No
 def run_simulation(
     base_url: str,
     num_users: int,
-    rps: int,
+    rps_scenarios: list[int],
     sim_duration_s: int,
+    cooldown_seconds: int,
     api_username: str | None,
     api_password: str | None,
     bucket_name: str,
@@ -342,6 +369,14 @@ def run_simulation(
     auth_env: dict[str, str] = {}
     if api_username and api_password:
         auth_env = {"API_USERNAME": api_username, "API_PASSWORD": api_password}
+
+    sim_courier_max = os.getenv("SIM_COURIER_MAX", "").strip()
+    if not sim_courier_max:
+        sim_courier_max = str(estimate_sim_courier_max(num_users, rps_scenarios))
+        log(f"Simulacao: SIM_COURIER_MAX autoajustado para {sim_courier_max}")
+
+    auth_env["SIM_COURIER_MAX"] = sim_courier_max
+
     try:
         if not can_load_data:
             log("Simulacao: pulando carga/sim_delivery/load-test por falta de endpoints de carga; deploy segue normalmente")
@@ -381,33 +416,60 @@ def run_simulation(
         )
 
         time.sleep(3)
+        if delivery_process.poll() is not None:
+            raise RuntimeError(
+                "Simulacao falhou: sim_delivery encerrou prematuramente "
+                f"(exit_code={delivery_process.returncode})."
+            )
 
-        log(f"Simulacao: load test {rps} RPS por {sim_duration_s}s")
-        metrics_path = f"/tmp/dijkfood_sim_metrics_{int(time.time())}.json"
         ecs = boto3.client("ecs", region_name=REGION)
         stop_event = threading.Event()
-        reporter = threading.Thread(
-            target=simulation_reporter,
-            kwargs={
-                "stop_event": stop_event,
-                "ecs": ecs,
-                "cluster": CLUSTER_NAME,
-                "services": [SERVICE_NAME, API_SERVICE_NAME, LOCATION_SERVICE_NAME],
-                "metrics_path": metrics_path,
-            },
-            daemon=True,
-        )
-        reporter.start()
+
+        reporter = None
         try:
-            run_python_script(
-                PROJECT_ROOT / "local" / "sim_client.py",
-                ["--api-url", base_url, "--rps", str(rps), "--duration", str(sim_duration_s)],
-                env={**auth_env, "SIM_METRICS_PATH": metrics_path, "SIM_REPORT_INTERVAL_S": str(SIM_REPORT_INTERVAL_S)},
-                timeout_seconds=sim_duration_s + 300,
-            )
+            for rps in rps_scenarios:
+                log(f"Simulacao: load test {rps} RPS por {sim_duration_s}s")
+                metrics_path = f"/tmp/dijkfood_sim_metrics_rps{rps}_{int(time.time())}.json"
+
+                stop_event.clear()
+                reporter = threading.Thread(
+                    target=simulation_reporter,
+                    kwargs={
+                        "stop_event": stop_event,
+                        "ecs": ecs,
+                        "cluster": CLUSTER_NAME,
+                        "services": [SERVICE_NAME, API_SERVICE_NAME, LOCATION_SERVICE_NAME],
+                        "metrics_path": metrics_path,
+                    },
+                    daemon=True,
+                )
+                reporter.start()
+
+                try:
+                    run_python_script(
+                        PROJECT_ROOT / "local" / "sim_client.py",
+                        ["--api-url", base_url, "--rps", str(rps), "--duration", str(sim_duration_s)],
+                        env={**auth_env, "SIM_METRICS_PATH": metrics_path, "SIM_REPORT_INTERVAL_S": str(SIM_REPORT_INTERVAL_S)},
+                        timeout_seconds=sim_duration_s + 300,
+                    )
+                finally:
+                    stop_event.set()
+                    if reporter is not None:
+                        reporter.join(timeout=2)
+
+                if delivery_process.poll() is not None:
+                    raise RuntimeError(
+                        "Simulacao falhou: sim_delivery encerrou antes do fim do load test "
+                        f"(exit_code={delivery_process.returncode})."
+                    )
+
+                if cooldown_seconds > 0 and rps != rps_scenarios[-1]:
+                    log(f"Simulacao: cooldown de {cooldown_seconds}s antes do proximo cenário")
+                    time.sleep(cooldown_seconds)
         finally:
             stop_event.set()
-            reporter.join(timeout=2)
+            if reporter is not None:
+                reporter.join(timeout=2)
     finally:
         if delivery_process is not None:
             log("Simulacao: encerrando sim_delivery")
@@ -615,10 +677,21 @@ def main(argv=None) -> int:
     parser.add_argument("--num-users", type=int, default=100, help="Quantidade base de usuarios para load.py")
     parser.add_argument("--rps", type=int, default=50, help="Pedidos por segundo na simulacao")
     parser.add_argument(
+        "--rps-scenarios",
+        default=None,
+        help="Lista CSV de RPS para executar em sequencia (ex: 3,5,10).",
+    )
+    parser.add_argument(
         "--sim-duration",
         type=int,
         default=SIM_DURATION_S,
         help="Duracao do teste de carga em segundos.",
+    )
+    parser.add_argument(
+        "--cooldown-seconds",
+        type=int,
+        default=20,
+        help="Pausa entre cenarios de RPS para reduzir efeito de cauda.",
     )
     parser.add_argument("--api-username", default=None, help="Usuario Basic Auth da API para simulacao")
     parser.add_argument("--api-password", default=None, help="Senha Basic Auth da API para simulacao")
@@ -720,12 +793,15 @@ def main(argv=None) -> int:
             )
 
         api_username, api_password = resolve_api_auth(args.api_username, args.api_password, args.api_auth_env_file)
+        rps_scenarios = parse_rps_scenarios(args.rps_scenarios, args.rps)
+        log("Simulacao: cenarios de RPS = " + ", ".join(str(item) for item in rps_scenarios))
         try:
             run_simulation(
                 base_url=simulation_base_url,
                 num_users=args.num_users,
-                rps=args.rps,
+            rps_scenarios=rps_scenarios,
                 sim_duration_s=args.sim_duration,
+                cooldown_seconds=args.cooldown_seconds,
                 api_username=api_username,
                 api_password=api_password,
                 bucket_name=bucket_name,

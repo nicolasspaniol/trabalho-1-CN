@@ -18,12 +18,17 @@ API_URL_ENV = "API_URL"
 API_USERNAME_ENV = "API_USERNAME"
 API_PASSWORD_ENV = "API_PASSWORD"
 
-DEFAULT_TOTAL_TIMEOUT_S = float(os.getenv("SIM_HTTP_TOTAL_TIMEOUT", "10"))
-DEFAULT_CONNECT_TIMEOUT_S = float(os.getenv("SIM_HTTP_CONNECT_TIMEOUT", "3"))
-DEFAULT_SOCK_READ_TIMEOUT_S = float(os.getenv("SIM_HTTP_SOCK_READ_TIMEOUT", "5"))
+DEFAULT_TOTAL_TIMEOUT_S = float(os.getenv("SIM_HTTP_TOTAL_TIMEOUT", "30"))
+DEFAULT_CONNECT_TIMEOUT_S = float(os.getenv("SIM_HTTP_CONNECT_TIMEOUT", "5"))
+DEFAULT_SOCK_READ_TIMEOUT_S = float(os.getenv("SIM_HTTP_SOCK_READ_TIMEOUT", "20"))
 
 DEFAULT_CONN_LIMIT = int(os.getenv("SIM_HTTP_CONN_LIMIT", "100"))
 DEFAULT_CONN_LIMIT_PER_HOST = int(os.getenv("SIM_HTTP_CONN_LIMIT_PER_HOST", "50"))
+DEFAULT_WRITE_MAX_INFLIGHT = int(os.getenv("SIM_WRITE_MAX_INFLIGHT", "80"))
+DEFAULT_READ_MAX_INFLIGHT = int(os.getenv("SIM_READ_MAX_INFLIGHT", "30"))
+DEFAULT_MAX_CATCHUP_BURST = int(os.getenv("SIM_MAX_CATCHUP_BURST", "5"))
+DEFAULT_WRITE_MAX_QUEUE = int(os.getenv("SIM_WRITE_MAX_QUEUE", "80"))
+DEFAULT_READ_MAX_QUEUE = int(os.getenv("SIM_READ_MAX_QUEUE", "30"))
 
 REPORT_INTERVAL_S = int(os.getenv("SIM_REPORT_INTERVAL_S", "30"))
 METRICS_PATH = os.getenv("SIM_METRICS_PATH", "/tmp/dijkfood_sim_client_metrics.json")
@@ -117,7 +122,10 @@ async def check_order_status(
     """Consulta eventos do pedido para medir a latência de leitura sob estresse"""
     start_time = time.perf_counter()
     try:
-        url = f"{api_url.rstrip('/')}{ORDERS_ENDPOINT}{order_id}"
+        url = (
+            f"{api_url.rstrip('/')}{ORDERS_ENDPOINT}{order_id}"
+            "?include_route=false&include_location=false"
+        )
         async with session.get(url, auth=make_user_auth(customer_id)) as response:
             response.raise_for_status()
             await response.json()
@@ -155,7 +163,7 @@ async def fetch_entity_ids(api_url: str, endpoint: str, auth: aiohttp.BasicAuth 
 async def run_load_test(
     api_url: str, orders_per_second: int, duration: int, customers: list, merchants: list, default_item_id: int, auth: aiohttp.BasicAuth | None
 ):
-    """Executa o teste de carga gerando tráfego de pedidos e leituras concorrentes"""
+    """Executa o teste de carga em open-loop (taxa fixa), desacoplado do tempo de resposta."""
     write_latencies = []
     read_latencies = []
     active_orders: list[tuple[int, int]] = []
@@ -163,9 +171,53 @@ async def run_load_test(
     successful_writes = 0
     read_attempts = 0
     successful_reads = 0
+    dropped_due_to_lag = 0
+    dropped_due_to_backpressure = 0
     test_start = time.perf_counter()
     last_report = test_start
     deadline = test_start + max(0, int(duration))
+    write_interval = 1.0 / max(1, orders_per_second)
+    next_write_at = test_start
+
+    write_tasks: set[asyncio.Task] = set()
+    read_tasks: set[asyncio.Task] = set()
+    write_sem = asyncio.Semaphore(DEFAULT_WRITE_MAX_INFLIGHT)
+    read_sem = asyncio.Semaphore(DEFAULT_READ_MAX_INFLIGHT)
+
+    async def place_order_bounded(customer_id: int, merchant_id: int):
+        async with write_sem:
+            return await place_order(session, api_url, customer_id, merchant_id, default_item_id)
+
+    async def check_order_status_bounded(order_id: int, customer_id: int):
+        async with read_sem:
+            return await check_order_status(session, api_url, order_id, customer_id)
+
+    def drain_completed_tasks() -> None:
+        nonlocal successful_writes, successful_reads
+
+        done_writes = [task for task in write_tasks if task.done()]
+        for task in done_writes:
+            write_tasks.remove(task)
+            try:
+                w_lat, o_id, owner_customer_id = task.result()
+                if w_lat is not None:
+                    write_latencies.append(w_lat)
+                    successful_writes += 1
+                    if o_id:
+                        active_orders.append((o_id, owner_customer_id))
+            except Exception:
+                pass
+
+        done_reads = [task for task in read_tasks if task.done()]
+        for task in done_reads:
+            read_tasks.remove(task)
+            try:
+                r_lat = task.result()
+                if r_lat is not None:
+                    read_latencies.append(r_lat)
+                    successful_reads += 1
+            except Exception:
+                pass
 
     connector = aiohttp.TCPConnector(limit=DEFAULT_CONN_LIMIT, limit_per_host=DEFAULT_CONN_LIMIT_PER_HOST)
     timeout = aiohttp.ClientTimeout(
@@ -176,61 +228,53 @@ async def run_load_test(
     async with aiohttp.ClientSession(connector=connector, auth=auth, timeout=timeout) as session:
         print(f"Iniciando teste de carga: {orders_per_second} pedidos/s por {duration}s...")
 
-        second = 0
         while True:
             now = time.perf_counter()
             if now >= deadline:
                 break
-            second += 1
-            loop_start = now
-            second_write_tasks = []
-            second_read_tasks = []
 
-            for slot in range(orders_per_second):
-                if time.perf_counter() >= deadline:
-                    break
-                target_time = loop_start + (slot / max(1, orders_per_second))
-                sleep_seconds = target_time - time.perf_counter()
-                if sleep_seconds > 0:
-                    await asyncio.sleep(sleep_seconds)
+            # Se o loop atrasar demais, não tenta compensar com uma rajada enorme.
+            # Isso evita espiral de sobrecarga quando a API já está lenta.
+            lag_seconds = max(0.0, now - next_write_at)
+            if write_interval > 0 and lag_seconds > (write_interval * DEFAULT_MAX_CATCHUP_BURST):
+                skipped_slots = int(lag_seconds / write_interval)
+                dropped_due_to_lag += skipped_slots
+                next_write_at = now
 
-                second_write_tasks.append(
+            burst = 0
+            while next_write_at <= now and next_write_at < deadline and burst < DEFAULT_MAX_CATCHUP_BURST:
+                # Backpressure de fila: evita acumular centenas de tasks pendentes.
+                if len(write_tasks) >= DEFAULT_WRITE_MAX_QUEUE:
+                    dropped_due_to_backpressure += 1
+                    next_write_at += write_interval
+                    burst += 1
+                    continue
+
+                write_tasks.add(
                     asyncio.create_task(
-                        place_order(
-                            session,
-                            api_url,
+                        place_order_bounded(
                             random.choice(customers),
                             random.choice(merchants),
-                            default_item_id,
                         )
                     )
                 )
                 write_attempts += 1
 
-                if active_orders and slot % 5 == 0:
+                # A cada 5 escritas tentadas, agenda uma leitura amostral.
+                if active_orders and write_attempts % 5 == 0:
+                    if len(read_tasks) >= DEFAULT_READ_MAX_QUEUE:
+                        burst += 1
+                        next_write_at += write_interval
+                        continue
                     order_id, owner_customer_id = random.choice(active_orders)
-                    second_read_tasks.append(
-                        asyncio.create_task(
-                            check_order_status(session, api_url, order_id, owner_customer_id)
-                        )
-                    )
+                    read_tasks.add(asyncio.create_task(check_order_status_bounded(order_id, owner_customer_id)))
                     read_attempts += 1
 
-            write_results = await asyncio.gather(*second_write_tasks)
-            read_results = await asyncio.gather(*second_read_tasks) if second_read_tasks else []
+                next_write_at += write_interval
+                burst += 1
 
-            for w_lat, o_id, owner_customer_id in write_results:
-                if w_lat is not None:
-                    write_latencies.append(w_lat)
-                    successful_writes += 1
-                    if o_id:
-                        active_orders.append((o_id, owner_customer_id))
+            drain_completed_tasks()
 
-            valid_reads = [r_lat for r_lat in read_results if r_lat is not None]
-            read_latencies.extend(valid_reads)
-            successful_reads += len(valid_reads)
-
-            now = time.perf_counter()
             should_report = (now - last_report) >= REPORT_INTERVAL_S or now >= deadline
             if should_report:
                 total_elapsed = max(1e-9, now - test_start)
@@ -263,14 +307,25 @@ async def run_load_test(
                 print(
                     f"[sim_client] {int(total_elapsed)}/{duration}s "
                     f"tasks_ok={successful_writes}/{write_attempts} "
+                    f"inflight_w={len(write_tasks)} inflight_r={len(read_tasks)} "
+                    f"dropped_lag={dropped_due_to_lag} dropped_bp={dropped_due_to_backpressure} "
                     f"RPS={effective_write_rps:.2f} "
                     f"P95_write_ms={(f'{p95_write_ms:.2f}' if p95_write_ms is not None else 'NA')} "
                     f"P95_read_ms={(f'{p95_read_ms:.2f}' if p95_read_ms is not None else 'NA')}"
                 )
                 last_report = now
 
-            elapsed = time.perf_counter() - loop_start
-            await asyncio.sleep(max(0.0, 1.0 - elapsed))
+            await asyncio.sleep(0.01)
+
+        if write_tasks:
+            done, _ = await asyncio.wait(write_tasks)
+            write_tasks = set(done)
+            drain_completed_tasks()
+
+        if read_tasks:
+            done, _ = await asyncio.wait(read_tasks)
+            read_tasks = set(done)
+            drain_completed_tasks()
 
     total_elapsed = max(1e-9, time.perf_counter() - test_start)
     effective_write_rps = successful_writes / total_elapsed
