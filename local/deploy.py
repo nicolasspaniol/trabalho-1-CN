@@ -1,11 +1,14 @@
 """Entrypoint unificado para o ciclo de deploy local."""
 
 import argparse
+import json
 import os
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
+from typing import Any
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
@@ -70,6 +73,10 @@ def parse_simple_env_file(env_file: Path) -> dict[str, str]:
         if key:
             values[key] = value
     return values
+
+
+SIM_DURATION_S = int(os.getenv("SIM_DURATION_S", "300"))
+SIM_REPORT_INTERVAL_S = int(os.getenv("SIM_REPORT_INTERVAL_S", "30"))
 
 
 def configure_aws_files() -> None:
@@ -142,24 +149,85 @@ def resolve_api_auth(api_username: str | None, api_password: str | None, api_aut
     return username, password
 
 
-def parse_rps_scenarios(value: str) -> list[int]:
-    scenarios = []
-    for part in value.split(","):
-        item = part.strip()
-        if not item:
-            continue
-        scenarios.append(int(item))
-    if not scenarios:
-        raise ValueError("Lista de RPS vazia. Exemplo valido: 10,50,200")
-    return scenarios
-
-
-def run_python_script(script_path: Path, args: list[str], env: dict[str, str] | None = None) -> None:
-    cmd = [sys.executable, str(script_path), *args]
+def run_python_script(
+    script_path: Path,
+    args: list[str],
+    env: dict[str, str] | None = None,
+    *,
+    timeout_seconds: int | None = None,
+) -> None:
+    # -u: evita buffering (importante para observar progresso no deploy/simulacao).
+    cmd = [sys.executable, "-u", str(script_path), *args]
     final_env = os.environ.copy()
+    final_env.setdefault("PYTHONUNBUFFERED", "1")
     if env:
         final_env.update(env)
-    subprocess.run(cmd, cwd=str(PROJECT_ROOT), check=True, env=final_env)
+    subprocess.run(cmd, cwd=str(PROJECT_ROOT), check=True, env=final_env, timeout=timeout_seconds)
+
+
+def describe_ecs_service_tasks(ecs, cluster: str, services: list[str]) -> dict[str, dict[str, int]]:
+    response = ecs.describe_services(cluster=cluster, services=services)
+    result: dict[str, dict[str, int]] = {}
+    for service in response.get("services", []):
+        name = service.get("serviceName")
+        if not name:
+            continue
+        result[str(name)] = {
+            "desired": int(service.get("desiredCount", 0)),
+            "running": int(service.get("runningCount", 0)),
+            "pending": int(service.get("pendingCount", 0)),
+        }
+    return result
+
+
+def read_json_file(path: str) -> dict[str, Any] | None:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+
+def simulation_reporter(
+    *,
+    stop_event: threading.Event,
+    ecs,
+    cluster: str,
+    services: list[str],
+    metrics_path: str,
+) -> None:
+    while not stop_event.is_set():
+        stop_event.wait(SIM_REPORT_INTERVAL_S)
+        if stop_event.is_set():
+            break
+
+        svc_counts = describe_ecs_service_tasks(ecs, cluster, services)
+        metrics = read_json_file(metrics_path) or {}
+
+        svc_summary = " | ".join(
+            f"{name}: {counts.get('running', 0)}/{counts.get('desired', 0)} (pend={counts.get('pending', 0)})"
+            for name, counts in svc_counts.items()
+        )
+
+        elapsed_s = metrics.get("elapsed_s")
+        write_success = metrics.get("write_success")
+        write_attempts = metrics.get("write_attempts")
+        target_rps = metrics.get("target_rps")
+        effective_write_rps = metrics.get("effective_write_rps")
+        p95_write_ms = metrics.get("p95_write_ms")
+        p95_read_ms = metrics.get("p95_read_ms")
+
+        log(
+            "Simulacao (30s): "
+            f"tasks={svc_summary or 'NA'}; "
+            f"pedidos_ok={write_success if write_success is not None else 'NA'}/{write_attempts if write_attempts is not None else 'NA'}; "
+            f"elapsed_s={int(elapsed_s) if isinstance(elapsed_s, (int, float)) else 'NA'}; "
+            f"rps_target={target_rps if target_rps is not None else 'NA'} "
+            f"rps_eff={f'{effective_write_rps:.2f}' if isinstance(effective_write_rps, (int, float)) else 'NA'}; "
+            f"p95_write_ms={f'{p95_write_ms:.2f}' if isinstance(p95_write_ms, (int, float)) else 'NA'} "
+            f"p95_read_ms={f'{p95_read_ms:.2f}' if isinstance(p95_read_ms, (int, float)) else 'NA'}"
+        )
 
 
 def resolve_openapi_paths(base_url: str) -> set[str] | None:
@@ -259,9 +327,8 @@ def ensure_simulation_contract(base_url: str, location_base_url: str | None = No
 def run_simulation(
     base_url: str,
     num_users: int,
-    rps_scenarios: list[int],
-    duration: int,
-    cooldown_seconds: int,
+    rps: int,
+    sim_duration_s: int,
     api_username: str | None,
     api_password: str | None,
     bucket_name: str,
@@ -272,10 +339,8 @@ def run_simulation(
     delivery_process = None
     can_load_data = supports_data_load(base_url)
     full_simulation_supported = ensure_simulation_contract(base_url, location_base_url)
-    auth_args: list[str] = []
     auth_env: dict[str, str] = {}
     if api_username and api_password:
-        auth_args = ["--username", api_username, "--password", api_password]
         auth_env = {"API_USERNAME": api_username, "API_PASSWORD": api_password}
     try:
         if not can_load_data:
@@ -285,15 +350,15 @@ def run_simulation(
         log("Simulacao: preflight de endpoints (OpenAPI + fluxo critico)")
         run_python_script(
             PROJECT_ROOT / "local" / "validate_endpoints.py",
-            ["--api-url", base_url, *auth_args],
+            ["--api-url", base_url, "--username", api_username or "admin", "--password", api_password or "admin"],
             env=auth_env,
         )
 
         log("Simulacao: populando base via API")
         run_python_script(
             PROJECT_ROOT / "local" / "load.py",
-            ["--api-url", base_url, "--num-users", str(num_users), "--graph-path", graph_file, *auth_args],
-            env=auth_env,
+            ["--api-url", base_url, "--num-users", str(num_users)],
+            env={**auth_env, "SIM_GRAPH_PATH": graph_file},
         )
 
         if not full_simulation_supported:
@@ -304,27 +369,45 @@ def run_simulation(
         delivery_process = subprocess.Popen(
             [
                 sys.executable,
+                "-u",
                 str(PROJECT_ROOT / "local" / "sim_delivery.py"),
                 "--api-url",
                 base_url,
                 "--location-api-url",
                 location_base_url or base_url,
-                *auth_args,
             ],
             cwd=str(PROJECT_ROOT),
-            env={**os.environ, **auth_env},
+            env={**os.environ, "PYTHONUNBUFFERED": "1", **auth_env},
         )
 
         time.sleep(3)
 
-        for rps in rps_scenarios:
-            log(f"Simulacao: load test {rps} RPS")
+        log(f"Simulacao: load test {rps} RPS por {sim_duration_s}s")
+        metrics_path = f"/tmp/dijkfood_sim_metrics_{int(time.time())}.json"
+        ecs = boto3.client("ecs", region_name=REGION)
+        stop_event = threading.Event()
+        reporter = threading.Thread(
+            target=simulation_reporter,
+            kwargs={
+                "stop_event": stop_event,
+                "ecs": ecs,
+                "cluster": CLUSTER_NAME,
+                "services": [SERVICE_NAME, API_SERVICE_NAME, LOCATION_SERVICE_NAME],
+                "metrics_path": metrics_path,
+            },
+            daemon=True,
+        )
+        reporter.start()
+        try:
             run_python_script(
                 PROJECT_ROOT / "local" / "sim_client.py",
-                ["--api-url", base_url, "--rps", str(rps), "--duration", str(duration), *auth_args],
-                env=auth_env,
+                ["--api-url", base_url, "--rps", str(rps), "--duration", str(sim_duration_s)],
+                env={**auth_env, "SIM_METRICS_PATH": metrics_path, "SIM_REPORT_INTERVAL_S": str(SIM_REPORT_INTERVAL_S)},
+                timeout_seconds=sim_duration_s + 300,
             )
-            time.sleep(cooldown_seconds)
+        finally:
+            stop_event.set()
+            reporter.join(timeout=2)
     finally:
         if delivery_process is not None:
             log("Simulacao: encerrando sim_delivery")
@@ -530,9 +613,13 @@ def main(argv=None) -> int:
     mode.add_argument("--only-delete", action="store_true", help="Executa apenas o teardown.")
     parser.add_argument("--with-simulation", action="store_true", help="Executa simulacao de carga apos os smoke tests.")
     parser.add_argument("--num-users", type=int, default=100, help="Quantidade base de usuarios para load.py")
-    parser.add_argument("--rps-scenarios", default="10,50,200", help="Lista de cenarios de carga em RPS (csv)")
-    parser.add_argument("--duration", type=int, default=30, help="Duracao de cada cenario de carga em segundos")
-    parser.add_argument("--cooldown-seconds", type=int, default=5, help="Pausa entre cenarios para o autoscaling respirar")
+    parser.add_argument("--rps", type=int, default=50, help="Pedidos por segundo na simulacao")
+    parser.add_argument(
+        "--sim-duration",
+        type=int,
+        default=SIM_DURATION_S,
+        help="Duracao do teste de carga em segundos.",
+    )
     parser.add_argument("--api-username", default=None, help="Usuario Basic Auth da API para simulacao")
     parser.add_argument("--api-password", default=None, help="Senha Basic Auth da API para simulacao")
     parser.add_argument(
@@ -632,15 +719,13 @@ def main(argv=None) -> int:
                 "Use --simulation-api-url apontando para a API FastAPI de dominio."
             )
 
-        rps_scenarios = parse_rps_scenarios(args.rps_scenarios)
         api_username, api_password = resolve_api_auth(args.api_username, args.api_password, args.api_auth_env_file)
         try:
             run_simulation(
                 base_url=simulation_base_url,
                 num_users=args.num_users,
-                rps_scenarios=rps_scenarios,
-                duration=args.duration,
-                cooldown_seconds=args.cooldown_seconds,
+                rps=args.rps,
+                sim_duration_s=args.sim_duration,
                 api_username=api_username,
                 api_password=api_password,
                 bucket_name=bucket_name,

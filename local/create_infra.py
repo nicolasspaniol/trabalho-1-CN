@@ -305,6 +305,12 @@ def setup_worker_infrastructure(region, cluster_name, service_name, table_name, 
     graph_file_key = resolve_graph_file_key()
     db_host = resolve_db_host()
     db_password = resolve_db_password()
+    # Defaults mais "parrudos" para simulação: evita fila no worker ao consultar/reservar couriers.
+    worker_db_pool_max_connections = os.getenv("WORKER_DB_POOL_MAX_CONNECTIONS", "10").strip() or "10"
+    worker_desired = int(os.getenv("WORKER_DESIRED_COUNT", "4"))
+    worker_min_capacity = int(os.getenv("WORKER_AUTOSCALING_MIN_CAPACITY", "4"))
+    worker_max_capacity = int(os.getenv("WORKER_AUTOSCALING_MAX_CAPACITY", "20"))
+    worker_request_target = float(os.getenv("WORKER_REQUEST_TARGET", "20"))
 
     alb_sg_id = ensure_security_group(ec2, vpc_id, ALB_SG_NAME, "Ingress publico HTTP para ALB do worker")
     task_sg_id = ensure_security_group(ec2, vpc_id, TASK_SG_NAME, "Ingress HTTP do ALB para tasks ECS")
@@ -356,6 +362,7 @@ def setup_worker_infrastructure(region, cluster_name, service_name, table_name, 
                     {"name": "DB_USER", "value": "postgres"},
                     {"name": "DB_NAME", "value": "postgres"},
                     {"name": "DB_PASSWORD", "value": db_password},
+                    {"name": "DB_POOL_MAX_CONNECTIONS", "value": worker_db_pool_max_connections},
                     {"name": "TABLE_NAME", "value": table_name},
                 ],
                 "logConfiguration": {
@@ -376,7 +383,7 @@ def setup_worker_infrastructure(region, cluster_name, service_name, table_name, 
     service_kwargs = {
         "cluster": cluster_name,
         "taskDefinition": task_arn,
-        "desiredCount": 2,
+        "desiredCount": worker_desired,
         "launchType": "FARGATE",
         "networkConfiguration": {"awsvpcConfiguration": {"subnets": subnets, "securityGroups": [task_sg_id], "assignPublicIp": "ENABLED"}},
         "loadBalancers": [{"targetGroupArn": tg_arn, "containerName": "worker-container", "containerPort": 80}],
@@ -394,9 +401,9 @@ def setup_worker_infrastructure(region, cluster_name, service_name, table_name, 
         cluster_name=cluster_name,
         service_name=service_name,
         resource_label=resource_label,
-        min_capacity=2,
-        max_capacity=20,
-        request_target=1000.0,
+        min_capacity=worker_min_capacity,
+        max_capacity=worker_max_capacity,
+        request_target=worker_request_target,
         cpu_target=70.0,
         memory_target=75.0,
         scale_out_cooldown=30,
@@ -433,6 +440,14 @@ def setup_api_infrastructure(
     admin_username = os.getenv("ADMIN_USERNAME", "admin")
     admin_password = os.getenv("ADMIN_PASSWORD", "admin")
     location_url = location_base_url or os.getenv("LOCATION_URL", "").strip()
+    # Defaults conservadores para evitar esgotar conexoes do RDS em conta/lab pequena.
+    api_db_pool_size = os.getenv("API_DB_POOL_SIZE", "3").strip() or "3"
+    api_db_max_overflow = os.getenv("API_DB_MAX_OVERFLOW", "0").strip() or "0"
+    api_db_pool_timeout = os.getenv("API_DB_POOL_TIMEOUT", "30").strip() or "30"
+    api_desired = int(os.getenv("API_DESIRED_COUNT", "2"))
+    api_min_capacity = int(os.getenv("API_AUTOSCALING_MIN_CAPACITY", "2"))
+    api_max_capacity = int(os.getenv("API_AUTOSCALING_MAX_CAPACITY", "8"))
+    api_request_target = float(os.getenv("API_REQUEST_TARGET", "120"))
 
     alb_sg_id = ensure_security_group(ec2, vpc_id, API_ALB_SG_NAME, "Ingress publico HTTP para ALB da API")
     task_sg_id = ensure_security_group(ec2, vpc_id, API_TASK_SG_NAME, "Ingress HTTP do ALB para tasks ECS da API")
@@ -456,7 +471,7 @@ def setup_api_infrastructure(
         networkMode="awsvpc",
         requiresCompatibilities=["FARGATE"],
         cpu="1024",
-        memory="2048",
+        memory="4096",
         executionRoleArn=execution_role_arn,
         taskRoleArn=execution_role_arn,
         containerDefinitions=[
@@ -472,6 +487,9 @@ def setup_api_infrastructure(
                     {"name": "DB_HOST", "value": db_host},
                     {"name": "DB_PORT", "value": "5432"},
                     {"name": "DB_NAME", "value": "postgres"},
+                    {"name": "DB_POOL_SIZE", "value": api_db_pool_size},
+                    {"name": "DB_MAX_OVERFLOW", "value": api_db_max_overflow},
+                    {"name": "DB_POOL_TIMEOUT", "value": api_db_pool_timeout},
                     {"name": "DYNAMODB_REGION", "value": region},
                     {"name": "ADMIN_USERNAME", "value": admin_username},
                     {"name": "ADMIN_PASSWORD", "value": admin_password},
@@ -498,7 +516,7 @@ def setup_api_infrastructure(
     service_kwargs = {
         "cluster": cluster_name,
         "taskDefinition": task_arn,
-        "desiredCount": 2,
+        "desiredCount": api_desired,
         "launchType": "FARGATE",
         "networkConfiguration": {
             "awsvpcConfiguration": {
@@ -522,9 +540,9 @@ def setup_api_infrastructure(
         cluster_name=cluster_name,
         service_name=service_name,
         resource_label=resource_label,
-        min_capacity=2,
-        max_capacity=20,
-        request_target=120.0,
+        min_capacity=api_min_capacity,
+        max_capacity=api_max_capacity,
+        request_target=api_request_target,
         cpu_target=70.0,
         memory_target=75.0,
         scale_out_cooldown=30,
@@ -548,6 +566,10 @@ def setup_location_infrastructure(region, cluster_name, service_name, execution_
     vpc_id = resolve_vpc_id(ec2)
     subnets = resolve_subnets(ec2, vpc_id)
     image_uri = resolve_image_uri(account_id, region, LOCATION_ECR_REPO, "LOCATION_IMAGE_URI")
+    location_desired = int(os.getenv("LOCATION_DESIRED_COUNT", "4"))
+    location_min_capacity = int(os.getenv("LOCATION_AUTOSCALING_MIN_CAPACITY", "4"))
+    location_max_capacity = int(os.getenv("LOCATION_AUTOSCALING_MAX_CAPACITY", "20"))
+    location_request_target = float(os.getenv("LOCATION_REQUEST_TARGET", "30"))
 
     alb_sg_id = ensure_security_group(ec2, vpc_id, LOCATION_ALB_SG_NAME, "Ingress publico HTTP para ALB da location API")
     task_sg_id = ensure_security_group(ec2, vpc_id, LOCATION_TASK_SG_NAME, "Ingress HTTP do ALB para tasks ECS da location API")
@@ -604,7 +626,7 @@ def setup_location_infrastructure(region, cluster_name, service_name, execution_
     service_kwargs = {
         "cluster": cluster_name,
         "taskDefinition": task_arn,
-        "desiredCount": 2,
+        "desiredCount": location_desired,
         "launchType": "FARGATE",
         "networkConfiguration": {
             "awsvpcConfiguration": {
@@ -628,9 +650,9 @@ def setup_location_infrastructure(region, cluster_name, service_name, execution_
         cluster_name=cluster_name,
         service_name=service_name,
         resource_label=resource_label,
-        min_capacity=2,
-        max_capacity=20,
-        request_target=200.0,
+        min_capacity=location_min_capacity,
+        max_capacity=location_max_capacity,
+        request_target=location_request_target,
         cpu_target=70.0,
         memory_target=75.0,
         scale_out_cooldown=30,

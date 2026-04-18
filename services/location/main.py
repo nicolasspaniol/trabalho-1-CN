@@ -1,8 +1,8 @@
-from fastapi import Depends, FastAPI
+from fastapi import Depends, FastAPI, HTTPException, status
 from os import getenv
 import boto3
 from boto3.resources.base import ServiceResource
-from botocore.exceptions import ClientError
+from botocore.config import Config
 from sqlmodel import SQLModel
 
 
@@ -10,24 +10,27 @@ app = FastAPI()
 
 COURIER_LOCATION_TABLE = "CourierLocation"
 
-dynamodb = boto3.resource(
-    "dynamodb",
-    region_name=getenv("DYNAMODB_REGION"),
-    endpoint_url=getenv("DYNAMODB_URL"),
-    aws_access_key_id=getenv("DYNAMODB_ACCESS_KEY_ID"),
-    aws_secret_access_key=getenv("DYNAMODB_SECRET_ACCESS_KEY"),
-)
-
-NOT_FOUND = { 404: { "description": "Not found" } }
-
-
 def get_dynamodb():
+    connect_timeout = float(getenv("DYNAMODB_CONNECT_TIMEOUT", "2"))
+    read_timeout = float(getenv("DYNAMODB_READ_TIMEOUT", "2"))
+    max_attempts = int(getenv("DYNAMODB_MAX_ATTEMPTS", "2"))
+    region = (
+        getenv("DYNAMODB_REGION")
+        or getenv("AWS_REGION")
+        or getenv("AWS_DEFAULT_REGION")
+        or "us-east-1"
+    )
     return boto3.resource(
         "dynamodb",
-        region_name=getenv("DYNAMODB_REGION"),
+        region_name=region,
         endpoint_url=getenv("DYNAMODB_URL"),
         aws_access_key_id=getenv("DYNAMODB_ACCESS_KEY_ID"),
         aws_secret_access_key=getenv("DYNAMODB_SECRET_ACCESS_KEY"),
+        config=Config(
+            connect_timeout=connect_timeout,
+            read_timeout=read_timeout,
+            retries={"max_attempts": max_attempts, "mode": "standard"},
+        ),
     )
 
 
@@ -41,14 +44,16 @@ def update_courier_location(
     location: Location,
     dynamo: ServiceResource = Depends(get_dynamodb),
 ):
-    dynamo.Table(COURIER_LOCATION_TABLE).put_item(
-        Item={
-            "Order_ID": order_id,
-            "Location": location.location,
-        }
-    )
-
-
+    try:
+        dynamo.Table(COURIER_LOCATION_TABLE).put_item(
+            Item={
+                "Order_ID": order_id,
+                "Location": location.location,
+            }
+        )
+    except Exception as exc:
+        # Preferível retornar 503 do que deixar a conexão pendurada (e gerar 502 no ALB).
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc))
     return {"status": "updated"}
 
 
@@ -59,8 +64,10 @@ def health():
 
 @app.get("/debug")
 def ddb(dynamo: ServiceResource = Depends(get_dynamodb)):
-    items = dynamo.Table(COURIER_LOCATION_TABLE).scan()
-    for i in items.get("Items", []):
-        print(i)
-    return True
-
+    try:
+        items = dynamo.Table(COURIER_LOCATION_TABLE).scan(Limit=50)
+        for i in items.get("Items", []):
+            print(i)
+        return True
+    except Exception:
+        return False

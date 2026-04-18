@@ -4,7 +4,6 @@ import random
 import pickle
 import asyncio
 import aiohttp
-import osmnx as ox
 import argparse
 import os
 from faker import Faker
@@ -12,6 +11,16 @@ from faker import Faker
 COURIER_PER_USER = 3  # REGRA: 3 entregadores por cliente
 MERCHANT_PER_USER = 0.1  # 1 restaurante para cada 10 clientes
 fake = Faker("pt_BR")
+
+API_URL_ENV = "API_URL"
+API_USERNAME_ENV = "API_USERNAME"
+API_PASSWORD_ENV = "API_PASSWORD"
+
+# Config "avançada" via env para reduzir flags no CLI.
+GRAPH_PATH = os.getenv("SIM_GRAPH_PATH", "sp_altodepinheiros.pkl")
+MAX_CONCURRENCY = int(os.getenv("SIM_PRELOAD_MAX_CONCURRENCY", "20"))
+RETRIES = int(os.getenv("SIM_PRELOAD_RETRIES", "3"))
+RETRY_BACKOFF_SECONDS = float(os.getenv("SIM_PRELOAD_RETRY_BACKOFF_SECONDS", "0.25"))
 
 CUSTOMERS_ENDPOINT = "/customers/"
 MERCHANTS_ENDPOINT = "/merchants/"
@@ -74,7 +83,56 @@ async def create_entity(
         return await response.json()
 
 
-async def populate_database(api_url: str, graph_path: str, num_users: int, username: str | None = None, password: str | None = None):
+async def create_entity_with_retry(
+    session: aiohttp.ClientSession,
+    api_url: str,
+    endpoint: str,
+    payload: dict,
+    retries: int,
+    retry_backoff_seconds: float,
+):
+    attempt = 0
+    while True:
+        try:
+            return await create_entity(session, api_url, endpoint, payload)
+        except EndpointRequestError as error:
+            is_transient = error.status in {429, 500, 502, 503, 504}
+            if attempt >= retries or not is_transient:
+                raise
+            await asyncio.sleep(retry_backoff_seconds * (2 ** attempt))
+            attempt += 1
+
+
+async def run_bounded_task(
+    semaphore: asyncio.Semaphore,
+    session: aiohttp.ClientSession,
+    api_url: str,
+    endpoint: str,
+    payload: dict,
+    retries: int,
+    retry_backoff_seconds: float,
+):
+    async with semaphore:
+        return await create_entity_with_retry(
+            session,
+            api_url,
+            endpoint,
+            payload,
+            retries,
+            retry_backoff_seconds,
+        )
+
+
+async def populate_database(
+    api_url: str,
+    graph_path: str,
+    num_users: int,
+    username: str | None = None,
+    password: str | None = None,
+    max_concurrency: int = 20,
+    retries: int = 3,
+    retry_backoff_seconds: float = 0.25,
+):
     """
     Criação assíncrona de todas as entidades no DB
     """
@@ -84,6 +142,7 @@ async def populate_database(api_url: str, graph_path: str, num_users: int, usern
     )
 
     auth = aiohttp.BasicAuth(username, password) if username and password else None
+    semaphore = asyncio.Semaphore(max_concurrency)
     async with aiohttp.ClientSession(auth=auth) as session:
         tasks = []
 
@@ -95,7 +154,17 @@ async def populate_database(api_url: str, graph_path: str, num_users: int, usern
                 "phone": fake.phone_number(),
                 "address": loc,
             }
-            tasks.append(create_entity(session, api_url, CUSTOMERS_ENDPOINT, payload))
+            tasks.append(
+                run_bounded_task(
+                    semaphore,
+                    session,
+                    api_url,
+                    CUSTOMERS_ENDPOINT,
+                    payload,
+                    retries,
+                    retry_backoff_seconds,
+                )
+            )
 
         # Gerar Couriers
         for loc in courier_locs:
@@ -105,7 +174,17 @@ async def populate_database(api_url: str, graph_path: str, num_users: int, usern
                 "availability": True,
                 "location": loc,
             }
-            tasks.append(create_entity(session, api_url, COURIERS_ENDPOINT, payload))
+            tasks.append(
+                run_bounded_task(
+                    semaphore,
+                    session,
+                    api_url,
+                    COURIERS_ENDPOINT,
+                    payload,
+                    retries,
+                    retry_backoff_seconds,
+                )
+            )
 
         # Gerar Merchants
         for loc in merchant_locs:
@@ -123,7 +202,17 @@ async def populate_database(api_url: str, graph_path: str, num_users: int, usern
                     }
                 ],
             }
-            tasks.append(create_entity(session, api_url, MERCHANTS_ENDPOINT, payload))
+            tasks.append(
+                run_bounded_task(
+                    semaphore,
+                    session,
+                    api_url,
+                    MERCHANTS_ENDPOINT,
+                    payload,
+                    retries,
+                    retry_backoff_seconds,
+                )
+            )
 
         print(f"Enviando {len(tasks)} requisições de cadastro para a API...")
         results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -143,15 +232,21 @@ async def populate_database(api_url: str, graph_path: str, num_users: int, usern
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Populador do Banco de Dados DijkFood")
-    parser.add_argument("--api-url", required=True, help="URL base da API (ALB)")
-    parser.add_argument(
-        "--graph-path", default="sp_altodepinheiros.pkl", help="Caminho do grafo local"
-    )
-    parser.add_argument(
-        "--num-users", type=int, default=100, help="Quantidade base de usuários"
-    )
-    parser.add_argument("--username", default=os.getenv("API_USERNAME"), help="Usuario Basic Auth da API")
-    parser.add_argument("--password", default=os.getenv("API_PASSWORD"), help="Senha Basic Auth da API")
+    parser.add_argument("--api-url", default=os.getenv(API_URL_ENV), help=f"URL base da API (ou env {API_URL_ENV})")
+    parser.add_argument("--num-users", type=int, default=100, help="Quantidade base de usuários")
     args = parser.parse_args()
+    if not args.api_url:
+        parser.error(f"--api-url é obrigatório (ou defina {API_URL_ENV}).")
 
-    asyncio.run(populate_database(args.api_url, args.graph_path, args.num_users, args.username, args.password))
+    asyncio.run(
+        populate_database(
+            args.api_url,
+            GRAPH_PATH,
+            args.num_users,
+            os.getenv(API_USERNAME_ENV),
+            os.getenv(API_PASSWORD_ENV),
+            MAX_CONCURRENCY,
+            RETRIES,
+            RETRY_BACKOFF_SECONDS,
+        )
+    )

@@ -3,9 +3,18 @@
 import argparse
 import asyncio
 import os
+import random
+import time
 from typing import Any
 
 import aiohttp
+
+API_URL_ENV = "API_URL"
+
+COURIER_MAX = int(os.getenv("SIM_COURIER_MAX", "50"))
+COURIER_POLL_SECONDS = float(os.getenv("SIM_COURIER_POLL_SECONDS", "5"))
+COURIER_POLL_JITTER_SECONDS = float(os.getenv("SIM_COURIER_POLL_JITTER_SECONDS", "1"))
+ERROR_BACKOFF_MAX_SECONDS = float(os.getenv("SIM_COURIER_ERROR_BACKOFF_MAX_SECONDS", "30"))
 
 NEW_DELIVERY_MODE = "new"
 PARTIAL_DELIVERY_MODE = "partial"
@@ -19,6 +28,29 @@ REQUIRED_DELIVERY_PATHS = {
 }
 
 OPTIONAL_DELIVERED_PATH = "/orders/{order_id}/delivered"
+
+
+class DeliveryStats:
+    def __init__(self) -> None:
+        self.assigned = 0
+        self.completed = 0
+        self.failed = 0
+
+    def mark_assigned(self) -> None:
+        self.assigned += 1
+
+    def mark_completed(self) -> None:
+        self.completed += 1
+
+    def mark_failed(self) -> None:
+        self.failed += 1
+
+    def summary(self) -> str:
+        return (
+            f"pedidos_atribuidos={self.assigned} "
+            f"pedidos_concluidos={self.completed} "
+            f"falhas={self.failed}"
+        )
 
 
 async def fetch_openapi_paths(session: aiohttp.ClientSession, api_url: str) -> set[str] | None:
@@ -59,6 +91,105 @@ async def get_json(session: aiohttp.ClientSession, url: str) -> Any:
         return await response.json()
 
 
+_RETRY_STATUSES = {429, 502, 503, 504}
+
+
+_STATUS_ORDER = {
+    "confirmed": 0,
+    "preparing": 1,
+    "ready_for_pickup": 2,
+    "picked_up": 3,
+    "in_transit": 4,
+    "delivered": 5,
+}
+
+
+def _status_at_least(current: str | None, desired: str) -> bool:
+    if not current:
+        return False
+    current_key = str(current).strip().lower()
+    desired_key = str(desired).strip().lower()
+    if current_key not in _STATUS_ORDER or desired_key not in _STATUS_ORDER:
+        return False
+    return _STATUS_ORDER[current_key] >= _STATUS_ORDER[desired_key]
+
+
+async def _fetch_order_status(session: aiohttp.ClientSession, api_url: str, order_id: int) -> str | None:
+    try:
+        payload = await get_json(session, f"{api_url.rstrip('/')}/orders/{order_id}")
+    except Exception:
+        return None
+    if isinstance(payload, dict):
+        status = payload.get("status")
+        return str(status).strip().lower() if status is not None else None
+    return None
+
+
+async def _request_with_retry(
+    session: aiohttp.ClientSession,
+    method: str,
+    url: str,
+    *,
+    api_url: str | None = None,
+    order_id: int | None = None,
+    desired_status: str | None = None,
+    params: dict[str, Any] | None = None,
+    json: dict[str, Any] | None = None,
+    attempts: int = 5,
+    base_delay_s: float = 0.25,
+    error_prefix: str,
+) -> bool:
+    delay = base_delay_s
+    last_exc: Exception | None = None
+    last_http_status: int | None = None
+    last_http_body: str | None = None
+
+    for attempt in range(1, attempts + 1):
+        try:
+            async with session.request(method, url, params=params, json=json) as response:
+                if response.status in _RETRY_STATUSES:
+                    body = await response.text()
+                    last_http_status = int(response.status)
+                    last_http_body = body[:200]
+                    if attempt >= attempts:
+                        response.raise_for_status()
+                else:
+                    if response.status == 400 and desired_status and api_url and order_id:
+                        # Timeout/retry pode causar transição duplicada. Confirma status antes de falhar.
+                        current = await _fetch_order_status(session, api_url, order_id)
+                        if _status_at_least(current, desired_status):
+                            return True
+                    response.raise_for_status()
+                    return True
+        except (
+            aiohttp.ClientConnectionError,
+            aiohttp.ClientPayloadError,
+            aiohttp.ServerDisconnectedError,
+            asyncio.TimeoutError,
+        ) as e:
+            last_exc = e
+            if desired_status and api_url and order_id:
+                # Se o servidor aplicou a transição mas o cliente não viu a resposta, trata como sucesso.
+                current = await _fetch_order_status(session, api_url, order_id)
+                if _status_at_least(current, desired_status):
+                    return True
+            if attempt >= attempts:
+                break
+        except Exception as e:
+            print(f"{error_prefix}: {e}")
+            return False
+
+        await asyncio.sleep(delay + random.random() * min(0.1, delay))
+        delay = min(5.0, delay * 2)
+
+    if last_exc is not None:
+        print(f"{error_prefix}: {last_exc}")
+        return False
+    if last_http_status is not None:
+        print(f"{error_prefix}: HTTP {last_http_status} apos {attempts} tentativas body={last_http_body!r}")
+    return False
+
+
 async def fetch_courier_ids(session: aiohttp.ClientSession, api_url: str) -> list[int]:
     try:
         payload = await get_json(session, f"{api_url.rstrip('/')}/couriers/")
@@ -83,11 +214,23 @@ async def fetch_courier_ids(session: aiohttp.ClientSession, api_url: str) -> lis
 
 async def get_courier_current_order(session: aiohttp.ClientSession, api_url: str) -> dict[str, Any] | None:
     try:
-        payload = await get_json(session, f"{api_url.rstrip('/')}/couriers/me/order")
+        # Modo leve: evita leituras no DynamoDB (rota/localizacao) que aumentam latencia e timeout sob carga.
+        payload = await get_json(
+            session,
+            f"{api_url.rstrip('/')}/couriers/me/order?include_route=false&include_location=false",
+        )
     except aiohttp.ClientResponseError as e:
         if e.status in (404, 500, 502, 503, 504):
             return None
         print(f"  Erro ao buscar pedido atual: {e}")
+        return None
+    except (
+        aiohttp.ClientConnectionError,
+        aiohttp.ServerDisconnectedError,
+        aiohttp.ClientPayloadError,
+        asyncio.TimeoutError,
+    ):
+        # Erro transitório esperado sob carga; o loop principal aplica o ritmo de polling.
         return None
     except Exception as e:
         print(f"  Erro ao buscar pedido atual: {e}")
@@ -126,67 +269,81 @@ async def update_courier_location(
     order_id: int,
     location: int,
 ) -> bool:
-    try:
-        async with session.put(
-            f"{location_api_url.rstrip('/')}/couriers/me/location",
-            params={"order_id": order_id},
-            json={"location": location},
-        ) as response:
-            response.raise_for_status()
-            return True
-    except Exception as e:
-        print(f"  Erro ao atualizar location do courier: {e}")
-        return False
+    return await _request_with_retry(
+        session,
+        "PUT",
+        f"{location_api_url.rstrip('/')}/couriers/me/location",
+        api_url=location_api_url,
+        order_id=order_id,
+        params={"order_id": order_id},
+        json={"location": location},
+        error_prefix="  Erro ao atualizar location do courier",
+    )
 
 
 async def mark_order_picked_up(session: aiohttp.ClientSession, api_url: str, order_id: int) -> bool:
-    try:
-        async with session.post(f"{api_url.rstrip('/')}/orders/{order_id}/picked_up", json={}) as response:
-            response.raise_for_status()
-            return True
-    except Exception as e:
-        print(f"  Erro ao marcar pedido {order_id} como picked_up: {e}")
-        return False
+    return await _request_with_retry(
+        session,
+        "POST",
+        f"{api_url.rstrip('/')}/orders/{order_id}/picked_up",
+        api_url=api_url,
+        order_id=order_id,
+        desired_status="picked_up",
+        json={},
+        error_prefix=f"  Erro ao marcar pedido {order_id} como picked_up",
+    )
 
 
 async def mark_order_ready(session: aiohttp.ClientSession, api_url: str, order_id: int) -> bool:
-    try:
-        async with session.post(f"{api_url.rstrip('/')}/orders/{order_id}/ready", json={}) as response:
-            response.raise_for_status()
-            return True
-    except Exception as e:
-        print(f"  Erro ao marcar pedido {order_id} como ready: {e}")
-        return False
+    return await _request_with_retry(
+        session,
+        "POST",
+        f"{api_url.rstrip('/')}/orders/{order_id}/ready",
+        api_url=api_url,
+        order_id=order_id,
+        desired_status="ready_for_pickup",
+        json={},
+        error_prefix=f"  Erro ao marcar pedido {order_id} como ready",
+    )
 
 
 async def mark_order_in_transit(session: aiohttp.ClientSession, api_url: str, order_id: int) -> bool:
-    try:
-        async with session.post(f"{api_url.rstrip('/')}/orders/{order_id}/in_transit", json={}) as response:
-            response.raise_for_status()
-            return True
-    except Exception as e:
-        print(f"  Erro ao marcar pedido {order_id} como in_transit: {e}")
-        return False
+    return await _request_with_retry(
+        session,
+        "POST",
+        f"{api_url.rstrip('/')}/orders/{order_id}/in_transit",
+        api_url=api_url,
+        order_id=order_id,
+        desired_status="in_transit",
+        json={},
+        error_prefix=f"  Erro ao marcar pedido {order_id} como in_transit",
+    )
 
 
 async def mark_order_delivered(session: aiohttp.ClientSession, api_url: str, order_id: int) -> bool:
-    try:
-        async with session.post(f"{api_url.rstrip('/')}/orders/{order_id}/delivered", json={}) as response:
-            response.raise_for_status()
-            return True
-    except Exception as e:
-        print(f"  Erro ao marcar pedido {order_id} como delivered: {e}")
-        return False
+    return await _request_with_retry(
+        session,
+        "POST",
+        f"{api_url.rstrip('/')}/orders/{order_id}/delivered",
+        api_url=api_url,
+        order_id=order_id,
+        desired_status="delivered",
+        json={},
+        error_prefix=f"  Erro ao marcar pedido {order_id} como delivered",
+    )
 
 
 async def accept_order(session: aiohttp.ClientSession, api_url: str, order_id: int) -> bool:
-    try:
-        async with session.post(f"{api_url.rstrip('/')}/orders/{order_id}/accept", json={}) as response:
-            response.raise_for_status()
-            return True
-    except Exception as e:
-        print(f"  Erro ao aceitar pedido {order_id}: {e}")
-        return False
+    return await _request_with_retry(
+        session,
+        "POST",
+        f"{api_url.rstrip('/')}/orders/{order_id}/accept",
+        api_url=api_url,
+        order_id=order_id,
+        desired_status="preparing",
+        json={},
+        error_prefix=f"  Erro ao aceitar pedido {order_id}",
+    )
 
 
 async def deliver_order_new(
@@ -195,14 +352,17 @@ async def deliver_order_new(
     location_api_url: str,
     order: dict[str, Any],
     can_mark_delivered: bool,
+    stats: DeliveryStats,
 ) -> bool:
     order_id = int(order["id"])
-    print(f"✓ Novo pedido atribuído: id={order_id}")
+    stats.mark_assigned()
 
     if not await mark_order_picked_up(session, api_url, order_id):
+        stats.mark_failed()
         return False
 
     if not await mark_order_in_transit(session, api_url, order_id):
+        stats.mark_failed()
         return False
 
     await asyncio.sleep(1)
@@ -219,9 +379,10 @@ async def deliver_order_new(
 
     if can_mark_delivered:
         if not await mark_order_delivered(session, api_url, order_id):
+            stats.mark_failed()
             return False
 
-    print(f"  ✓ Pedido {order_id} entregue com sucesso")
+    stats.mark_completed()
     return True
 
 
@@ -231,21 +392,28 @@ async def run_courier_loop(
     courier_username: str,
     delivery_mode: str,
     can_mark_delivered: bool,
+    stats: DeliveryStats,
 ):
     auth = aiohttp.BasicAuth(courier_username, "x")
 
-    async with aiohttp.ClientSession(auth=auth) as session:
+    timeout = aiohttp.ClientTimeout(
+        total=float(os.getenv("SIM_HTTP_TOTAL_TIMEOUT", "30")),
+        connect=float(os.getenv("SIM_HTTP_CONNECT_TIMEOUT", "5")),
+        sock_read=float(os.getenv("SIM_HTTP_SOCK_READ_TIMEOUT", "20")),
+    )
+    async with aiohttp.ClientSession(auth=auth, timeout=timeout) as session:
         last_handled_order_id: int | None = None
+        error_backoff = 0.0
+        last_error_log = 0.0
 
         while True:
             try:
                 current_order = await get_courier_current_order(session, api_url)
+                error_backoff = 0.0
 
                 if not current_order:
-                    if last_handled_order_id is not None:
-                        print(f"✓ Pedido {last_handled_order_id} finalizado (courier={courier_username})")
-                        last_handled_order_id = None
-                    await asyncio.sleep(2)
+                    last_handled_order_id = None
+                    await asyncio.sleep(_poll_sleep_seconds())
                     continue
 
                 order_id_value = current_order.get("id")
@@ -256,12 +424,12 @@ async def run_courier_loop(
                 status = current_order.get("status")
 
                 if order_id == last_handled_order_id:
-                    await asyncio.sleep(2)
+                    await asyncio.sleep(_poll_sleep_seconds())
                     continue
 
                 if delivery_mode == NEW_DELIVERY_MODE:
                     if not str(status).upper().endswith("READY_FOR_PICKUP"):
-                        await asyncio.sleep(2)
+                        await asyncio.sleep(_poll_sleep_seconds())
                         continue
                     handled = await deliver_order_new(
                         session,
@@ -269,20 +437,29 @@ async def run_courier_loop(
                         location_api_url,
                         current_order,
                         can_mark_delivered,
+                        stats,
                     )
                     if handled:
                         last_handled_order_id = order_id
                 else:
-                    print(
-                        "  └─ Contrato de courier incompleto; aguardando /orders/{order_id}/accept, "
-                        "/orders/{order_id}/ready, /couriers/me/location e /orders/{order_id}/picked_up"
-                    )
                     last_handled_order_id = order_id
 
             except Exception as e:
-                print(f"✗ Erro no courier worker ({courier_username}): {e}")
+                # Backoff por courier: evita que timeouts em cascata virem DDoS no ALB/API.
+                error_backoff = min(ERROR_BACKOFF_MAX_SECONDS, max(1.0, error_backoff * 2) if error_backoff else 2.0)
+                now = time.monotonic()
+                # Evita spam de log em loops rápidos.
+                if now - last_error_log >= 10.0:
+                    print(f"✗ Erro no courier worker ({courier_username}): {e} (backoff={error_backoff:.1f}s)")
+                    last_error_log = now
 
-            await asyncio.sleep(2)
+            await asyncio.sleep(_poll_sleep_seconds() + error_backoff)
+
+
+async def report_delivery_progress(stats: DeliveryStats, interval_seconds: int) -> None:
+    while True:
+        await asyncio.sleep(interval_seconds)
+        print(f"[sim_delivery] {stats.summary()}")
 
 
 async def delivery_worker(
@@ -305,11 +482,18 @@ async def delivery_worker(
     admin_auth = aiohttp.BasicAuth(username, password) if username and password else None
     location_api_url = location_api_url or api_url
 
-    async with aiohttp.ClientSession(auth=admin_auth) as admin_session:
+    timeout = aiohttp.ClientTimeout(
+        total=float(os.getenv("SIM_HTTP_TOTAL_TIMEOUT", "30")),
+        connect=float(os.getenv("SIM_HTTP_CONNECT_TIMEOUT", "5")),
+        sock_read=float(os.getenv("SIM_HTTP_SOCK_READ_TIMEOUT", "20")),
+    )
+    async with aiohttp.ClientSession(auth=admin_auth, timeout=timeout) as admin_session:
         courier_ids = await fetch_courier_ids(admin_session, api_url)
 
     selected_couriers: list[str] = []
     if courier_ids:
+        if COURIER_MAX > 0:
+            courier_ids = courier_ids[:COURIER_MAX]
         selected_couriers = [str(cid) for cid in courier_ids]
         print(f"Iniciando courier worker com {len(selected_couriers)} couriers")
     elif username and username.isnumeric():
@@ -319,7 +503,7 @@ async def delivery_worker(
         print("Nao foi possivel descobrir um courier valido; simulacao de entrega nao sera iniciada")
         return
 
-    async with aiohttp.ClientSession(auth=admin_auth) as session:
+    async with aiohttp.ClientSession(auth=admin_auth, timeout=timeout) as session:
         api_paths = await fetch_openapi_paths(session, api_url)
         location_paths = await fetch_openapi_paths(session, location_api_url)
         paths = set()
@@ -339,6 +523,7 @@ async def delivery_worker(
         else:
             print("Iniciando courier worker em modo parcial: contrato de delivery incompleto")
 
+        stats = DeliveryStats()
         tasks = [
             asyncio.create_task(
                 run_courier_loop(
@@ -347,30 +532,36 @@ async def delivery_worker(
                     courier_username=courier_username,
                     delivery_mode=delivery_mode,
                     can_mark_delivered=can_mark_delivered,
+                    stats=stats,
                 )
             )
             for courier_username in selected_couriers
         ]
+        tasks.append(asyncio.create_task(report_delivery_progress(stats, interval_seconds=5)))
         await asyncio.gather(*tasks)
+
+
+def _poll_sleep_seconds() -> float:
+    base = max(0.1, COURIER_POLL_SECONDS)
+    jitter = max(0.0, COURIER_POLL_JITTER_SECONDS)
+    return base + (random.random() * jitter)
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Central de Entregadores DijkFood")
-    parser.add_argument("--api-url", required=True, help="URL base da API (ALB)")
+    parser.add_argument("--api-url", default=os.getenv(API_URL_ENV), help=f"URL base da API (ou env {API_URL_ENV})")
     parser.add_argument(
         "--location-api-url",
         default=None,
         help="URL base da API de location (ALB). Quando omitida, usa --api-url.",
     )
-    parser.add_argument("--username", default=None, help="Usuario Basic Auth da API")
-    parser.add_argument("--password", default=None, help="Senha Basic Auth da API")
     args = parser.parse_args()
+    if not args.api_url:
+        parser.error(f"--api-url é obrigatório (ou defina {API_URL_ENV}).")
 
     asyncio.run(
         delivery_worker(
             args.api_url,
             location_api_url=args.location_api_url,
-            username=args.username,
-            password=args.password,
         )
     )

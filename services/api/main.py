@@ -5,6 +5,7 @@ from typing import Annotated, Optional
 import boto3
 import requests
 from boto3.resources.base import ServiceResource
+from botocore.config import Config
 from fastapi import APIRouter, BackgroundTasks, Depends, FastAPI, HTTPException, Query, Request, status
 from fastapi.responses import JSONResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
@@ -35,18 +36,41 @@ DATABASE_URL = (
     f"{getenv('DB_PORT', '5432')}/"
     f"{getenv('DB_NAME', 'postgres')}"
 )
-db_engine = create_engine(DATABASE_URL)
+db_engine = create_engine(
+    DATABASE_URL,
+    pool_size=int(getenv("DB_POOL_SIZE", "5")),
+    max_overflow=int(getenv("DB_MAX_OVERFLOW", "0")),
+    pool_timeout=int(getenv("DB_POOL_TIMEOUT", "30")),
+    pool_pre_ping=True,
+)
 
 NOT_FOUND = {404: {"description": "Not found"}}
 
 
 def get_dynamodb() -> ServiceResource:
+    # Evita que a API fique presa por muito tempo em chamadas de rede ao DynamoDB
+    # (o que degrada o target atrás do ALB e pode resultar em 502).
+    # Valores curtos por padrão; ajuste via env se precisar.
+    connect_timeout = float(getenv("DYNAMODB_CONNECT_TIMEOUT", "2"))
+    read_timeout = float(getenv("DYNAMODB_READ_TIMEOUT", "2"))
+    max_attempts = int(getenv("DYNAMODB_MAX_ATTEMPTS", "2"))
+    region = (
+        getenv("DYNAMODB_REGION")
+        or getenv("AWS_REGION")
+        or getenv("AWS_DEFAULT_REGION")
+        or "us-east-1"
+    )
     return boto3.resource(
         "dynamodb",
-        region_name=getenv("DYNAMODB_REGION"),
+        region_name=region,
         endpoint_url=getenv("DYNAMODB_URL"),
         aws_access_key_id=getenv("DYNAMODB_ACCESS_KEY_ID"),
         aws_secret_access_key=getenv("DYNAMODB_SECRET_ACCESS_KEY"),
+        config=Config(
+            connect_timeout=connect_timeout,
+            read_timeout=read_timeout,
+            retries={"max_attempts": max_attempts, "mode": "standard"},
+        ),
     )
 
 
@@ -83,7 +107,12 @@ def get_user(model):
 
 
 def get_dynamo_item(table, order_id: int):
-    return table.get_item(Key={"Order_ID": order_id}).get("Item")
+    try:
+        return table.get_item(Key={"Order_ID": order_id}).get("Item")
+    except Exception as exc:
+        # O dado em Dynamo é auxiliar; falhas temporárias não devem derrubar a request.
+        print(f"[dynamo] aviso: falha ao ler Order_ID={order_id}: {exc}")
+        return None
 
 
 def assert_exists(obj, obj_id: int, name: str) -> None:
@@ -118,12 +147,16 @@ def write_courier_location(dynamo: ServiceResource, order_id: int, location: int
         except Exception:
             pass
 
-    dynamo.Table(COURIER_LOCATION_TABLE).put_item(
-        Item={
-            "Order_ID": order_id,
-            "Location": location,
-        }
-    )
+    try:
+        dynamo.Table(COURIER_LOCATION_TABLE).put_item(
+            Item={
+                "Order_ID": order_id,
+                "Location": location,
+            }
+        )
+    except Exception as exc:
+        # A localizacao é dado auxiliar; não deixa a request falhar por indisponibilidade temporária.
+        print(f"[write_courier_location] aviso: falha ao escrever no DynamoDB: {exc}")
 
 
 SessionDep = Annotated[Session, Depends(get_session)]
@@ -364,7 +397,13 @@ def delete_courier(id: int, session: SessionDep, _auth: AdminDep):
 
 
 @couriers.get("/me/order", response_model=em.OrderPublicComplete, responses=NOT_FOUND, tags=["Order"])
-def get_assigned_order(session: SessionDep, courier: CourierDep, dynamo: DynamoDep):
+def get_assigned_order(
+    session: SessionDep,
+    courier: CourierDep,
+    dynamo: DynamoDep,
+    include_route: bool = Query(True, description="Inclui delivery_route (DynamoDB)."),
+    include_location: bool = Query(True, description="Inclui courier_location (DynamoDB)."),
+):
     order = session.exec(
         select(em.Order).where(
             em.Order.courier_id == courier.user_id,
@@ -377,13 +416,15 @@ def get_assigned_order(session: SessionDep, courier: CourierDep, dynamo: DynamoD
 
     order_public = em.OrderPublicComplete.model_validate(order, from_attributes=True)
 
-    delivery_route = get_dynamo_item(dynamo.Table(DELIVERY_ROUTE_TABLE), order.id)
-    if delivery_route:
-        order_public.delivery_route = em.DeliveryRoute.from_dynamo(delivery_route)
+    if include_route:
+        delivery_route = get_dynamo_item(dynamo.Table(DELIVERY_ROUTE_TABLE), order.id)
+        if delivery_route:
+            order_public.delivery_route = em.DeliveryRoute.from_dynamo(delivery_route)
 
-    courier_location = get_dynamo_item(dynamo.Table(COURIER_LOCATION_TABLE), order.id)
-    if courier_location:
-        order_public.courier_location = em.CourierLocation.from_dynamo(courier_location)
+    if include_location:
+        courier_location = get_dynamo_item(dynamo.Table(COURIER_LOCATION_TABLE), order.id)
+        if courier_location:
+            order_public.courier_location = em.CourierLocation.from_dynamo(courier_location)
 
     return order_public
 
@@ -408,16 +449,20 @@ def look_for_courier(order_id: int, customer_address: int, merchant_address: int
     if not WORKER_URL:
         return
 
-    response = requests.post(
-        f"{WORKER_URL.rstrip('/')}/calculate-route",
-        json={"merchant_node": merchant_address, "user_node": customer_address},
-        timeout=10,
-    )
-    if response.status_code != 200:
-        return
+    try:
+        response = requests.post(
+            f"{WORKER_URL.rstrip('/')}/calculate-route",
+            json={"merchant_node": merchant_address, "user_node": customer_address},
+            timeout=10,
+        )
+        if response.status_code != 200:
+            return
 
-    data = response.json()
-    courier_id = int(data["courier_id"])
+        data = response.json()
+        courier_id = int(data["courier_id"])
+    except Exception as exc:
+        print(f"[look_for_courier] aviso: falha ao chamar worker: {exc}")
+        return
 
     route = em.DeliveryRoute(
         courier_id=courier_id,
@@ -619,7 +664,11 @@ def announce_order_in_transit(order_id: int, session: SessionDep, courier: Couri
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not your order")
 
     merchant = session.get(em.Merchant, order.merchant_id)
-    write_courier_location(dynamo, order.id, merchant.address)
+    if not merchant:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Merchant not found")
+
+    # Nao bloqueia a transicao de status em I/O externo (LOCATION_URL/DynamoDB).
+    bg_tasks.add_task(write_courier_location, dynamo, order.id, merchant.address)
 
     order_status_transition(order, em.OrderStatus.picked_up, em.OrderStatus.in_transit)
     session.add(order)

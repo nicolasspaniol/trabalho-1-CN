@@ -29,6 +29,10 @@ def get_session():
 
 session = get_session()
 
+
+def should_use_multi_az() -> bool:
+    return os.getenv("DB_MULTI_AZ", "true").strip().lower() not in {"0", "false", "no"}
+
 # SECURITY GROUP
 def setup_security_group(name):
     ec2 = session.client('ec2')
@@ -135,6 +139,7 @@ def setup_rds(db_instance_id, sg_id):
     """
     rds = session.client('rds')
     db_password = require_db_password()
+    desired_multi_az = should_use_multi_az()
     
     print(f"🐘 Provisionando instância RDS: {db_instance_id}...")
     try:
@@ -146,7 +151,8 @@ def setup_rds(db_instance_id, sg_id):
             MasterUsername='postgres',
             MasterUserPassword=db_password,
             VpcSecurityGroupIds=[sg_id],
-            PubliclyAccessible=True
+            PubliclyAccessible=True,
+            MultiAZ=desired_multi_az,
         )
         print("⏳ Aguardando RDS ficar disponível (aprox. 10 min)...")
         # O programa "trava" aqui propositalmente até o banco ligar
@@ -161,7 +167,35 @@ def setup_rds(db_instance_id, sg_id):
     except rds.exceptions.DBInstanceAlreadyExistsFault:
         print(f"ℹ️ Instância {db_instance_id} já existe. Recuperando endpoint...")
         desc = rds.describe_db_instances(DBInstanceIdentifier=db_instance_id)
-        return desc['DBInstances'][0]['Endpoint']['Address']
+        db_instance = desc['DBInstances'][0]
+        current_multi_az = bool(db_instance.get('MultiAZ'))
+        current_sg_ids = [group['VpcSecurityGroupId'] for group in db_instance.get('VpcSecurityGroups', [])]
+
+        needs_update = current_multi_az != desired_multi_az or sg_id not in current_sg_ids
+        if needs_update:
+            print(
+                "🛠️ Atualizando configuracao do RDS existente: "
+                f"MultiAZ {current_multi_az} -> {desired_multi_az}"
+            )
+            new_sg_ids = current_sg_ids or []
+            if sg_id not in new_sg_ids:
+                new_sg_ids.append(sg_id)
+
+            rds.modify_db_instance(
+                DBInstanceIdentifier=db_instance_id,
+                MultiAZ=desired_multi_az,
+                VpcSecurityGroupIds=new_sg_ids,
+                ApplyImmediately=True,
+            )
+            print("⏳ Aguardando modificacao do RDS ficar disponível...")
+            rds.get_waiter('db_instance_available').wait(DBInstanceIdentifier=db_instance_id)
+            desc = rds.describe_db_instances(DBInstanceIdentifier=db_instance_id)
+
+        endpoint = desc['DBInstances'][0]['Endpoint']['Address']
+        print(
+            f"✅ RDS pronto em: {endpoint} | MultiAZ={desc['DBInstances'][0].get('MultiAZ')}"
+        )
+        return endpoint
     except Exception as e:
         print(f"❌ Erro ao provisionar RDS: {e}")
         return None
