@@ -2,6 +2,8 @@
 
 import argparse
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+import csv
+from datetime import datetime
 import json
 import os
 import subprocess
@@ -85,9 +87,96 @@ def env_flag(name: str, default: bool = False) -> bool:
 
 
 SIM_DURATION_S = int(os.getenv("SIM_DURATION_S", "300"))
-SIM_REPORT_INTERVAL_S = int(os.getenv("SIM_REPORT_INTERVAL_S", "30"))
+SIM_REPORT_INTERVAL_S = int(os.getenv("SIM_REPORT_INTERVAL_S", "10"))
 GRAPH_FILE_DEFAULT = os.getenv("GRAPH_FILE", "").strip() or os.getenv("MAPAS_FILE", "").strip() or "sp_cidade.pkl"
 GRAPH_LOCATION_DEFAULT = os.getenv("GRAPH_LOCATION", "").strip() or "Sao Paulo, Sao Paulo, Brazil"
+SIM_RESULTS_DIR = Path(os.getenv("SIM_RESULTS_DIR", str(PROJECT_ROOT / "simulation_results")))
+
+
+def ensure_results_csv(
+    *,
+    csv_path: Path,
+    services: list[str],
+) -> None:
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    if csv_path.exists():
+        return
+
+    base_columns = [
+        "timestamp_iso",
+        "elapsed_s",
+        "target_rps",
+        "write_offered",
+        "write_attempts",
+        "write_success",
+        "write_dropped_backpressure",
+        "read_attempts",
+        "read_success",
+        "in_flight_writes",
+        "in_flight_reads",
+        "effective_write_rps",
+        "effective_read_rps",
+        "p95_write_ms",
+        "p95_read_ms",
+        "top_write_failures",
+    ]
+
+    service_columns: list[str] = []
+    for service_name in services:
+        normalized = service_name.lower().replace("-", "_").replace(" ", "_")
+        service_columns.extend(
+            [
+                f"{normalized}_running",
+                f"{normalized}_desired",
+                f"{normalized}_pending",
+            ]
+        )
+
+    with csv_path.open("w", newline="", encoding="utf-8") as csv_file:
+        writer = csv.writer(csv_file)
+        writer.writerow(base_columns + service_columns)
+
+
+def append_results_csv_row(
+    *,
+    csv_path: Path,
+    services: list[str],
+    metrics: dict[str, Any],
+    service_counts: dict[str, dict[str, int]],
+) -> None:
+    base_values = [
+        datetime.now().isoformat(timespec="seconds"),
+        metrics.get("elapsed_s"),
+        metrics.get("target_rps"),
+        metrics.get("write_offered"),
+        metrics.get("write_attempts"),
+        metrics.get("write_success"),
+        metrics.get("write_dropped_backpressure"),
+        metrics.get("read_attempts"),
+        metrics.get("read_success"),
+        metrics.get("in_flight_writes"),
+        metrics.get("in_flight_reads"),
+        metrics.get("effective_write_rps"),
+        metrics.get("effective_read_rps"),
+        metrics.get("p95_write_ms"),
+        metrics.get("p95_read_ms"),
+        json.dumps(metrics.get("top_write_failures", []), ensure_ascii=True),
+    ]
+
+    service_values: list[int] = []
+    for service_name in services:
+        counts = service_counts.get(service_name, {})
+        service_values.extend(
+            [
+                int(counts.get("running", 0)),
+                int(counts.get("desired", 0)),
+                int(counts.get("pending", 0)),
+            ]
+        )
+
+    with csv_path.open("a", newline="", encoding="utf-8") as csv_file:
+        writer = csv.writer(csv_file)
+        writer.writerow(base_values + service_values)
 
 
 def configure_aws_files() -> None:
@@ -207,7 +296,10 @@ def simulation_reporter(
     cluster: str,
     services: list[str],
     metrics_path: str,
+    csv_path: Path,
 ) -> None:
+    ensure_results_csv(csv_path=csv_path, services=services)
+
     while not stop_event.is_set():
         stop_event.wait(SIM_REPORT_INTERVAL_S)
         if stop_event.is_set():
@@ -228,6 +320,13 @@ def simulation_reporter(
         effective_write_rps = metrics.get("effective_write_rps")
         p95_write_ms = metrics.get("p95_write_ms")
         p95_read_ms = metrics.get("p95_read_ms")
+
+        append_results_csv_row(
+            csv_path=csv_path,
+            services=services,
+            metrics=metrics,
+            service_counts=svc_counts,
+        )
 
         log(
             "Simulacao (30s): "
@@ -429,6 +528,11 @@ def run_simulation(
 
         time.sleep(3)
 
+        timestamp_suffix = datetime.now().strftime("%Y%m%d_%H%M%S")
+        csv_file_name = f"sim_rps{rps}_users{num_users}_dur{sim_duration_s}_{timestamp_suffix}.csv"
+        csv_path = SIM_RESULTS_DIR / csv_file_name
+
+        log(f"Simulacao: resultados serao salvos em {csv_path}")
         log(f"Simulacao: load test {rps} RPS por {sim_duration_s}s")
         metrics_path = f"/tmp/dijkfood_sim_metrics_{int(time.time())}.json"
         ecs = boto3.client("ecs", region_name=REGION)
@@ -441,6 +545,7 @@ def run_simulation(
                 "cluster": CLUSTER_NAME,
                 "services": [SERVICE_NAME, API_SERVICE_NAME, LOCATION_SERVICE_NAME],
                 "metrics_path": metrics_path,
+                "csv_path": csv_path,
             },
             daemon=True,
         )
