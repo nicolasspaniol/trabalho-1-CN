@@ -378,17 +378,19 @@ async def deliver_order_new(
         stats.mark_failed()
         return False
 
-    await asyncio.sleep(1)
 
+    # Envia a localização do entregador ao longo de todo o caminho, a cada 100ms
     route = order.get("delivery_route") if isinstance(order, dict) else None
     if isinstance(route, dict):
         path_to_user = route.get("path_to_user")
         if isinstance(path_to_user, list) and path_to_user:
-            try:
-                customer_node = int(path_to_user[-1])
-                await update_courier_location(session, location_api_url, order_id, customer_node)
-            except (TypeError, ValueError):
-                pass
+            for node in path_to_user:
+                try:
+                    node_int = int(node)
+                    await update_courier_location(session, location_api_url, order_id, node_int)
+                    await asyncio.sleep(0.1)
+                except (TypeError, ValueError):
+                    continue
 
     if can_mark_delivered:
         if not await mark_order_delivered(session, api_url, order_id):

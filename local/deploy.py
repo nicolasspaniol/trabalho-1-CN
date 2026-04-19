@@ -1147,75 +1147,69 @@ def enforce_clean_start_for_simulation(service_names: list[str]) -> dict[str, di
 
     min_by_service = resolve_min_capacities_for_services(service_names)
     ecs = boto3.client("ecs", region_name=REGION)
-    original_suspension_state = snapshot_autoscaling_suspension_state(service_names)
+    autoscaling = boto3.client("application-autoscaling", region_name=REGION)
+    for service_name in service_names:
+        log(f"Clean start: ajustando {service_name} para min_capacity=4 e desired=4")
+        autoscaling.register_scalable_target(
+            ServiceNamespace="ecs",
+            ResourceId=f"service/{CLUSTER_NAME}/{service_name}",
+            ScalableDimension="ecs:service:DesiredCount",
+            MinCapacity=4,
+        )
+        ecs.update_service(
+            cluster=CLUSTER_NAME,
+            service=service_name,
+            desiredCount=4,
+        )
 
-    suspension_applied = False
-    try:
-        set_autoscaling_suspension_state(service_names, suspended=True)
-        suspension_applied = True
+    started_at = time.time()
+    deadline = started_at + timeout_seconds
 
+    while time.time() < deadline:
+        response = ecs.describe_services(cluster=CLUSTER_NAME, services=service_names)
+        services = response.get("services", [])
+        by_name = {str(item.get("serviceName", "")): item for item in services}
+
+        all_clean = True
         for service_name in service_names:
-            target_desired = int(min_by_service.get(service_name, 1))
-            log(f"Clean start: ajustando {service_name} para desired={target_desired}")
-            ecs.update_service(
-                cluster=CLUSTER_NAME,
-                service=service_name,
-                desiredCount=target_desired,
+            service = by_name.get(service_name)
+            if not service:
+                all_clean = False
+                log(f"Clean start: {service_name} ainda nao encontrado no describe_services")
+                continue
+
+            desired = int(service.get("desiredCount", 0))
+            running = int(service.get("runningCount", 0))
+            pending = int(service.get("pendingCount", 0))
+            deployments = service.get("deployments", [])
+            in_progress = [item for item in deployments if item.get("rolloutState") != "COMPLETED"]
+
+            clean = (
+                running == desired
+                and pending == 0
+                and len(in_progress) == 0
+                and len(deployments) == 1
             )
 
-        started_at = time.time()
-        deadline = started_at + timeout_seconds
-
-        while time.time() < deadline:
-            response = ecs.describe_services(cluster=CLUSTER_NAME, services=service_names)
-            services = response.get("services", [])
-            by_name = {str(item.get("serviceName", "")): item for item in services}
-
-            all_clean = True
-            for service_name in service_names:
-                service = by_name.get(service_name)
-                if not service:
-                    all_clean = False
-                    log(f"Clean start: {service_name} ainda nao encontrado no describe_services")
-                    continue
-
-                desired = int(service.get("desiredCount", 0))
-                running = int(service.get("runningCount", 0))
-                pending = int(service.get("pendingCount", 0))
-                deployments = service.get("deployments", [])
-                in_progress = [item for item in deployments if item.get("rolloutState") != "COMPLETED"]
-
-                clean = (
-                    running == desired
-                    and pending == 0
-                    and len(in_progress) == 0
-                    and len(deployments) == 1
+            if not clean:
+                all_clean = False
+                rollout_states = [str(item.get("rolloutState") or "UNKNOWN") for item in deployments]
+                log(
+                    f"Clean start aguardando {service_name}: "
+                    f"running={running}/{desired} pending={pending} deployments={len(deployments)} "
+                    f"rollout={rollout_states}"
                 )
 
-                if not clean:
-                    all_clean = False
-                    rollout_states = [str(item.get("rolloutState") or "UNKNOWN") for item in deployments]
-                    log(
-                        f"Clean start aguardando {service_name}: "
-                        f"running={running}/{desired} pending={pending} deployments={len(deployments)} "
-                        f"rollout={rollout_states}"
-                    )
+        if all_clean:
+            log("Clean start: servicos estabilizados para inicio da simulacao")
+            return {}
 
-            if all_clean:
-                log("Clean start: servicos estabilizados para inicio da simulacao")
-                return original_suspension_state
+        time.sleep(poll_seconds)
 
-            time.sleep(poll_seconds)
-
-        raise TimeoutError(
-            "Clean start nao convergiu no prazo; tente aumentar SIM_CLEAN_START_TIMEOUT_SECONDS "
-            "ou revisar eventos de deployment no ECS."
-        )
-    except BaseException:
-        if suspension_applied:
-            log("Clean start: interrupcao detectada, restaurando estado original do autoscaling")
-            restore_autoscaling_suspension_state(original_suspension_state)
-        raise
+    raise TimeoutError(
+        "Clean start nao convergiu no prazo; tente aumentar SIM_CLEAN_START_TIMEOUT_SECONDS "
+        "ou revisar eventos de deployment no ECS."
+    )
 
 
 def test_api_service(base_url: str) -> None:
