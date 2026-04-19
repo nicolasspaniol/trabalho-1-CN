@@ -64,20 +64,8 @@ def _read_int_env(name: str, default: int, *, minimum: int | None = None, maximu
 
 
 def resolve_desired_count(configured_desired: int, service_description: dict | None, prefix: str) -> int:
-    preserve_current = _env_flag(
-        f"{prefix}_PRESERVE_CURRENT_DESIRED",
-        default=_env_flag("ECS_PRESERVE_CURRENT_DESIRED", default=True),
-    )
-
-    if not preserve_current or not service_description:
-        return configured_desired
-
-    try:
-        current_desired = int(service_description.get("desiredCount", configured_desired))
-    except (TypeError, ValueError):
-        current_desired = configured_desired
-
-    return max(configured_desired, current_desired)
+    # Sempre usa o valor padrão/configurado, nunca preserva o valor anterior
+    return configured_desired
 
 
 def build_service_deployment_settings(prefix: str, default_grace_seconds: int) -> tuple[int, dict]:
@@ -317,7 +305,7 @@ def ensure_service_autoscaling(
     cpu_target=70.0,
     memory_target=75.0,
     scale_out_cooldown=15,
-    scale_in_cooldown=180,
+    scale_in_cooldown=30,
 ):
     """Configura autoscaling para um servico ECS com politicas de CPU e memoria."""
     resource_id = f"service/{cluster_name}/{service_name}"
@@ -363,20 +351,21 @@ def ensure_service_autoscaling(
     )
 
     if resource_label and request_target is not None:
+        # Step scaling mais suave: aumenta/diminui 1 task por vez
         autoscaling.put_scaling_policy(
             PolicyName="AlbRequestScaling",
             ServiceNamespace="ecs",
             ResourceId=resource_id,
             ScalableDimension="ecs:service:DesiredCount",
-            PolicyType="TargetTrackingScaling",
-            TargetTrackingScalingPolicyConfiguration={
-                "TargetValue": request_target,
-                "PredefinedMetricSpecification": {
-                    "PredefinedMetricType": "ALBRequestCountPerTarget",
-                    "ResourceLabel": resource_label,
-                },
-                "ScaleOutCooldown": scale_out_cooldown,
-                "ScaleInCooldown": scale_in_cooldown,
+            PolicyType="StepScaling",
+            StepScalingPolicyConfiguration={
+                "AdjustmentType": "ChangeInCapacity",
+                "StepAdjustments": [
+                    {"MetricIntervalLowerBound": 0, "ScalingAdjustment": 1},
+                    {"MetricIntervalUpperBound": 0, "ScalingAdjustment": -1},
+                ],
+                "Cooldown": scale_out_cooldown,
+                "MetricAggregationType": "Average",
             },
         )
 

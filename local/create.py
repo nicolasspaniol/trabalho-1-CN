@@ -31,7 +31,7 @@ session = get_session()
 
 
 def should_use_multi_az() -> bool:
-    return os.getenv("DB_MULTI_AZ", "false").strip().lower() not in {"0", "false", "no"}
+    return os.getenv("DB_MULTI_AZ", "true").strip().lower() not in {"0", "false", "no"}
 
 
 def resolve_db_instance_class() -> str:
