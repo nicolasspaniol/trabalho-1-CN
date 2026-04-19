@@ -28,7 +28,7 @@ services:
       DB_USER: "${DB_USERNAME:-postgres}"
       DB_PASSWORD: "${DB_PASSWORD:-postgres}"
       MAPAS_BUCKET: "${MAPAS_BUCKET:-}"
-      MAPAS_FILE: "${MAPAS_FILE:-sp_altodepinheiros.pkl}"
+      MAPAS_FILE: "${MAPAS_FILE:-sp_cidade.pkl}"
     ports:
       - "8010:80"
     depends_on:

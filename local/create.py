@@ -81,12 +81,14 @@ def fetch_and_store_graph(location_query: str, local_filename: str, s3_bucket: s
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Extração de Grafo Viário para S3")
+    default_location = os.getenv("GRAPH_LOCATION", "").strip() or "Sao Paulo, Sao Paulo, Brazil"
+    default_file = os.getenv("GRAPH_FILE", "").strip() or os.getenv("MAPAS_FILE", "").strip() or "sp_cidade.pkl"
     parser.add_argument("--bucket", required=True, help="Nome do bucket S3 de destino")
     parser.add_argument(
-        "--location", default="Alto de Pinheiros, São Paulo, Brazil", help="Região alvo"
+        "--location", default=default_location, help="Região alvo"
     )
     parser.add_argument(
-        "--file", default="sp_altodepinheiros.pkl", help="Nome do arquivo local"
+        "--file", default=default_file, help="Nome do arquivo local"
     )
     args = parser.parse_args()
 

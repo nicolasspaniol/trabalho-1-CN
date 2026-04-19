@@ -83,7 +83,17 @@ def resolve_desired_count(configured_desired: int, service_description: dict | N
 def build_service_deployment_settings(prefix: str, default_grace_seconds: int) -> tuple[int, dict]:
     grace_seconds = _read_int_env(f"{prefix}_HEALTHCHECK_GRACE_SECONDS", default_grace_seconds, minimum=0)
     min_healthy_percent = _read_int_env(f"{prefix}_DEPLOYMENT_MIN_HEALTHY_PERCENT", 50, minimum=0, maximum=100)
-    max_percent = _read_int_env(f"{prefix}_DEPLOYMENT_MAX_PERCENT", 300, minimum=100)
+    max_percent = _read_int_env(f"{prefix}_DEPLOYMENT_MAX_PERCENT", 300, minimum=1)
+
+    # ECS com Availability Zone Rebalancing habilitado rejeita maximumPercent <= 100
+    # em update_service. Mantemos o valor o mais proximo possivel do solicitado.
+    if max_percent <= 100:
+        print(
+            f"[infra] {prefix}_DEPLOYMENT_MAX_PERCENT={max_percent} ajustado para 101 "
+            "(ECS requer maximumPercent > 100 no update_service).",
+            flush=True,
+        )
+        max_percent = 101
 
     deployment_configuration = {
         "minimumHealthyPercent": min_healthy_percent,
@@ -104,7 +114,7 @@ def resolve_image_uri(account_id, region, repo_name: str, env_var: str):
 
 
 def resolve_graph_file_key():
-    return os.getenv("MAPAS_FILE", "sp_altodepinheiros.pkl").strip() or "sp_altodepinheiros.pkl"
+    return os.getenv("MAPAS_FILE", "").strip() or os.getenv("GRAPH_FILE", "").strip() or "sp_cidade.pkl"
 
 
 def resolve_db_host():
@@ -391,6 +401,7 @@ def setup_worker_infrastructure(region, cluster_name, service_name, table_name, 
     db_host = resolve_db_host()
     db_password = resolve_db_password()
     # Defaults mais "parrudos" para simulação: evita fila no worker ao consultar/reservar couriers.
+    worker_db_pool_min_connections = os.getenv("WORKER_DB_POOL_MIN_CONNECTIONS", "0").strip() or "0"
     worker_db_pool_max_connections = os.getenv("WORKER_DB_POOL_MAX_CONNECTIONS", "4").strip() or "4"
     worker_route_max_available_couriers = os.getenv("WORKER_ROUTE_MAX_AVAILABLE_COURIERS", "500").strip() or "500"
     worker_route_queue_wait_seconds = os.getenv("WORKER_ROUTE_QUEUE_WAIT_SECONDS", "1.5").strip() or "1.5"
@@ -454,6 +465,7 @@ def setup_worker_infrastructure(region, cluster_name, service_name, table_name, 
                     {"name": "DB_USER", "value": "postgres"},
                     {"name": "DB_NAME", "value": "postgres"},
                     {"name": "DB_PASSWORD", "value": db_password},
+                    {"name": "DB_POOL_MIN_CONNECTIONS", "value": worker_db_pool_min_connections},
                     {"name": "DB_POOL_MAX_CONNECTIONS", "value": worker_db_pool_max_connections},
                     {"name": "ROUTE_MAX_AVAILABLE_COURIERS", "value": worker_route_max_available_couriers},
                     {"name": "ROUTE_QUEUE_WAIT_SECONDS", "value": worker_route_queue_wait_seconds},

@@ -134,26 +134,21 @@ uv run --project local local/deploy.py \
 - --no-delete: mantem recursos ativos ao final
 - --only-delete: remove recursos
 - --skip-pre-setup: reaproveita imagens ja publicadas no ECR (evita build/push no inicio)
+- --simulation-only: nao faz deploy; usa servicos ja ativos e executa apenas a simulacao
 - --api-username e --api-password: credenciais Basic Auth da API
 - --graph-file e --graph-location: arquivo/regiao do grafo
 - --simulation-api-url: URL alternativa da API para simulacao
 
 ### Escopo geografico da simulacao (bairro vs cidade inteira)
 
-Durante os testes iniciais, o projeto usou um grafo menor (Alto de Pinheiros) para reduzir tempo de build e custo.
-Voce pode rodar com Sao Paulo inteira via --graph-location.
+O padrao atual do projeto usa Sao Paulo inteira:
 
-Exemplo com bairro (mais rapido e barato):
+- graph-location: "Sao Paulo, Sao Paulo, Brazil"
+- graph-file: sp_cidade.pkl
 
-```bash
-uv run --project local local/deploy.py \
-	--with-simulation \
-	--graph-location "Alto de Pinheiros, Sao Paulo, Brazil" \
-	--graph-file sp_altodepinheiros.pkl \
-	--no-delete
-```
+Voce pode customizar a localizacao por CLI ou variaveis de ambiente (GRAPH_LOCATION, GRAPH_FILE, MAPAS_FILE).
 
-Exemplo com cidade inteira (enunciado):
+Exemplo com padrao (cidade inteira):
 
 ```bash
 uv run --project local local/deploy.py \
@@ -163,11 +158,38 @@ uv run --project local local/deploy.py \
 	--no-delete
 ```
 
+Exemplo customizado para um bairro (mais rapido e barato):
+
+```bash
+uv run --project local local/deploy.py \
+	--with-simulation \
+	--graph-location "Alto de Pinheiros, Sao Paulo, Brazil" \
+	--graph-file sp_altodepinheiros.pkl \
+	--no-delete
+```
+
 Aviso:
 
 - O grafo da cidade inteira pode aumentar bastante tempo de extração/upload e custo de execução.
 - Se o arquivo ja existir no S3 com a mesma chave, o deploy reaproveita o objeto para acelerar o ciclo.
 - Para forcar regeneracao/upload do grafo, execute com `FORCE_GRAPH_REBUILD=1`.
+- Para testes de carga repetidos no mesmo ambiente, voce pode pular reaplicacao do schema SQL com `DB_SKIP_SCHEMA_LOAD=1`.
+- Para testes pesados que batem quota de vCPU do ECS/Fargate durante rollout, use `DEPLOY_SERIAL_ROLLOUT=1` para atualizar os servicos em serie (worker -> location -> api).
+- Para reduzir conexoes ociosas ao RDS no worker, use `WORKER_DB_POOL_MIN_CONNECTIONS=0` (padrao atual) e ajuste `WORKER_DB_POOL_MAX_CONNECTIONS` conforme o limite do banco.
+- Se o ambiente estiver instavel no preflight (ex.: banco saturado) e voce quiser mesmo assim medir carga, use `SIM_SKIP_PREFLIGHT_ON_FAILURE=1`.
+
+### Rodar apenas simulacao (sem novo deploy)
+
+Quando a infraestrutura ja estiver ativa, use `--simulation-only` para evitar o tempo de rollout completo:
+
+```bash
+SKIP_PRE_SETUP=1 uv run --active --project local local/deploy.py \
+	--simulation-only \
+	--with-simulation \
+	--num-users 5000 \
+	--rps 200 \
+	--sim-duration 300
+```
 
 ## API na interface web
 

@@ -33,7 +33,12 @@ API_USERNAME_ENV = "API_USERNAME"
 API_PASSWORD_ENV = "API_PASSWORD"
 
 # Config "avançada" via env para reduzir flags no CLI.
-GRAPH_PATH = os.getenv("SIM_GRAPH_PATH", "sp_altodepinheiros.pkl")
+GRAPH_PATH = (
+    os.getenv("SIM_GRAPH_PATH", "").strip()
+    or os.getenv("GRAPH_FILE", "").strip()
+    or os.getenv("MAPAS_FILE", "").strip()
+    or "sp_cidade.pkl"
+)
 MAX_CONCURRENCY = int(os.getenv("SIM_PRELOAD_MAX_CONCURRENCY", "20"))
 RETRIES = int(os.getenv("SIM_PRELOAD_RETRIES", "3"))
 RETRY_BACKOFF_SECONDS = float(os.getenv("SIM_PRELOAD_RETRY_BACKOFF_SECONDS", "0.25"))

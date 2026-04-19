@@ -35,7 +35,7 @@ def try_load_graph_from_s3() -> bool:
         return False
 
     bucket = os.getenv('MAPAS_BUCKET')
-    file_key = os.getenv('MAPAS_FILE', 'sp_altodepinheiros.pkl')
+    file_key = os.getenv('MAPAS_FILE', '').strip() or os.getenv('GRAPH_FILE', '').strip() or 'sp_cidade.pkl'
 
     s3_client = boto3.client('s3')
     local_path = f"/tmp/{os.path.basename(file_key)}"
@@ -69,9 +69,11 @@ def try_init_db_pool() -> bool:
         return False
 
     try:
+        min_connections = max(0, int(os.getenv('DB_POOL_MIN_CONNECTIONS', '0')))
+        max_connections = max(min_connections, int(os.getenv('DB_POOL_MAX_CONNECTIONS', '5')))
         DB_POOL = pool.SimpleConnectionPool(
-            minconn=1,
-            maxconn=int(os.getenv('DB_POOL_MAX_CONNECTIONS', '5')),
+            minconn=min_connections,
+            maxconn=max_connections,
             host=db_host,
             dbname=db_name,
             user=db_user,

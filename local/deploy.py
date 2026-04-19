@@ -86,6 +86,8 @@ def env_flag(name: str, default: bool = False) -> bool:
 
 SIM_DURATION_S = int(os.getenv("SIM_DURATION_S", "300"))
 SIM_REPORT_INTERVAL_S = int(os.getenv("SIM_REPORT_INTERVAL_S", "30"))
+GRAPH_FILE_DEFAULT = os.getenv("GRAPH_FILE", "").strip() or os.getenv("MAPAS_FILE", "").strip() or "sp_cidade.pkl"
+GRAPH_LOCATION_DEFAULT = os.getenv("GRAPH_LOCATION", "").strip() or "Sao Paulo, Sao Paulo, Brazil"
 
 
 def configure_aws_files() -> None:
@@ -362,6 +364,7 @@ def run_simulation(
 
         log("Simulacao: preflight de endpoints (OpenAPI + fluxo critico)")
         preflight_attempts = max(1, int(os.getenv("SIM_PREFLIGHT_ATTEMPTS", "3")))
+        skip_preflight_on_failure = env_flag("SIM_SKIP_PREFLIGHT_ON_FAILURE", default=False)
         for attempt in range(1, preflight_attempts + 1):
             try:
                 run_python_script(
@@ -372,6 +375,12 @@ def run_simulation(
                 break
             except subprocess.CalledProcessError as exc:
                 if attempt >= preflight_attempts:
+                    if skip_preflight_on_failure:
+                        log(
+                            "Simulacao: preflight falhou apos todas as tentativas, "
+                            "mas SIM_SKIP_PREFLIGHT_ON_FAILURE=1; seguindo com a carga"
+                        )
+                        break
                     raise exc
                 backoff_seconds = min(30, 5 * attempt)
                 log(
@@ -496,6 +505,8 @@ def ensure_graph_in_s3(bucket_name: str, graph_file: str, graph_location: str) -
 
 
 def run_deployment(execution_role_arn: str, bucket_name: str) -> None:
+    serial_rollout = env_flag("DEPLOY_SERIAL_ROLLOUT", default=False)
+
     log("Deploy dados: garantindo bucket S3")
     create_data.setup_s3_bucket(bucket_name)
 
@@ -511,10 +522,19 @@ def run_deployment(execution_role_arn: str, bucket_name: str) -> None:
 
     schema_path = PROJECT_ROOT / DB_SCHEMA_FILE
     if schema_path.exists():
-        log(f"Deploy dados: aplicando schema em {schema_path}")
-        loaded = create_data.load_schema_to_rds(db_endpoint, str(schema_path))
-        if not loaded:
-            raise RuntimeError("Falha ao carregar schema SQL no RDS")
+        if env_flag("DB_SKIP_SCHEMA_LOAD", default=False) or env_flag("SKIP_SCHEMA_LOAD", default=False):
+            log(
+                "Deploy dados: carga de schema ignorada "
+                "(DB_SKIP_SCHEMA_LOAD=1 ou SKIP_SCHEMA_LOAD=1)"
+            )
+        else:
+            log(f"Deploy dados: aplicando schema em {schema_path}")
+            loaded = create_data.load_schema_to_rds(db_endpoint, str(schema_path))
+            if not loaded:
+                raise RuntimeError(
+                    "Falha ao carregar schema SQL no RDS. "
+                    "Se o banco ja estiver provisionado para testes, use DB_SKIP_SCHEMA_LOAD=1."
+                )
     else:
         log(f"Deploy dados: schema nao encontrado em {schema_path}, seguindo sem carga SQL")
 
@@ -526,6 +546,10 @@ def run_deployment(execution_role_arn: str, bucket_name: str) -> None:
         bucket_name=bucket_name,
         execution_role_arn=execution_role_arn,
     )
+
+    if serial_rollout:
+        log(f"Deploy serial: aguardando estabilidade ECS de {SERVICE_NAME}")
+        wait_for_ecs_service_stable(SERVICE_NAME)
 
     worker_alb_dns = str(
         wait_for_load_balancer_dns(
@@ -542,6 +566,10 @@ def run_deployment(execution_role_arn: str, bucket_name: str) -> None:
         service_name=LOCATION_SERVICE_NAME,
         execution_role_arn=execution_role_arn,
     )
+
+    if serial_rollout:
+        log(f"Deploy serial: aguardando estabilidade ECS de {LOCATION_SERVICE_NAME}")
+        wait_for_ecs_service_stable(LOCATION_SERVICE_NAME)
 
     location_alb_dns = str(
         wait_for_load_balancer_dns(
@@ -562,6 +590,10 @@ def run_deployment(execution_role_arn: str, bucket_name: str) -> None:
         db_password=os.environ["DB_PASSWORD"],
         execution_role_arn=execution_role_arn,
     )
+
+    if serial_rollout:
+        log(f"Deploy serial: aguardando estabilidade ECS de {API_SERVICE_NAME}")
+        wait_for_ecs_service_stable(API_SERVICE_NAME)
 
 
 def run_pre_deploy_setup() -> None:
@@ -919,12 +951,12 @@ def main(argv=None) -> int:
     )
     parser.add_argument(
         "--graph-file",
-        default="sp_altodepinheiros.pkl",
+        default=GRAPH_FILE_DEFAULT,
         help="Nome do arquivo local do grafo usado na simulacao",
     )
     parser.add_argument(
         "--graph-location",
-        default="Alto de Pinheiros, Sao Paulo, Brazil",
+        default=GRAPH_LOCATION_DEFAULT,
         help="Regiao usada para gerar o grafo no create.py",
     )
     parser.add_argument(
@@ -942,6 +974,11 @@ def main(argv=None) -> int:
         action="store_true",
         help="Pula o pre-setup (build/push de imagens) e reutiliza imagens ja publicadas no ECR.",
     )
+    parser.add_argument(
+        "--simulation-only",
+        action="store_true",
+        help="Nao executa deploy; usa ALBs/servicos existentes e roda apenas simulacao.",
+    )
     args = parser.parse_args(argv)
 
     configure_aws_files()
@@ -949,6 +986,64 @@ def main(argv=None) -> int:
     if args.only_delete:
         log("Teardown")
         delete.main([])
+        log("Fim")
+        return 0
+
+    if args.simulation_only and args.only_delete:
+        raise ValueError("--simulation-only nao pode ser combinado com --only-delete")
+
+    if args.simulation_only and not args.with_simulation:
+        raise ValueError("--simulation-only requer --with-simulation")
+
+    if args.simulation_only:
+        os.environ["MAPAS_FILE"] = args.graph_file
+
+        log("ALB worker")
+        elbv2 = boto3.client("elbv2", region_name=REGION)
+        worker_alb_dns = str(wait_for_load_balancer_dns(elbv2, LOAD_BALANCER_NAME, log=log))
+        log(f"DNS worker: {worker_alb_dns}")
+
+        log("ALB API")
+        api_alb_dns = str(wait_for_load_balancer_dns(elbv2, API_LOAD_BALANCER_NAME, log=log))
+        log(f"DNS API: {api_alb_dns}")
+
+        log("ALB location")
+        location_alb_dns = str(wait_for_load_balancer_dns(elbv2, LOCATION_LOAD_BALANCER_NAME, log=log))
+        log(f"DNS location: {location_alb_dns}")
+
+        api_base_url = f"http://{api_alb_dns}"
+        location_base_url = f"http://{location_alb_dns}"
+
+        log("Readiness dos servicos")
+        wait_services_ready(
+            [
+                (worker_alb_dns, TARGET_GROUP_NAME, SERVICE_NAME),
+                (api_alb_dns, API_TARGET_GROUP_NAME, API_SERVICE_NAME),
+                (location_alb_dns, LOCATION_TARGET_GROUP_NAME, LOCATION_SERVICE_NAME),
+            ]
+        )
+
+        simulation_base_url = resolve_simulation_base_url(api_base_url, args.simulation_api_url)
+        if simulation_base_url == api_base_url and not supports_data_load(simulation_base_url):
+            raise RuntimeError(
+                "Simulacao indisponivel na URL atual: o endpoint publico da API nao expoe /customers, /merchants e /couriers. "
+                "Use --simulation-api-url apontando para a API FastAPI de dominio."
+            )
+
+        api_username, api_password = resolve_api_auth(args.api_username, args.api_password, args.api_auth_env_file)
+        run_simulation(
+            base_url=simulation_base_url,
+            num_users=args.num_users,
+            rps=args.rps,
+            sim_duration_s=args.sim_duration,
+            api_username=api_username,
+            api_password=api_password,
+            bucket_name="",
+            graph_file=args.graph_file,
+            graph_location=args.graph_location,
+            location_base_url=location_base_url,
+        )
+
         log("Fim")
         return 0
 
