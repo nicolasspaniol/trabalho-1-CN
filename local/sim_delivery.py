@@ -470,9 +470,13 @@ async def run_courier_loop(
 
 
 async def report_delivery_progress(stats: DeliveryStats, interval_seconds: int) -> None:
+    last_summary = ""
     while True:
         await asyncio.sleep(interval_seconds)
-        print(f"[sim_delivery] {stats.summary()}")
+        current_summary = stats.summary()
+        if current_summary != last_summary:
+            print(f"[sim_delivery] {current_summary}")
+            last_summary = current_summary
 
 
 async def delivery_worker(
@@ -551,7 +555,8 @@ async def delivery_worker(
             )
             for courier_username in selected_couriers
         ]
-        tasks.append(asyncio.create_task(report_delivery_progress(stats, interval_seconds=5)))
+        progress_interval_seconds = max(5, int(os.getenv("SIM_DELIVERY_PROGRESS_INTERVAL_S", "15")))
+        tasks.append(asyncio.create_task(report_delivery_progress(stats, interval_seconds=progress_interval_seconds)))
         await asyncio.gather(*tasks)
 
 

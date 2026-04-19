@@ -104,7 +104,9 @@ def ensure_results_csv(
 
     base_columns = [
         "timestamp_iso",
+        "phase",
         "elapsed_s",
+        "warmup_seconds",
         "target_rps",
         "write_offered",
         "write_attempts",
@@ -116,8 +118,27 @@ def ensure_results_csv(
         "in_flight_reads",
         "effective_write_rps",
         "effective_read_rps",
+        "window_seconds",
+        "write_attempts_window",
+        "write_success_window",
+        "read_attempts_window",
+        "read_success_window",
+        "effective_write_rps_window",
+        "effective_read_rps_window",
         "p95_write_ms",
         "p95_read_ms",
+        "p95_write_ms_window",
+        "p95_read_ms_window",
+        "write_offered_steady",
+        "write_attempts_steady",
+        "write_success_steady",
+        "write_dropped_backpressure_steady",
+        "read_attempts_steady",
+        "read_success_steady",
+        "effective_write_rps_steady",
+        "effective_read_rps_steady",
+        "p95_write_ms_steady",
+        "p95_read_ms_steady",
         "top_write_failures",
     ]
 
@@ -146,7 +167,9 @@ def append_results_csv_row(
 ) -> None:
     base_values = [
         datetime.now().isoformat(timespec="seconds"),
+        metrics.get("phase"),
         metrics.get("elapsed_s"),
+        metrics.get("warmup_seconds"),
         metrics.get("target_rps"),
         metrics.get("write_offered"),
         metrics.get("write_attempts"),
@@ -158,8 +181,27 @@ def append_results_csv_row(
         metrics.get("in_flight_reads"),
         metrics.get("effective_write_rps"),
         metrics.get("effective_read_rps"),
+        metrics.get("window_seconds"),
+        metrics.get("write_attempts_window"),
+        metrics.get("write_success_window"),
+        metrics.get("read_attempts_window"),
+        metrics.get("read_success_window"),
+        metrics.get("effective_write_rps_window"),
+        metrics.get("effective_read_rps_window"),
         metrics.get("p95_write_ms"),
         metrics.get("p95_read_ms"),
+        metrics.get("p95_write_ms_window"),
+        metrics.get("p95_read_ms_window"),
+        metrics.get("write_offered_steady"),
+        metrics.get("write_attempts_steady"),
+        metrics.get("write_success_steady"),
+        metrics.get("write_dropped_backpressure_steady"),
+        metrics.get("read_attempts_steady"),
+        metrics.get("read_success_steady"),
+        metrics.get("effective_write_rps_steady"),
+        metrics.get("effective_read_rps_steady"),
+        metrics.get("p95_write_ms_steady"),
+        metrics.get("p95_read_ms_steady"),
         json.dumps(metrics.get("top_write_failures", []), ensure_ascii=True),
     ]
 
@@ -299,6 +341,9 @@ def simulation_reporter(
     csv_path: Path,
 ) -> None:
     ensure_results_csv(csv_path=csv_path, services=services)
+    warmup_log_interval_s = max(SIM_REPORT_INTERVAL_S, int(os.getenv("SIM_WARMUP_LOG_INTERVAL_S", "30")))
+    last_warmup_log_ts = 0.0
+    last_warmup_svc_summary = ""
 
     while not stop_event.is_set():
         stop_event.wait(SIM_REPORT_INTERVAL_S)
@@ -318,7 +363,10 @@ def simulation_reporter(
         write_attempts = metrics.get("write_attempts")
         target_rps = metrics.get("target_rps")
         effective_write_rps = metrics.get("effective_write_rps")
+        effective_write_rps_window = metrics.get("effective_write_rps_window")
+        window_seconds = metrics.get("window_seconds")
         p95_write_ms = metrics.get("p95_write_ms")
+        p95_write_ms_window = metrics.get("p95_write_ms_window")
         p95_read_ms = metrics.get("p95_read_ms")
 
         append_results_csv_row(
@@ -328,14 +376,29 @@ def simulation_reporter(
             service_counts=svc_counts,
         )
 
+        # Antes do sim_client iniciar, evita spam com NA/NA em todas as colunas.
+        if not isinstance(elapsed_s, (int, float)):
+            now_ts = time.time()
+            should_log_warmup = (
+                svc_summary != last_warmup_svc_summary
+                or (now_ts - last_warmup_log_ts) >= warmup_log_interval_s
+            )
+            if should_log_warmup:
+                log(f"Simulacao (aquecendo): tasks={svc_summary or 'NA'}")
+                last_warmup_log_ts = now_ts
+                last_warmup_svc_summary = svc_summary
+            continue
+
         log(
-            "Simulacao (30s): "
+            f"Simulacao (a cada {SIM_REPORT_INTERVAL_S}s, acumulado): "
             f"tasks={svc_summary or 'NA'}; "
             f"pedidos_ok={write_success if write_success is not None else 'NA'}/{write_attempts if write_attempts is not None else 'NA'}; "
             f"elapsed_s={int(elapsed_s) if isinstance(elapsed_s, (int, float)) else 'NA'}; "
             f"rps_target={target_rps if target_rps is not None else 'NA'} "
             f"rps_eff={f'{effective_write_rps:.2f}' if isinstance(effective_write_rps, (int, float)) else 'NA'}; "
+            f"rps_{int(window_seconds) if isinstance(window_seconds, (int, float)) else 'NA'}s={f'{effective_write_rps_window:.2f}' if isinstance(effective_write_rps_window, (int, float)) else 'NA'}; "
             f"p95_write_ms={f'{p95_write_ms:.2f}' if isinstance(p95_write_ms, (int, float)) else 'NA'} "
+            f"p95_write_{int(window_seconds) if isinstance(window_seconds, (int, float)) else 'NA'}s_ms={f'{p95_write_ms_window:.2f}' if isinstance(p95_write_ms_window, (int, float)) else 'NA'} "
             f"p95_read_ms={f'{p95_read_ms:.2f}' if isinstance(p95_read_ms, (int, float)) else 'NA'}"
         )
 
@@ -445,13 +508,33 @@ def run_simulation(
     graph_file: str,
     graph_location: str,
     location_base_url: str | None,
+    autoscaling_restore_state: dict[str, dict[str, bool]] | None = None,
 ) -> None:
     delivery_process = None
+    autoscaling_restored = False
+    autoscaling_restore_lock = threading.Lock()
+
+    def compute_warmup_seconds(duration_seconds: int) -> int:
+        configured_warmup = max(0, int(os.getenv("SIM_WARMUP_SECONDS", "180")))
+        return max(0, min(max(0, int(duration_seconds) - 30), configured_warmup))
+
+    def restore_autoscaling_once(reason: str) -> None:
+        nonlocal autoscaling_restored
+        if not autoscaling_restore_state:
+            return
+        with autoscaling_restore_lock:
+            if autoscaling_restored:
+                return
+            log(f"Simulacao: restaurando autoscaling ({reason})")
+            restore_autoscaling_suspension_state(autoscaling_restore_state)
+            autoscaling_restored = True
+
     can_load_data = supports_data_load(base_url)
     full_simulation_supported = ensure_simulation_contract(base_url, location_base_url)
-    # Mantem oferta suficiente sem transformar polling de couriers em gargalo de banco.
-    target_couriers = max(60, min(300, rps * 6))
-    active_delivery_couriers = max(40, min(target_couriers, rps * 4))
+    # Perfil mais realista: evita amplificacao excessiva por polling de courier,
+    # mantendo pressao suficiente para acionar autoscaling em cenarios de 50/200 RPS.
+    target_couriers = max(40, min(220, rps * 3))
+    active_delivery_couriers = max(30, min(target_couriers, rps * 2))
     courier_per_user = target_couriers / max(1, num_users)
     auth_env: dict[str, str] = {}
     if api_username and api_password:
@@ -509,8 +592,8 @@ def run_simulation(
         delivery_env = {**os.environ, "PYTHONUNBUFFERED": "1", **auth_env}
         # Reduz polling agressivo para evitar pressao excessiva no path de autenticacao/DB.
         delivery_env.setdefault("SIM_COURIER_MAX", str(active_delivery_couriers))
-        delivery_env.setdefault("SIM_COURIER_POLL_SECONDS", "1.2")
-        delivery_env.setdefault("SIM_COURIER_POLL_JITTER_SECONDS", "0.4")
+        delivery_env.setdefault("SIM_COURIER_POLL_SECONDS", "2.0")
+        delivery_env.setdefault("SIM_COURIER_POLL_JITTER_SECONDS", "1.0")
         delivery_env.setdefault("SIM_API_PAGE_SIZE", "100")
         delivery_process = subprocess.Popen(
             [
@@ -550,7 +633,31 @@ def run_simulation(
             daemon=True,
         )
         reporter.start()
+        restore_thread = None
         try:
+            if autoscaling_restore_state:
+                restore_delay_seconds = compute_warmup_seconds(sim_duration_s) + max(
+                    0,
+                    int(os.getenv("SIM_AUTOSCALING_RESTORE_DELAY_SECONDS", "0")),
+                )
+                if restore_delay_seconds <= 0:
+                    restore_autoscaling_once("sem warmup configurado")
+                else:
+                    log(
+                        "Simulacao: autoscaling seguira suspenso durante o warmup "
+                        f"({restore_delay_seconds}s)"
+                    )
+
+                    def delayed_restore() -> None:
+                        try:
+                            time.sleep(restore_delay_seconds)
+                            restore_autoscaling_once("apos warmup")
+                        except Exception as error:
+                            log(f"Simulacao: falha ao restaurar autoscaling apos warmup: {error}")
+
+                    restore_thread = threading.Thread(target=delayed_restore, daemon=True)
+                    restore_thread.start()
+
             run_python_script(
                 PROJECT_ROOT / "local" / "sim_client.py",
                 ["--api-url", base_url, "--rps", str(rps), "--duration", str(sim_duration_s)],
@@ -558,8 +665,8 @@ def run_simulation(
                     **auth_env,
                     "SIM_METRICS_PATH": metrics_path,
                     "SIM_REPORT_INTERVAL_S": str(SIM_REPORT_INTERVAL_S),
-                    "SIM_MAX_IN_FLIGHT_WRITES": str(max(100, rps * 6)),
-                    "SIM_MAX_IN_FLIGHT_READS": str(max(50, rps * 3)),
+                    "SIM_MAX_IN_FLIGHT_WRITES": str(max(120, rps * 3)),
+                    "SIM_MAX_IN_FLIGHT_READS": str(max(60, rps * 2)),
                     "SIM_API_PAGE_SIZE": "100",
                 },
                 timeout_seconds=sim_duration_s + 300,
@@ -567,11 +674,15 @@ def run_simulation(
         finally:
             stop_event.set()
             reporter.join(timeout=2)
+            if restore_thread is not None:
+                restore_thread.join(timeout=1)
+            restore_autoscaling_once("encerramento da simulacao")
     finally:
         if delivery_process is not None:
             log("Simulacao: encerrando sim_delivery")
             delivery_process.terminate()
             delivery_process.wait()
+        restore_autoscaling_once("finalizacao da run_simulation")
 
 
 def resolve_simulation_base_url(worker_base_url: str, override_api_url: str | None) -> str:
@@ -960,70 +1071,151 @@ def resolve_min_capacities_for_services(service_names: list[str]) -> dict[str, i
     return min_by_service
 
 
-def enforce_clean_start_for_simulation(service_names: list[str]) -> None:
+def snapshot_autoscaling_suspension_state(service_names: list[str]) -> dict[str, dict[str, bool]]:
+    autoscaling = boto3.client("application-autoscaling", region_name=REGION)
+    resource_ids = [f"service/{CLUSTER_NAME}/{name}" for name in service_names]
+    response = autoscaling.describe_scalable_targets(
+        ServiceNamespace="ecs",
+        ResourceIds=resource_ids,
+        ScalableDimension="ecs:service:DesiredCount",
+    )
+
+    state_by_service: dict[str, dict[str, bool]] = {}
+    for target in response.get("ScalableTargets", []):
+        resource_id = str(target.get("ResourceId", ""))
+        parts = resource_id.split("/")
+        if len(parts) != 3:
+            continue
+        service_name = parts[2]
+        suspended = target.get("SuspendedState") or {}
+        state_by_service[service_name] = {
+            "DynamicScalingInSuspended": bool(suspended.get("DynamicScalingInSuspended", False)),
+            "DynamicScalingOutSuspended": bool(suspended.get("DynamicScalingOutSuspended", False)),
+            "ScheduledScalingSuspended": bool(suspended.get("ScheduledScalingSuspended", False)),
+        }
+    return state_by_service
+
+
+def set_autoscaling_suspension_state(service_names: list[str], *, suspended: bool) -> None:
+    autoscaling = boto3.client("application-autoscaling", region_name=REGION)
+    min_by_service = resolve_min_capacities_for_services(service_names)
+
+    for service_name in service_names:
+        min_capacity = int(min_by_service.get(service_name, 1))
+        log(
+            f"Clean start: autoscaling {'suspenso' if suspended else 'reativado'} para {service_name}"
+        )
+        autoscaling.register_scalable_target(
+            ServiceNamespace="ecs",
+            ResourceId=f"service/{CLUSTER_NAME}/{service_name}",
+            ScalableDimension="ecs:service:DesiredCount",
+            MinCapacity=min_capacity,
+            SuspendedState={
+                "DynamicScalingInSuspended": suspended,
+                "DynamicScalingOutSuspended": suspended,
+                "ScheduledScalingSuspended": suspended,
+            },
+        )
+
+
+def restore_autoscaling_suspension_state(state_by_service: dict[str, dict[str, bool]]) -> None:
+    if not state_by_service:
+        return
+
+    autoscaling = boto3.client("application-autoscaling", region_name=REGION)
+    min_by_service = resolve_min_capacities_for_services(list(state_by_service.keys()))
+
+    for service_name, state in state_by_service.items():
+        min_capacity = int(min_by_service.get(service_name, 1))
+        log(f"Clean start: restaurando estado de autoscaling para {service_name}")
+        autoscaling.register_scalable_target(
+            ServiceNamespace="ecs",
+            ResourceId=f"service/{CLUSTER_NAME}/{service_name}",
+            ScalableDimension="ecs:service:DesiredCount",
+            MinCapacity=min_capacity,
+            SuspendedState={
+                "DynamicScalingInSuspended": bool(state.get("DynamicScalingInSuspended", False)),
+                "DynamicScalingOutSuspended": bool(state.get("DynamicScalingOutSuspended", False)),
+                "ScheduledScalingSuspended": bool(state.get("ScheduledScalingSuspended", False)),
+            },
+        )
+
+
+def enforce_clean_start_for_simulation(service_names: list[str]) -> dict[str, dict[str, bool]]:
     timeout_seconds = max(120, int(os.getenv("SIM_CLEAN_START_TIMEOUT_SECONDS", "900")))
     poll_seconds = max(3, int(os.getenv("SIM_CLEAN_START_POLL_SECONDS", "10")))
 
     min_by_service = resolve_min_capacities_for_services(service_names)
     ecs = boto3.client("ecs", region_name=REGION)
+    original_suspension_state = snapshot_autoscaling_suspension_state(service_names)
 
-    for service_name in service_names:
-        target_desired = int(min_by_service.get(service_name, 1))
-        log(f"Clean start: ajustando {service_name} para desired={target_desired}")
-        ecs.update_service(
-            cluster=CLUSTER_NAME,
-            service=service_name,
-            desiredCount=target_desired,
-        )
+    suspension_applied = False
+    try:
+        set_autoscaling_suspension_state(service_names, suspended=True)
+        suspension_applied = True
 
-    started_at = time.time()
-    deadline = started_at + timeout_seconds
-
-    while time.time() < deadline:
-        response = ecs.describe_services(cluster=CLUSTER_NAME, services=service_names)
-        services = response.get("services", [])
-        by_name = {str(item.get("serviceName", "")): item for item in services}
-
-        all_clean = True
         for service_name in service_names:
-            service = by_name.get(service_name)
-            if not service:
-                all_clean = False
-                log(f"Clean start: {service_name} ainda nao encontrado no describe_services")
-                continue
-
-            desired = int(service.get("desiredCount", 0))
-            running = int(service.get("runningCount", 0))
-            pending = int(service.get("pendingCount", 0))
-            deployments = service.get("deployments", [])
-            in_progress = [item for item in deployments if item.get("rolloutState") != "COMPLETED"]
-
-            clean = (
-                running == desired
-                and pending == 0
-                and len(in_progress) == 0
-                and len(deployments) == 1
+            target_desired = int(min_by_service.get(service_name, 1))
+            log(f"Clean start: ajustando {service_name} para desired={target_desired}")
+            ecs.update_service(
+                cluster=CLUSTER_NAME,
+                service=service_name,
+                desiredCount=target_desired,
             )
 
-            if not clean:
-                all_clean = False
-                rollout_states = [str(item.get("rolloutState") or "UNKNOWN") for item in deployments]
-                log(
-                    f"Clean start aguardando {service_name}: "
-                    f"running={running}/{desired} pending={pending} deployments={len(deployments)} "
-                    f"rollout={rollout_states}"
+        started_at = time.time()
+        deadline = started_at + timeout_seconds
+
+        while time.time() < deadline:
+            response = ecs.describe_services(cluster=CLUSTER_NAME, services=service_names)
+            services = response.get("services", [])
+            by_name = {str(item.get("serviceName", "")): item for item in services}
+
+            all_clean = True
+            for service_name in service_names:
+                service = by_name.get(service_name)
+                if not service:
+                    all_clean = False
+                    log(f"Clean start: {service_name} ainda nao encontrado no describe_services")
+                    continue
+
+                desired = int(service.get("desiredCount", 0))
+                running = int(service.get("runningCount", 0))
+                pending = int(service.get("pendingCount", 0))
+                deployments = service.get("deployments", [])
+                in_progress = [item for item in deployments if item.get("rolloutState") != "COMPLETED"]
+
+                clean = (
+                    running == desired
+                    and pending == 0
+                    and len(in_progress) == 0
+                    and len(deployments) == 1
                 )
 
-        if all_clean:
-            log("Clean start: servicos estabilizados para inicio da simulacao")
-            return
+                if not clean:
+                    all_clean = False
+                    rollout_states = [str(item.get("rolloutState") or "UNKNOWN") for item in deployments]
+                    log(
+                        f"Clean start aguardando {service_name}: "
+                        f"running={running}/{desired} pending={pending} deployments={len(deployments)} "
+                        f"rollout={rollout_states}"
+                    )
 
-        time.sleep(poll_seconds)
+            if all_clean:
+                log("Clean start: servicos estabilizados para inicio da simulacao")
+                return original_suspension_state
 
-    raise TimeoutError(
-        "Clean start nao convergiu no prazo; tente aumentar SIM_CLEAN_START_TIMEOUT_SECONDS "
-        "ou revisar eventos de deployment no ECS."
-    )
+            time.sleep(poll_seconds)
+
+        raise TimeoutError(
+            "Clean start nao convergiu no prazo; tente aumentar SIM_CLEAN_START_TIMEOUT_SECONDS "
+            "ou revisar eventos de deployment no ECS."
+        )
+    except BaseException:
+        if suspension_applied:
+            log("Clean start: interrupcao detectada, restaurando estado original do autoscaling")
+            restore_autoscaling_suspension_state(original_suspension_state)
+        raise
 
 
 def test_api_service(base_url: str) -> None:
@@ -1207,37 +1399,46 @@ def main(argv=None) -> int:
         location_base_url = f"http://{location_alb_dns}"
 
         log("Clean start: preparando baseline confiavel para simulacao")
-        enforce_clean_start_for_simulation([SERVICE_NAME, API_SERVICE_NAME, LOCATION_SERVICE_NAME])
-
-        log("Readiness dos servicos")
-        wait_services_ready(
-            [
-                (worker_alb_dns, TARGET_GROUP_NAME, SERVICE_NAME),
-                (api_alb_dns, API_TARGET_GROUP_NAME, API_SERVICE_NAME),
-                (location_alb_dns, LOCATION_TARGET_GROUP_NAME, LOCATION_SERVICE_NAME),
-            ]
+        autoscaling_restore_state = enforce_clean_start_for_simulation(
+            [SERVICE_NAME, API_SERVICE_NAME, LOCATION_SERVICE_NAME]
         )
 
-        simulation_base_url = resolve_simulation_base_url(api_base_url, args.simulation_api_url)
-        if simulation_base_url == api_base_url and not supports_data_load(simulation_base_url):
-            raise RuntimeError(
-                "Simulacao indisponivel na URL atual: o endpoint publico da API nao expoe /customers, /merchants e /couriers. "
-                "Use --simulation-api-url apontando para a API FastAPI de dominio."
+        simulation_started = False
+        try:
+            log("Readiness dos servicos")
+            wait_services_ready(
+                [
+                    (worker_alb_dns, TARGET_GROUP_NAME, SERVICE_NAME),
+                    (api_alb_dns, API_TARGET_GROUP_NAME, API_SERVICE_NAME),
+                    (location_alb_dns, LOCATION_TARGET_GROUP_NAME, LOCATION_SERVICE_NAME),
+                ]
             )
 
-        api_username, api_password = resolve_api_auth(args.api_username, args.api_password, args.api_auth_env_file)
-        run_simulation(
-            base_url=simulation_base_url,
-            num_users=args.num_users,
-            rps=args.rps,
-            sim_duration_s=args.sim_duration,
-            api_username=api_username,
-            api_password=api_password,
-            bucket_name="",
-            graph_file=args.graph_file,
-            graph_location=args.graph_location,
-            location_base_url=location_base_url,
-        )
+            simulation_base_url = resolve_simulation_base_url(api_base_url, args.simulation_api_url)
+            if simulation_base_url == api_base_url and not supports_data_load(simulation_base_url):
+                raise RuntimeError(
+                    "Simulacao indisponivel na URL atual: o endpoint publico da API nao expoe /customers, /merchants e /couriers. "
+                    "Use --simulation-api-url apontando para a API FastAPI de dominio."
+                )
+
+            api_username, api_password = resolve_api_auth(args.api_username, args.api_password, args.api_auth_env_file)
+            simulation_started = True
+            run_simulation(
+                base_url=simulation_base_url,
+                num_users=args.num_users,
+                rps=args.rps,
+                sim_duration_s=args.sim_duration,
+                api_username=api_username,
+                api_password=api_password,
+                bucket_name="",
+                graph_file=args.graph_file,
+                graph_location=args.graph_location,
+                location_base_url=location_base_url,
+                autoscaling_restore_state=autoscaling_restore_state,
+            )
+        finally:
+            if not simulation_started:
+                restore_autoscaling_suspension_state(autoscaling_restore_state)
 
         log("Fim")
         return 0
@@ -1283,26 +1484,30 @@ def main(argv=None) -> int:
 
     if args.with_simulation:
         log("Clean start: preparando baseline confiavel para simulacao")
-        enforce_clean_start_for_simulation([SERVICE_NAME, API_SERVICE_NAME, LOCATION_SERVICE_NAME])
-
-        log("Readiness dos servicos")
-        wait_services_ready(
-            [
-                (worker_alb_dns, TARGET_GROUP_NAME, SERVICE_NAME),
-                (api_alb_dns, API_TARGET_GROUP_NAME, API_SERVICE_NAME),
-                (location_alb_dns, LOCATION_TARGET_GROUP_NAME, LOCATION_SERVICE_NAME),
-            ]
+        autoscaling_restore_state = enforce_clean_start_for_simulation(
+            [SERVICE_NAME, API_SERVICE_NAME, LOCATION_SERVICE_NAME]
         )
 
-        simulation_base_url = resolve_simulation_base_url(api_base_url, args.simulation_api_url)
-        if simulation_base_url == api_base_url and not supports_data_load(simulation_base_url):
-            raise RuntimeError(
-                "Simulacao indisponivel na URL atual: o endpoint publico da API nao expoe /customers, /merchants e /couriers. "
-                "Use --simulation-api-url apontando para a API FastAPI de dominio."
+        simulation_started = False
+        try:
+            log("Readiness dos servicos")
+            wait_services_ready(
+                [
+                    (worker_alb_dns, TARGET_GROUP_NAME, SERVICE_NAME),
+                    (api_alb_dns, API_TARGET_GROUP_NAME, API_SERVICE_NAME),
+                    (location_alb_dns, LOCATION_TARGET_GROUP_NAME, LOCATION_SERVICE_NAME),
+                ]
             )
 
-        api_username, api_password = resolve_api_auth(args.api_username, args.api_password, args.api_auth_env_file)
-        try:
+            simulation_base_url = resolve_simulation_base_url(api_base_url, args.simulation_api_url)
+            if simulation_base_url == api_base_url and not supports_data_load(simulation_base_url):
+                raise RuntimeError(
+                    "Simulacao indisponivel na URL atual: o endpoint publico da API nao expoe /customers, /merchants e /couriers. "
+                    "Use --simulation-api-url apontando para a API FastAPI de dominio."
+                )
+
+            api_username, api_password = resolve_api_auth(args.api_username, args.api_password, args.api_auth_env_file)
+            simulation_started = True
             run_simulation(
                 base_url=simulation_base_url,
                 num_users=args.num_users,
@@ -1314,10 +1519,14 @@ def main(argv=None) -> int:
                 graph_file=args.graph_file,
                 graph_location=args.graph_location,
                 location_base_url=location_base_url,
+                autoscaling_restore_state=autoscaling_restore_state,
             )
         except RuntimeError as error:
             log(str(error))
             return 2
+        finally:
+            if not simulation_started:
+                restore_autoscaling_suspension_state(autoscaling_restore_state)
 
         if args.with_autoscaling_demo:
             run_autoscaling_demo(args.autoscaling_wait_seconds)

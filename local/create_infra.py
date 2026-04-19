@@ -316,8 +316,8 @@ def ensure_service_autoscaling(
     request_target=None,
     cpu_target=70.0,
     memory_target=75.0,
-    scale_out_cooldown=30,
-    scale_in_cooldown=300,
+    scale_out_cooldown=15,
+    scale_in_cooldown=180,
 ):
     """Configura autoscaling para um servico ECS com politicas de CPU e memoria."""
     resource_id = f"service/{cluster_name}/{service_name}"
@@ -406,10 +406,12 @@ def setup_worker_infrastructure(region, cluster_name, service_name, table_name, 
     worker_route_max_available_couriers = os.getenv("WORKER_ROUTE_MAX_AVAILABLE_COURIERS", "500").strip() or "500"
     worker_route_queue_wait_seconds = os.getenv("WORKER_ROUTE_QUEUE_WAIT_SECONDS", "1.5").strip() or "1.5"
     worker_route_queue_retry_interval_seconds = os.getenv("WORKER_ROUTE_QUEUE_RETRY_INTERVAL_SECONDS", "0.2").strip() or "0.2"
-    worker_desired = int(os.getenv("WORKER_DESIRED_COUNT", "4"))
-    worker_min_capacity = int(os.getenv("WORKER_AUTOSCALING_MIN_CAPACITY", "4"))
-    worker_max_capacity = int(os.getenv("WORKER_AUTOSCALING_MAX_CAPACITY", "20"))
-    worker_request_target = float(os.getenv("WORKER_REQUEST_TARGET", "20"))
+    worker_desired = int(os.getenv("WORKER_DESIRED_COUNT", "6"))
+    worker_min_capacity = int(os.getenv("WORKER_AUTOSCALING_MIN_CAPACITY", "6"))
+    worker_max_capacity = int(os.getenv("WORKER_AUTOSCALING_MAX_CAPACITY", "40"))
+    worker_request_target = float(os.getenv("WORKER_REQUEST_TARGET", "35"))
+    worker_scale_out_cooldown = int(os.getenv("WORKER_SCALE_OUT_COOLDOWN", "15"))
+    worker_scale_in_cooldown = int(os.getenv("WORKER_SCALE_IN_COOLDOWN", "180"))
     worker_health_grace_seconds, worker_deployment_configuration = build_service_deployment_settings(
         "WORKER",
         default_grace_seconds=180,
@@ -524,8 +526,8 @@ def setup_worker_infrastructure(region, cluster_name, service_name, table_name, 
         request_target=worker_request_target,
         cpu_target=70.0,
         memory_target=75.0,
-        scale_out_cooldown=30,
-        scale_in_cooldown=300,
+        scale_out_cooldown=worker_scale_out_cooldown,
+        scale_in_cooldown=worker_scale_in_cooldown,
     )
     return True
 
@@ -559,18 +561,20 @@ def setup_api_infrastructure(
     admin_password = os.getenv("ADMIN_PASSWORD", "admin")
     location_url = location_base_url or os.getenv("LOCATION_URL", "").strip()
     # Defaults conservadores para evitar esgotar conexoes do RDS em conta/lab pequena.
-    api_db_pool_size = os.getenv("API_DB_POOL_SIZE", "4").strip() or "4"
-    api_db_max_overflow = os.getenv("API_DB_MAX_OVERFLOW", "2").strip() or "2"
+    api_db_pool_size = os.getenv("API_DB_POOL_SIZE", "8").strip() or "8"
+    api_db_max_overflow = os.getenv("API_DB_MAX_OVERFLOW", "8").strip() or "8"
     api_db_pool_timeout = os.getenv("API_DB_POOL_TIMEOUT", "10").strip() or "10"
     api_worker_connect_timeout = os.getenv("API_WORKER_CONNECT_TIMEOUT_SECONDS", "1.0").strip() or "1.0"
     api_worker_read_timeout = os.getenv("API_WORKER_READ_TIMEOUT_SECONDS", "4.0").strip() or "4.0"
     api_dispatch_workers = os.getenv("API_DISPATCH_WORKERS", "4").strip() or "4"
     api_auth_cache_ttl_seconds = os.getenv("API_AUTH_CACHE_TTL_SECONDS", "30").strip() or "30"
     api_auth_cache_max_size = os.getenv("API_AUTH_CACHE_MAX_SIZE", "50000").strip() or "50000"
-    api_desired = int(os.getenv("API_DESIRED_COUNT", "3"))
-    api_min_capacity = int(os.getenv("API_AUTOSCALING_MIN_CAPACITY", "3"))
-    api_max_capacity = int(os.getenv("API_AUTOSCALING_MAX_CAPACITY", "10"))
-    api_request_target = float(os.getenv("API_REQUEST_TARGET", "80"))
+    api_desired = int(os.getenv("API_DESIRED_COUNT", "4"))
+    api_min_capacity = int(os.getenv("API_AUTOSCALING_MIN_CAPACITY", "4"))
+    api_max_capacity = int(os.getenv("API_AUTOSCALING_MAX_CAPACITY", "20"))
+    api_request_target = float(os.getenv("API_REQUEST_TARGET", "120"))
+    api_scale_out_cooldown = int(os.getenv("API_SCALE_OUT_COOLDOWN", "15"))
+    api_scale_in_cooldown = int(os.getenv("API_SCALE_IN_COOLDOWN", "180"))
     api_health_grace_seconds, api_deployment_configuration = build_service_deployment_settings(
         "API",
         default_grace_seconds=90,
@@ -688,8 +692,8 @@ def setup_api_infrastructure(
         request_target=api_request_target,
         cpu_target=70.0,
         memory_target=75.0,
-        scale_out_cooldown=30,
-        scale_in_cooldown=300,
+        scale_out_cooldown=api_scale_out_cooldown,
+        scale_in_cooldown=api_scale_in_cooldown,
     )
     return True
 
@@ -709,10 +713,12 @@ def setup_location_infrastructure(region, cluster_name, service_name, execution_
     vpc_id = resolve_vpc_id(ec2)
     subnets = resolve_subnets(ec2, vpc_id)
     image_uri = resolve_image_uri(account_id, region, LOCATION_ECR_REPO, "LOCATION_IMAGE_URI")
-    location_desired = int(os.getenv("LOCATION_DESIRED_COUNT", "4"))
-    location_min_capacity = int(os.getenv("LOCATION_AUTOSCALING_MIN_CAPACITY", "4"))
+    location_desired = int(os.getenv("LOCATION_DESIRED_COUNT", "2"))
+    location_min_capacity = int(os.getenv("LOCATION_AUTOSCALING_MIN_CAPACITY", "2"))
     location_max_capacity = int(os.getenv("LOCATION_AUTOSCALING_MAX_CAPACITY", "20"))
-    location_request_target = float(os.getenv("LOCATION_REQUEST_TARGET", "30"))
+    location_request_target = float(os.getenv("LOCATION_REQUEST_TARGET", "50"))
+    location_scale_out_cooldown = int(os.getenv("LOCATION_SCALE_OUT_COOLDOWN", "15"))
+    location_scale_in_cooldown = int(os.getenv("LOCATION_SCALE_IN_COOLDOWN", "180"))
     location_health_grace_seconds, location_deployment_configuration = build_service_deployment_settings(
         "LOCATION",
         default_grace_seconds=60,
@@ -813,7 +819,7 @@ def setup_location_infrastructure(region, cluster_name, service_name, execution_
         request_target=location_request_target,
         cpu_target=70.0,
         memory_target=75.0,
-        scale_out_cooldown=30,
-        scale_in_cooldown=300,
+        scale_out_cooldown=location_scale_out_cooldown,
+        scale_in_cooldown=location_scale_in_cooldown,
     )
     return True
