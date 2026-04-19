@@ -939,6 +939,93 @@ def wait_for_ecs_service_stable(service_name: str) -> None:
     )
 
 
+def resolve_min_capacities_for_services(service_names: list[str]) -> dict[str, int]:
+    autoscaling = boto3.client("application-autoscaling", region_name=REGION)
+    resource_ids = [f"service/{CLUSTER_NAME}/{name}" for name in service_names]
+    response = autoscaling.describe_scalable_targets(
+        ServiceNamespace="ecs",
+        ResourceIds=resource_ids,
+        ScalableDimension="ecs:service:DesiredCount",
+    )
+
+    min_by_service: dict[str, int] = {}
+    for target in response.get("ScalableTargets", []):
+        resource_id = str(target.get("ResourceId", ""))
+        parts = resource_id.split("/")
+        if len(parts) != 3:
+            continue
+        service_name = parts[2]
+        min_by_service[service_name] = int(target.get("MinCapacity", 1))
+
+    return min_by_service
+
+
+def enforce_clean_start_for_simulation(service_names: list[str]) -> None:
+    timeout_seconds = max(120, int(os.getenv("SIM_CLEAN_START_TIMEOUT_SECONDS", "900")))
+    poll_seconds = max(3, int(os.getenv("SIM_CLEAN_START_POLL_SECONDS", "10")))
+
+    min_by_service = resolve_min_capacities_for_services(service_names)
+    ecs = boto3.client("ecs", region_name=REGION)
+
+    for service_name in service_names:
+        target_desired = int(min_by_service.get(service_name, 1))
+        log(f"Clean start: ajustando {service_name} para desired={target_desired}")
+        ecs.update_service(
+            cluster=CLUSTER_NAME,
+            service=service_name,
+            desiredCount=target_desired,
+        )
+
+    started_at = time.time()
+    deadline = started_at + timeout_seconds
+
+    while time.time() < deadline:
+        response = ecs.describe_services(cluster=CLUSTER_NAME, services=service_names)
+        services = response.get("services", [])
+        by_name = {str(item.get("serviceName", "")): item for item in services}
+
+        all_clean = True
+        for service_name in service_names:
+            service = by_name.get(service_name)
+            if not service:
+                all_clean = False
+                log(f"Clean start: {service_name} ainda nao encontrado no describe_services")
+                continue
+
+            desired = int(service.get("desiredCount", 0))
+            running = int(service.get("runningCount", 0))
+            pending = int(service.get("pendingCount", 0))
+            deployments = service.get("deployments", [])
+            in_progress = [item for item in deployments if item.get("rolloutState") != "COMPLETED"]
+
+            clean = (
+                running == desired
+                and pending == 0
+                and len(in_progress) == 0
+                and len(deployments) == 1
+            )
+
+            if not clean:
+                all_clean = False
+                rollout_states = [str(item.get("rolloutState") or "UNKNOWN") for item in deployments]
+                log(
+                    f"Clean start aguardando {service_name}: "
+                    f"running={running}/{desired} pending={pending} deployments={len(deployments)} "
+                    f"rollout={rollout_states}"
+                )
+
+        if all_clean:
+            log("Clean start: servicos estabilizados para inicio da simulacao")
+            return
+
+        time.sleep(poll_seconds)
+
+    raise TimeoutError(
+        "Clean start nao convergiu no prazo; tente aumentar SIM_CLEAN_START_TIMEOUT_SECONDS "
+        "ou revisar eventos de deployment no ECS."
+    )
+
+
 def test_api_service(base_url: str) -> None:
     health_url = f"{base_url}/health"
     openapi_url = f"{base_url}/openapi.json"
@@ -1119,6 +1206,9 @@ def main(argv=None) -> int:
         api_base_url = f"http://{api_alb_dns}"
         location_base_url = f"http://{location_alb_dns}"
 
+        log("Clean start: preparando baseline confiavel para simulacao")
+        enforce_clean_start_for_simulation([SERVICE_NAME, API_SERVICE_NAME, LOCATION_SERVICE_NAME])
+
         log("Readiness dos servicos")
         wait_services_ready(
             [
@@ -1192,6 +1282,9 @@ def main(argv=None) -> int:
     location_base_url = f"http://{location_alb_dns}"
 
     if args.with_simulation:
+        log("Clean start: preparando baseline confiavel para simulacao")
+        enforce_clean_start_for_simulation([SERVICE_NAME, API_SERVICE_NAME, LOCATION_SERVICE_NAME])
+
         log("Readiness dos servicos")
         wait_services_ready(
             [
