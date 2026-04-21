@@ -1,2 +1,0 @@
-rps_target	status	effective_rps	p95_write_ms	p95_read_ms	backpressure	writes	reads	p95_goal	log_file
-50	FAILED	NA	NA	NA	NA	NA	NA	NO	/home/rique/Documents/fgv/5o/CN/trabalho-1-CN/.benchmarks/20260418-214250/rps_50_attempt_2.log
