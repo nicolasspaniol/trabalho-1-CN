@@ -23,7 +23,7 @@ Servicos:
 Dados:
 - RDS PostgreSQL: dados transacionais (`user`, `customer`, `merchant`, `courier`, `order`, `order_event`)
 - DynamoDB: dados de rota/localizacao em tempo real
-- S3: arquivo do grafo viario (`MAPAS_FILE`)
+- Grafo viário: arquivo `sp_cidade.pkl` já incluído na imagem do worker (não depende mais de S3)
 
 Infra:
 - ECS Fargate + ALB por servico
@@ -92,7 +92,7 @@ uv run --project local local/deploy.py \
 
 Quando roda com deploy:
 1. pre-setup opcional (`local/pre_deploy_setup.sh`) para build/push no ECR
-2. cria/atualiza S3, DynamoDB, RDS e schema SQL
+2. cria/atualiza DynamoDB, RDS e schema SQL
 3. cria/atualiza worker, location e api no ECS/ALB
 4. espera DNS + health dos target groups
 5. (opcional) simulacao de carga
@@ -137,11 +137,11 @@ Caracteristicas atuais do `sim_client.py`:
 - steady-state configuravel (`SIM_STEADY_START_SECONDS`)
 - metricas exportadas em JSON (`SIM_METRICS_PATH`) e agregadas no CSV
 
-## Variaveis de ambiente mais uteis
+## Variáveis de ambiente mais úteis
 
 Infra/deploy:
 - `EXECUTION_ROLE_ARN`, `EXECUTION_ROLE_NAME`
-- `BUCKET_NAME`, `DB_PASSWORD`, `DB_INSTANCE_ID`, `DB_SCHEMA_FILE`
+- `DB_PASSWORD`, `DB_INSTANCE_ID`, `DB_SCHEMA_FILE`
 - `FORCE_GRAPH_REBUILD=1`
 - `DB_SKIP_SCHEMA_LOAD=1`
 - `DEPLOY_SERIAL_ROLLOUT=1`

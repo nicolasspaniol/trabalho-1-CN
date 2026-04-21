@@ -64,11 +64,6 @@ def resolve_account_id(sts) -> str:
     return sts.get_caller_identity()["Account"]
 
 
-def resolve_bucket_name(account_id: str) -> str:
-    env_bucket = os.getenv("BUCKET_NAME", "").strip()
-    if env_bucket:
-        return env_bucket
-    return f"dijkfood-assets-sp-{account_id}"
 
 
 def get_lb_arn(elbv2):
@@ -151,35 +146,6 @@ def wait_lb_deleted(elbv2, lb_arn: str, timeout_seconds: int = 180) -> None:
             return
 
 
-def delete_bucket_recursive(s3, bucket_name: str) -> None:
-    log(f"8) Removendo bucket S3 {bucket_name}")
-
-    # Remove todas as versoes e delete markers (bucket versionado ou nao).
-    paginator = s3.get_paginator("list_object_versions")
-    for page in paginator.paginate(Bucket=bucket_name):
-        objects = []
-        for version in page.get("Versions", []):
-            objects.append({"Key": version["Key"], "VersionId": version["VersionId"]})
-        for marker in page.get("DeleteMarkers", []):
-            objects.append({"Key": marker["Key"], "VersionId": marker["VersionId"]})
-        if objects:
-            s3.delete_objects(Bucket=bucket_name, Delete={"Objects": objects, "Quiet": True})
-
-    # Cobre o caso de bucket sem versionamento.
-    cont = None
-    while True:
-        kwargs = {"Bucket": bucket_name}
-        if cont:
-            kwargs["ContinuationToken"] = cont
-        page = s3.list_objects_v2(**kwargs)
-        objs = [{"Key": obj["Key"]} for obj in page.get("Contents", [])]
-        if objs:
-            s3.delete_objects(Bucket=bucket_name, Delete={"Objects": objs, "Quiet": True})
-        if not page.get("IsTruncated"):
-            break
-        cont = page.get("NextContinuationToken")
-
-    s3.delete_bucket(Bucket=bucket_name)
 
 
 def delete_sg_with_retry(ec2, sg_id: str, max_attempts: int = 12) -> None:
@@ -214,7 +180,6 @@ def main(argv=None):
     s3 = session.client("s3")
 
     account_id = resolve_account_id(sts)
-    bucket_name = resolve_bucket_name(account_id)
     vpc_id = resolve_vpc_id(ec2, elbv2)
 
     service_names = [SERVICE_NAME, API_SERVICE_NAME, LOCATION_SERVICE_NAME]
@@ -283,15 +248,6 @@ def main(argv=None):
 
     log(f"8) Removendo RDS {DB_INSTANCE_ID}")
     safe(lambda: rds.delete_db_instance(DBInstanceIdentifier=DB_INSTANCE_ID, SkipFinalSnapshot=True), "delete-rds")
-
-    try:
-        delete_bucket_recursive(s3, bucket_name)
-    except ClientError as error:
-        code = error.response.get("Error", {}).get("Code", "ClientError")
-        if code in {"NoSuchBucket", "AccessDenied"}:
-            warn(f"delete-bucket: {code} - {error}")
-        else:
-            warn(f"delete-bucket: {code} - {error}")
 
     log("10) Removendo security groups customizados")
     for name in (

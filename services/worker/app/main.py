@@ -58,31 +58,6 @@ def graph_retry_interval_seconds() -> float:
         return 30.0
 
 
-def try_load_graph_from_s3() -> bool:
-    global GRAPH, GRAPH_LOAD_ERROR, GRAPH_LAST_LOAD_ATTEMPT
-
-    retry_interval = graph_retry_interval_seconds()
-    now = time.monotonic()
-    if GRAPH is None and GRAPH_LOAD_ERROR and (now - GRAPH_LAST_LOAD_ATTEMPT) < retry_interval:
-        return False
-
-    bucket = os.getenv('MAPAS_BUCKET')
-    file_key = os.getenv('MAPAS_FILE', '').strip() or os.getenv('GRAPH_FILE', '').strip() or 'sp_cidade.pkl'
-
-    s3_client = boto3.client('s3')
-    local_path = f"/tmp/{os.path.basename(file_key)}"
-
-    try:
-        GRAPH_LAST_LOAD_ATTEMPT = now
-        s3_client.download_file(bucket, file_key, local_path)
-        with open(local_path, 'rb') as f:
-            GRAPH = pickle.load(f)
-        GRAPH_LOAD_ERROR = None
-        return True
-    except Exception as error:
-        GRAPH = None
-        GRAPH_LOAD_ERROR = str(error)
-        return False
 
 
 def try_init_db_pool() -> bool:

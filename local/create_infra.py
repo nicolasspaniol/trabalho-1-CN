@@ -658,7 +658,7 @@ def ensure_service_autoscaling(
         )
 
 
-def setup_worker_infrastructure(region, cluster_name, service_name, table_name, bucket_name, execution_role_arn):
+def setup_worker_infrastructure(region, cluster_name, service_name, table_name, execution_role_arn):
     if not execution_role_arn:
         raise ValueError("execution_role_arn is required")
 
@@ -745,7 +745,6 @@ def setup_worker_infrastructure(region, cluster_name, service_name, table_name, 
                 "image": image_uri,
                 "portMappings": [{"containerPort": 80}],
                 "environment": [
-                    {"name": "MAPAS_BUCKET", "value": bucket_name},
                     {"name": "MAPAS_FILE", "value": graph_file_key},
                     {"name": "DB_HOST", "value": db_host},
                     {"name": "DB_USER", "value": "postgres"},

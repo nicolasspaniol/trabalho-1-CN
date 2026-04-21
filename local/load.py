@@ -35,8 +35,6 @@ API_PASSWORD_ENV = "API_PASSWORD"
 # Config "avançada" via env para reduzir flags no CLI.
 GRAPH_PATH = (
     os.getenv("SIM_GRAPH_PATH", "").strip()
-    or os.getenv("GRAPH_FILE", "").strip()
-    or os.getenv("MAPAS_FILE", "").strip()
     or "sp_cidade.pkl"
 )
 MAX_CONCURRENCY = int(os.getenv("SIM_PRELOAD_MAX_CONCURRENCY", "20"))

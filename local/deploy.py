@@ -52,11 +52,6 @@ DB_INSTANCE_ID = os.getenv("DB_INSTANCE_ID", "dijkfood-postgres")
 DB_SECURITY_GROUP_NAME = os.getenv("DB_SECURITY_GROUP_NAME", "dijkfood-rds-sg")
 DB_SCHEMA_FILE = os.getenv("DB_SCHEMA_FILE", "local/schema.sql")
 
-# TODO(grupo-api): publicar o contrato final de couriers/me/location e picked_up no OpenAPI.
-# TODO(grupo-worker): validar o formato final das rotas e o fluxo de courier contra o contrato novo.
-# TODO(grupo-dados): definir estrategia final de versionamento/lifecycle do grafo no S3 para o mapa da cidade inteira.
-# TODO(grupo-infra): automatizar policy/versioning/lifecycle do bucket S3 do mapa.
-
 
 def log(message: str) -> None:
     print(f"[cycle] {message}", flush=True)
@@ -477,11 +472,6 @@ def resolve_account_id() -> str:
     return sts.get_caller_identity()["Account"]
 
 
-def resolve_bucket_name(account_id: str) -> str:
-    bucket_name = os.getenv("BUCKET_NAME", "").strip()
-    if bucket_name:
-        return bucket_name
-    return f"dijkfood-assets-sp-{account_id}"
 
 
 def resolve_db_password(account_id: str) -> str:
@@ -742,7 +732,6 @@ def run_simulation(
     sim_duration_s: int,
     api_username: str | None,
     api_password: str | None,
-    bucket_name: str,
     graph_file: str,
     graph_location: str,
     location_base_url: str | None,
@@ -948,41 +937,16 @@ def resolve_simulation_base_url(worker_base_url: str, override_api_url: str | No
     return worker_base_url
 
 
-def s3_object_exists(bucket_name: str, object_key: str) -> bool:
-    s3 = boto3.client("s3", region_name=REGION)
-    try:
-        s3.head_object(Bucket=bucket_name, Key=object_key)
-        return True
-    except ClientError as error:
-        code = str(error.response.get("Error", {}).get("Code", ""))
-        if code in {"404", "NoSuchKey", "NotFound"}:
-            return False
-        raise
 
 
-def ensure_graph_in_s3(bucket_name: str, graph_file: str, graph_location: str) -> None:
-    if not env_flag("FORCE_GRAPH_REBUILD", default=False) and s3_object_exists(bucket_name, graph_file):
-        log(
-            "Dados: grafo ja existe no S3; pulando geracao/upload "
-            "(use FORCE_GRAPH_REBUILD=1 para forcar)"
-        )
-        return
-
-    log("Dados: gerando grafo e enviando para S3")
-    run_python_script(
-        PROJECT_ROOT / "local" / "create.py",
-        ["--bucket", bucket_name, "--file", graph_file, "--location", graph_location],
-    )
 
 
-def run_deployment(execution_role_arn: str, bucket_name: str) -> None:
+def run_deployment(execution_role_arn: str) -> None:
     serial_rollout = env_flag("DEPLOY_SERIAL_ROLLOUT", default=False)
 
     log("Deploy ECS: garantindo service-linked role do ECS")
     create_infra.ensure_ecs_service_linked_role(REGION)
 
-    log("Deploy dados: garantindo bucket S3")
-    create_data.setup_s3_bucket(bucket_name)
 
     log("Deploy dados: garantindo tabela DynamoDB")
     create_data.setup_dynamo(TABLE_NAME)
@@ -1017,7 +981,6 @@ def run_deployment(execution_role_arn: str, bucket_name: str) -> None:
         cluster_name=CLUSTER_NAME,
         service_name=SERVICE_NAME,
         table_name=TABLE_NAME,
-        bucket_name=bucket_name,
         execution_role_arn=execution_role_arn,
     )
 
@@ -1694,7 +1657,6 @@ def main(argv=None) -> int:
                 sim_duration_s=args.sim_duration,
                 api_username=api_username,
                 api_password=api_password,
-                bucket_name="",
                 graph_file=args.graph_file,
                 graph_location=args.graph_location,
                 location_base_url=location_base_url,
@@ -1716,21 +1678,16 @@ def main(argv=None) -> int:
         run_pre_deploy_setup()
 
     account_id = resolve_account_id()
-    bucket_name = resolve_bucket_name(account_id)
     db_password = resolve_db_password(account_id)
-    os.environ["BUCKET_NAME"] = bucket_name
     os.environ["DB_PASSWORD"] = db_password
     os.environ["MAPAS_FILE"] = args.graph_file
 
     execution_role_arn = require_execution_role()
     os.environ["EXECUTION_ROLE_ARN"] = execution_role_arn
 
-    log("Deploy dados: garantindo bucket S3 antes do upload do grafo")
-    create_data.setup_s3_bucket(bucket_name)
-    ensure_graph_in_s3(bucket_name, args.graph_file, args.graph_location)
 
     log("Deploy")
-    run_deployment(execution_role_arn, bucket_name)
+    run_deployment(execution_role_arn)
 
     log("ALB worker")
     elbv2 = boto3.client("elbv2", region_name=REGION)
@@ -1788,7 +1745,6 @@ def main(argv=None) -> int:
                 sim_duration_s=args.sim_duration,
                 api_username=api_username,
                 api_password=api_password,
-                bucket_name=bucket_name,
                 graph_file=args.graph_file,
                 graph_location=args.graph_location,
                 location_base_url=location_base_url,
