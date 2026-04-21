@@ -1494,42 +1494,6 @@ def test_location_service(base_url: str) -> None:
 def run_autoscaling_demo(wait_seconds: int) -> None:
     log("Demo autoscaling: exibindo estado dos servicos ECS")
     autoscaling_demo.main(["--show-only", "--wait-seconds", str(wait_seconds)])
-    debug_alb_request_alarm_states([SERVICE_NAME, API_SERVICE_NAME, LOCATION_SERVICE_NAME])
-
-
-def debug_alb_request_alarm_states(service_names: list[str]) -> None:
-    cloudwatch = boto3.client("cloudwatch", region_name=REGION)
-    alarm_names: list[str] = []
-    for service_name in service_names:
-        alarm_prefix = service_name.replace("/", "-")
-        alarm_names.append(f"{alarm_prefix}-AlbRequestHigh")
-        alarm_names.append(f"{alarm_prefix}-AlbRequestLow")
-
-    if not alarm_names:
-        return
-
-    response = cloudwatch.describe_alarms(AlarmNames=alarm_names)
-    alarms = response.get("MetricAlarms", [])
-    by_name = {str(alarm.get("AlarmName", "")): alarm for alarm in alarms}
-
-    log("Demo autoscaling: estado dos alarmes AlbRequestHigh/Low")
-    for alarm_name in alarm_names:
-        alarm = by_name.get(alarm_name)
-        if not alarm:
-            log(f"  - {alarm_name}: nao encontrado")
-            continue
-
-        state = str(alarm.get("StateValue", "UNKNOWN"))
-        reason = str(alarm.get("StateReason", "sem motivo"))
-        threshold = alarm.get("Threshold")
-        period = alarm.get("Period")
-        eval_periods = alarm.get("EvaluationPeriods")
-        datapoints_to_alarm = alarm.get("DatapointsToAlarm")
-        log(
-            f"  - {alarm_name}: state={state} threshold={threshold} "
-            f"period={period}s evals={eval_periods} dta={datapoints_to_alarm} "
-            f"reason={reason}"
-        )
 
 
 def run_fault_demo(api_base_url: str, worker_base_url: str, location_base_url: str) -> None:

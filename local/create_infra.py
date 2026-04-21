@@ -611,7 +611,10 @@ def ensure_service_autoscaling(
             Namespace="AWS/ApplicationELB",
             MetricName="RequestCountPerTarget",
             Dimensions=dimensions,
+            # RequestCountPerTarget representa contagem de requests por período.
+            # Para capturar pressão real no minuto, usamos Sum (não Average).
             Statistic="Sum",
+            # Janela curta para reação rápida: 1 minuto e 1 avaliação.
             Period=period_seconds,
             EvaluationPeriods=evaluation_periods,
             DatapointsToAlarm=1,
@@ -635,7 +638,10 @@ def ensure_service_autoscaling(
             Namespace="AWS/ApplicationELB",
             MetricName="RequestCountPerTarget",
             Dimensions=dimensions,
+            # Mantemos Sum pela mesma razão do alarme de scale-out:
+            # comparar volume por período evita leituras "sem datapoint" na prática.
             Statistic="Sum",
+            # 1 minuto / 1 avaliação para detectar rapidamente queda sustentada de tráfego.
             Period=period_seconds,
             EvaluationPeriods=evaluation_periods,
             DatapointsToAlarm=1,
