@@ -15,6 +15,9 @@ COURIER_MAX = int(os.getenv("SIM_COURIER_MAX", "200"))
 COURIER_POLL_SECONDS = float(os.getenv("SIM_COURIER_POLL_SECONDS", "1"))
 COURIER_POLL_JITTER_SECONDS = float(os.getenv("SIM_COURIER_POLL_JITTER_SECONDS", "0.25"))
 ERROR_BACKOFF_MAX_SECONDS = float(os.getenv("SIM_COURIER_ERROR_BACKOFF_MAX_SECONDS", "30"))
+COURIER_STEP_SECONDS = float(os.getenv("SIM_COURIER_STEP_SECONDS", "0.1"))
+COURIER_FALLBACK_TRAVEL_SECONDS = float(os.getenv("SIM_COURIER_FALLBACK_TRAVEL_SECONDS", "1.0"))
+COURIER_SPEED_MPS = float(os.getenv("SIM_COURIER_SPEED_MPS", "6.0"))
 
 NEW_DELIVERY_MODE = "new"
 PARTIAL_DELIVERY_MODE = "partial"
@@ -225,12 +228,17 @@ async def fetch_courier_ids(session: aiohttp.ClientSession, api_url: str) -> lis
     return courier_ids
 
 
-async def get_courier_current_order(session: aiohttp.ClientSession, api_url: str) -> dict[str, Any] | None:
+async def get_courier_current_order(
+    session: aiohttp.ClientSession,
+    api_url: str,
+    *,
+    include_route: bool = False,
+) -> dict[str, Any] | None:
     try:
-        # Modo leve: evita leituras no DynamoDB (rota/localizacao) que aumentam latencia e timeout sob carga.
+        route_flag = "true" if include_route else "false"
         payload = await get_json(
             session,
-            f"{api_url.rstrip('/')}/couriers/me/order?include_route=false&include_location=false",
+            f"{api_url.rstrip('/')}/couriers/me/order?include_route={route_flag}&include_location=false",
         )
     except aiohttp.ClientResponseError as e:
         if e.status in (404, 500, 502, 503, 504):
@@ -254,26 +262,6 @@ async def get_courier_current_order(session: aiohttp.ClientSession, api_url: str
     if isinstance(payload, dict):
         return payload
     return None
-
-
-async def get_customer_address(session: aiohttp.ClientSession, api_url: str, customer_id: int) -> int | None:
-    try:
-        payload = await get_json(session, f"{api_url.rstrip('/')}/customers/{customer_id}")
-        address = payload.get("address") if isinstance(payload, dict) else None
-        return int(address) if address is not None else None
-    except Exception as e:
-        print(f"  Erro ao buscar endereco do cliente {customer_id}: {e}")
-        return None
-
-
-async def get_merchant_address(session: aiohttp.ClientSession, api_url: str, merchant_id: int) -> int | None:
-    try:
-        payload = await get_json(session, f"{api_url.rstrip('/')}/merchants/{merchant_id}")
-        address = payload.get("address") if isinstance(payload, dict) else None
-        return int(address) if address is not None else None
-    except Exception as e:
-        print(f"  Erro ao buscar endereco do restaurante {merchant_id}: {e}")
-        return None
 
 
 async def update_courier_location(
@@ -370,6 +358,52 @@ async def deliver_order_new(
     order_id = int(order["id"])
     stats.mark_assigned()
 
+    order_with_route = order
+    if not isinstance(order.get("delivery_route"), dict):
+        fetched_order = await get_courier_current_order(session, api_url, include_route=True)
+        fetched_id = fetched_order.get("id") if isinstance(fetched_order, dict) else None
+        if fetched_order and fetched_id is not None and int(fetched_id) == order_id:
+            order_with_route = fetched_order
+
+    route = order_with_route.get("delivery_route") if isinstance(order_with_route, dict) else None
+    path_to_merchant = route.get("path_to_merchant") if isinstance(route, dict) else None
+    path_to_user = route.get("path_to_user") if isinstance(route, dict) else None
+    distance_to_merchant = route.get("distance_to_merchant") if isinstance(route, dict) else None
+    distance_to_user = route.get("distance_to_user") if isinstance(route, dict) else None
+    uses_dedicated_location_api = location_api_url.rstrip("/") != api_url.rstrip("/")
+
+    def _path_step_sleep_seconds(path: Any, distance_meters: Any) -> float:
+        if not isinstance(path, list) or len(path) <= 1:
+            return max(0.01, COURIER_STEP_SECONDS)
+
+        steps = max(1, len(path) - 1)
+        speed_mps = max(0.5, COURIER_SPEED_MPS)
+        try:
+            distance_value = float(distance_meters)
+        except (TypeError, ValueError):
+            distance_value = 0.0
+
+        if distance_value > 0:
+            travel_seconds = distance_value / speed_mps
+            return max(0.01, travel_seconds / steps)
+
+        return max(0.01, COURIER_STEP_SECONDS)
+
+    async def replay_route(path: Any, distance_meters: Any) -> None:
+        if not isinstance(path, list) or not path:
+            return
+        step_sleep_s = _path_step_sleep_seconds(path, distance_meters)
+        for node in path:
+            try:
+                node_int = int(node)
+            except (TypeError, ValueError):
+                continue
+            await update_courier_location(session, location_api_url, order_id, node_int)
+            await asyncio.sleep(step_sleep_s)
+
+    if uses_dedicated_location_api:
+        await replay_route(path_to_merchant, distance_to_merchant)
+
     if not await mark_order_picked_up(session, api_url, order_id):
         stats.mark_failed()
         return False
@@ -378,19 +412,21 @@ async def deliver_order_new(
         stats.mark_failed()
         return False
 
+    if not uses_dedicated_location_api:
+        await replay_route(path_to_merchant, distance_to_merchant)
 
-    # Envia a localização do entregador ao longo de todo o caminho, a cada 100ms
-    route = order.get("delivery_route") if isinstance(order, dict) else None
-    if isinstance(route, dict):
-        path_to_user = route.get("path_to_user")
-        if isinstance(path_to_user, list) and path_to_user:
-            for node in path_to_user:
-                try:
-                    node_int = int(node)
-                    await update_courier_location(session, location_api_url, order_id, node_int)
-                    await asyncio.sleep(0.1)
-                except (TypeError, ValueError):
-                    continue
+    if isinstance(path_to_user, list) and path_to_user:
+        await replay_route(path_to_user, distance_to_user)
+    else:
+        # Sem rota detalhada, evita chamadas de endpoints restritos (401) usando auth de courier.
+        # Mantem uma pequena "janela de viagem" para nao parecer entrega instantanea.
+        fallback_seconds = max(0.05, COURIER_FALLBACK_TRAVEL_SECONDS)
+        if distance_to_user is not None:
+            try:
+                fallback_seconds = max(fallback_seconds, float(distance_to_user) / max(0.5, COURIER_SPEED_MPS))
+            except (TypeError, ValueError):
+                pass
+        await asyncio.sleep(fallback_seconds)
 
     if can_mark_delivered:
         if not await mark_order_delivered(session, api_url, order_id):
@@ -580,9 +616,13 @@ if __name__ == "__main__":
     if not args.api_url:
         parser.error(f"--api-url é obrigatório (ou defina {API_URL_ENV}).")
 
-    asyncio.run(
-        delivery_worker(
-            args.api_url,
-            location_api_url=args.location_api_url,
+    try:
+        asyncio.run(
+            delivery_worker(
+                args.api_url,
+                location_api_url=args.location_api_url,
+            )
         )
-    )
+    except KeyboardInterrupt:
+        print("[sim_delivery] Execução interrompida pelo usuário.")
+        raise SystemExit(130)

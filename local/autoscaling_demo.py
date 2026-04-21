@@ -173,9 +173,18 @@ def show_service_status(ecs, autoscaling, cluster_name: str, service_name: str) 
     if policies:
         print("  policies:")
         for policy in policies:
-            metric = policy.get("TargetTrackingScalingPolicyConfiguration", {}).get("PredefinedMetricSpecification", {}).get("PredefinedMetricType")
-            target_value = policy.get("TargetTrackingScalingPolicyConfiguration", {}).get("TargetValue")
-            print(f"    - {policy.get('PolicyName')} metric={metric} target={target_value}")
+            policy_name = str(policy.get("PolicyName"))
+            policy_type = str(policy.get("PolicyType"))
+            if policy_type == "TargetTrackingScaling":
+                metric = policy.get("TargetTrackingScalingPolicyConfiguration", {}).get("PredefinedMetricSpecification", {}).get("PredefinedMetricType")
+                target_value = policy.get("TargetTrackingScalingPolicyConfiguration", {}).get("TargetValue")
+                print(f"    - {policy_name} type={policy_type} metric={metric} target={target_value}")
+            elif policy_type == "StepScaling":
+                cooldown = policy.get("StepScalingPolicyConfiguration", {}).get("Cooldown")
+                steps = policy.get("StepScalingPolicyConfiguration", {}).get("StepAdjustments", [])
+                print(f"    - {policy_name} type={policy_type} cooldown={cooldown}s steps={len(steps)}")
+            else:
+                print(f"    - {policy_name} type={policy_type}")
     else:
         print("  policies: nenhuma")
 

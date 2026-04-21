@@ -86,11 +86,249 @@ def env_flag(name: str, default: bool = False) -> bool:
     return raw_value.strip().lower() not in {"", "0", "false", "no", "off"}
 
 
+def read_int_env(name: str, default: int, *, minimum: int = 0) -> int:
+    try:
+        value = int(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        value = int(default)
+    return max(minimum, value)
+
+
+def read_float_env(name: str, default: float, *, minimum: float = 0.0) -> float:
+    try:
+        value = float(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        value = float(default)
+    return max(minimum, value)
+
+
 SIM_DURATION_S = int(os.getenv("SIM_DURATION_S", "300"))
 SIM_REPORT_INTERVAL_S = int(os.getenv("SIM_REPORT_INTERVAL_S", "10"))
 GRAPH_FILE_DEFAULT = os.getenv("GRAPH_FILE", "").strip() or os.getenv("MAPAS_FILE", "").strip() or "sp_cidade.pkl"
 GRAPH_LOCATION_DEFAULT = os.getenv("GRAPH_LOCATION", "").strip() or "Sao Paulo, Sao Paulo, Brazil"
 SIM_RESULTS_DIR = Path(os.getenv("SIM_RESULTS_DIR", str(PROJECT_ROOT / "simulation_results")))
+
+SERVICE_SCALING_ENV_DEFAULTS: dict[str, dict[str, str | int]] = {
+    SERVICE_NAME: {
+        "min_env": "WORKER_AUTOSCALING_MIN_CAPACITY",
+        "min_default": 2,
+        "desired_env": "WORKER_DESIRED_COUNT",
+        "desired_default": 2,
+    },
+    API_SERVICE_NAME: {
+        "min_env": "API_AUTOSCALING_MIN_CAPACITY",
+        "min_default": 2,
+        "desired_env": "API_DESIRED_COUNT",
+        "desired_default": 2,
+    },
+    LOCATION_SERVICE_NAME: {
+        "min_env": "LOCATION_AUTOSCALING_MIN_CAPACITY",
+        "min_default": 1,
+        "desired_env": "LOCATION_DESIRED_COUNT",
+        "desired_default": 1,
+    },
+}
+
+SERVICE_ALB_TARGETS: dict[str, tuple[str, str]] = {
+    SERVICE_NAME: (LOAD_BALANCER_NAME, TARGET_GROUP_NAME),
+    API_SERVICE_NAME: (API_LOAD_BALANCER_NAME, API_TARGET_GROUP_NAME),
+    LOCATION_SERVICE_NAME: (LOCATION_LOAD_BALANCER_NAME, LOCATION_TARGET_GROUP_NAME),
+}
+
+SERVICE_AUTOSCALING_POLICY_DEFAULTS: dict[str, dict[str, str | int | float]] = {
+    SERVICE_NAME: {
+        "max_env": "WORKER_AUTOSCALING_MAX_CAPACITY",
+        "max_default": 18,
+        "request_target_env": "WORKER_REQUEST_TARGET",
+        "request_target_default": 180.0,
+        "scale_out_cooldown_env": "WORKER_SCALE_OUT_COOLDOWN",
+        "scale_out_cooldown_default": 12,
+        "scale_in_cooldown_env": "WORKER_SCALE_IN_COOLDOWN",
+        "scale_in_cooldown_default": 180,
+        "request_scale_out_step_env": "WORKER_REQUEST_SCALE_OUT_STEP",
+        "request_scale_out_step_default": 2,
+        "request_scale_in_step_env": "WORKER_REQUEST_SCALE_IN_STEP",
+        "request_scale_in_step_default": 1,
+        "request_alarm_period_env": "WORKER_REQUEST_ALARM_PERIOD_SECONDS",
+        "request_alarm_period_default": 15,
+        "request_alarm_evals_env": "WORKER_REQUEST_ALARM_EVALUATION_PERIODS",
+        "request_alarm_evals_default": 1,
+        "request_scale_out_multiplier_env": "WORKER_REQUEST_SCALE_OUT_MULTIPLIER",
+        "request_scale_out_multiplier_default": 1.02,
+        "request_scale_in_multiplier_env": "WORKER_REQUEST_SCALE_IN_MULTIPLIER",
+        "request_scale_in_multiplier_default": 0.75,
+    },
+    API_SERVICE_NAME: {
+        "max_env": "API_AUTOSCALING_MAX_CAPACITY",
+        "max_default": 14,
+        "request_target_env": "API_REQUEST_TARGET",
+        "request_target_default": 220.0,
+        "scale_out_cooldown_env": "API_SCALE_OUT_COOLDOWN",
+        "scale_out_cooldown_default": 12,
+        "scale_in_cooldown_env": "API_SCALE_IN_COOLDOWN",
+        "scale_in_cooldown_default": 180,
+        "request_scale_out_step_env": "API_REQUEST_SCALE_OUT_STEP",
+        "request_scale_out_step_default": 2,
+        "request_scale_in_step_env": "API_REQUEST_SCALE_IN_STEP",
+        "request_scale_in_step_default": 1,
+        "request_alarm_period_env": "API_REQUEST_ALARM_PERIOD_SECONDS",
+        "request_alarm_period_default": 15,
+        "request_alarm_evals_env": "API_REQUEST_ALARM_EVALUATION_PERIODS",
+        "request_alarm_evals_default": 1,
+        "request_scale_out_multiplier_env": "API_REQUEST_SCALE_OUT_MULTIPLIER",
+        "request_scale_out_multiplier_default": 1.02,
+        "request_scale_in_multiplier_env": "API_REQUEST_SCALE_IN_MULTIPLIER",
+        "request_scale_in_multiplier_default": 0.75,
+    },
+    LOCATION_SERVICE_NAME: {
+        "max_env": "LOCATION_AUTOSCALING_MAX_CAPACITY",
+        "max_default": 10,
+        "request_target_env": "LOCATION_REQUEST_TARGET",
+        "request_target_default": 180.0,
+        "scale_out_cooldown_env": "LOCATION_SCALE_OUT_COOLDOWN",
+        "scale_out_cooldown_default": 12,
+        "scale_in_cooldown_env": "LOCATION_SCALE_IN_COOLDOWN",
+        "scale_in_cooldown_default": 180,
+        "request_scale_out_step_env": "LOCATION_REQUEST_SCALE_OUT_STEP",
+        "request_scale_out_step_default": 2,
+        "request_scale_in_step_env": "LOCATION_REQUEST_SCALE_IN_STEP",
+        "request_scale_in_step_default": 1,
+        "request_alarm_period_env": "LOCATION_REQUEST_ALARM_PERIOD_SECONDS",
+        "request_alarm_period_default": 15,
+        "request_alarm_evals_env": "LOCATION_REQUEST_ALARM_EVALUATION_PERIODS",
+        "request_alarm_evals_default": 1,
+        "request_scale_out_multiplier_env": "LOCATION_REQUEST_SCALE_OUT_MULTIPLIER",
+        "request_scale_out_multiplier_default": 1.02,
+        "request_scale_in_multiplier_env": "LOCATION_REQUEST_SCALE_IN_MULTIPLIER",
+        "request_scale_in_multiplier_default": 0.75,
+    },
+}
+
+
+def resolve_configured_min_capacity(service_name: str) -> int:
+    defaults = SERVICE_SCALING_ENV_DEFAULTS.get(service_name)
+    if not defaults:
+        return 1
+    return read_int_env(str(defaults["min_env"]), int(defaults["min_default"]), minimum=1)
+
+
+def resolve_configured_desired_count(service_name: str) -> int:
+    defaults = SERVICE_SCALING_ENV_DEFAULTS.get(service_name)
+    if not defaults:
+        return 1
+
+    min_capacity = resolve_configured_min_capacity(service_name)
+    desired = read_int_env(str(defaults["desired_env"]), int(defaults["desired_default"]), minimum=1)
+    return max(min_capacity, desired)
+
+
+def resolve_autoscaling_policy_for_service(service_name: str) -> dict[str, int | float]:
+    defaults = SERVICE_AUTOSCALING_POLICY_DEFAULTS.get(service_name)
+    if not defaults:
+        raise ValueError(f"Servico sem defaults de autoscaling: {service_name}")
+
+    min_capacity = resolve_configured_min_capacity(service_name)
+    max_capacity = read_int_env(
+        str(defaults["max_env"]),
+        int(defaults["max_default"]),
+        minimum=min_capacity,
+    )
+
+    return {
+        "min_capacity": min_capacity,
+        "max_capacity": max_capacity,
+        "request_target": read_float_env(
+            str(defaults["request_target_env"]),
+            float(defaults["request_target_default"]),
+            minimum=1.0,
+        ),
+        "scale_out_cooldown": read_int_env(
+            str(defaults["scale_out_cooldown_env"]),
+            int(defaults["scale_out_cooldown_default"]),
+            minimum=5,
+        ),
+        "scale_in_cooldown": read_int_env(
+            str(defaults["scale_in_cooldown_env"]),
+            int(defaults["scale_in_cooldown_default"]),
+            minimum=30,
+        ),
+        "request_scale_out_step": read_int_env(
+            str(defaults["request_scale_out_step_env"]),
+            int(defaults["request_scale_out_step_default"]),
+            minimum=1,
+        ),
+        "request_scale_in_step": read_int_env(
+            str(defaults["request_scale_in_step_env"]),
+            int(defaults["request_scale_in_step_default"]),
+            minimum=1,
+        ),
+        "request_alarm_period_seconds": read_int_env(
+            str(defaults["request_alarm_period_env"]),
+            int(defaults["request_alarm_period_default"]),
+            minimum=15,
+        ),
+        "request_alarm_evaluation_periods": read_int_env(
+            str(defaults["request_alarm_evals_env"]),
+            int(defaults["request_alarm_evals_default"]),
+            minimum=1,
+        ),
+        "request_scale_out_multiplier": read_float_env(
+            str(defaults["request_scale_out_multiplier_env"]),
+            float(defaults["request_scale_out_multiplier_default"]),
+            minimum=1.01,
+        ),
+        "request_scale_in_multiplier": read_float_env(
+            str(defaults["request_scale_in_multiplier_env"]),
+            float(defaults["request_scale_in_multiplier_default"]),
+            minimum=0.1,
+        ),
+    }
+
+
+def reapply_autoscaling_policies_for_simulation(service_names: list[str]) -> None:
+    requested = [name for name in service_names if name in SERVICE_ALB_TARGETS]
+    if not requested:
+        return
+
+    autoscaling = boto3.client("application-autoscaling", region_name=REGION)
+    cloudwatch = boto3.client("cloudwatch", region_name=REGION)
+    elbv2 = boto3.client("elbv2", region_name=REGION)
+
+    for service_name in requested:
+        load_balancer_name, target_group_name = SERVICE_ALB_TARGETS[service_name]
+        lb_arn = elbv2.describe_load_balancers(Names=[load_balancer_name])["LoadBalancers"][0]["LoadBalancerArn"]
+        tg_arn = elbv2.describe_target_groups(Names=[target_group_name])["TargetGroups"][0]["TargetGroupArn"]
+        resource_label = create_infra.build_alb_resource_label(lb_arn, tg_arn)
+        policy = resolve_autoscaling_policy_for_service(service_name)
+
+        create_infra.ensure_service_autoscaling(
+            autoscaling=autoscaling,
+            cluster_name=CLUSTER_NAME,
+            service_name=service_name,
+            resource_label=resource_label,
+            cloudwatch=cloudwatch,
+            min_capacity=int(policy["min_capacity"]),
+            max_capacity=int(policy["max_capacity"]),
+            request_target=float(policy["request_target"]),
+            cpu_target=70.0,
+            memory_target=75.0,
+            scale_out_cooldown=int(policy["scale_out_cooldown"]),
+            scale_in_cooldown=int(policy["scale_in_cooldown"]),
+            request_scale_out_step=int(policy["request_scale_out_step"]),
+            request_scale_in_step=int(policy["request_scale_in_step"]),
+            request_alarm_period_seconds=int(policy["request_alarm_period_seconds"]),
+            request_alarm_evaluation_periods=int(policy["request_alarm_evaluation_periods"]),
+            request_scale_out_multiplier=float(policy["request_scale_out_multiplier"]),
+            request_scale_in_multiplier=float(policy["request_scale_in_multiplier"]),
+        )
+
+        high_threshold = float(policy["request_target"]) * float(policy["request_scale_out_multiplier"])
+        low_threshold = float(policy["request_target"]) * float(policy["request_scale_in_multiplier"])
+        log(
+            f"Autoscaling atualizado ({service_name}): min={policy['min_capacity']} max={policy['max_capacity']} "
+            f"req_target={policy['request_target']:.1f} high={high_threshold:.1f} low={low_threshold:.1f} "
+            f"cooldown_out={policy['scale_out_cooldown']} cooldown_in={policy['scale_in_cooldown']}"
+        )
 
 
 def ensure_results_csv(
@@ -513,9 +751,16 @@ def run_simulation(
     delivery_process = None
     autoscaling_restored = False
     autoscaling_restore_lock = threading.Lock()
+    minimum_sim_duration_seconds = read_int_env("SIM_MIN_DURATION_SECONDS", 300, minimum=60)
+    effective_sim_duration_s = max(int(sim_duration_s), minimum_sim_duration_seconds)
+    if effective_sim_duration_s != int(sim_duration_s):
+        log(
+            "Simulacao: duracao ajustada para garantir janela de autoscaling "
+            f"({sim_duration_s}s -> {effective_sim_duration_s}s)"
+        )
 
     def compute_warmup_seconds(duration_seconds: int) -> int:
-        configured_warmup = max(0, int(os.getenv("SIM_WARMUP_SECONDS", "180")))
+        configured_warmup = max(0, int(os.getenv("SIM_WARMUP_SECONDS", "20")))
         return max(0, min(max(0, int(duration_seconds) - 30), configured_warmup))
 
     def restore_autoscaling_once(reason: str) -> None:
@@ -612,11 +857,11 @@ def run_simulation(
         time.sleep(3)
 
         timestamp_suffix = datetime.now().strftime("%Y%m%d_%H%M%S")
-        csv_file_name = f"sim_rps{rps}_users{num_users}_dur{sim_duration_s}_{timestamp_suffix}.csv"
+        csv_file_name = f"sim_rps{rps}_users{num_users}_dur{effective_sim_duration_s}_{timestamp_suffix}.csv"
         csv_path = SIM_RESULTS_DIR / csv_file_name
 
         log(f"Simulacao: resultados serao salvos em {csv_path}")
-        log(f"Simulacao: load test {rps} RPS por {sim_duration_s}s")
+        log(f"Simulacao: load test {rps} RPS por {effective_sim_duration_s}s")
         metrics_path = f"/tmp/dijkfood_sim_metrics_{int(time.time())}.json"
         ecs = boto3.client("ecs", region_name=REGION)
         stop_event = threading.Event()
@@ -636,7 +881,8 @@ def run_simulation(
         restore_thread = None
         try:
             if autoscaling_restore_state:
-                restore_delay_seconds = compute_warmup_seconds(sim_duration_s) + max(
+                warmup_seconds = compute_warmup_seconds(effective_sim_duration_s)
+                restore_delay_seconds = warmup_seconds + max(
                     0,
                     int(os.getenv("SIM_AUTOSCALING_RESTORE_DELAY_SECONDS", "0")),
                 )
@@ -658,18 +904,27 @@ def run_simulation(
                     restore_thread = threading.Thread(target=delayed_restore, daemon=True)
                     restore_thread.start()
 
+            max_in_flight_writes = min(1200, max(220, rps * 6))
+            max_in_flight_reads = min(600, max(100, rps * 3))
+            http_conn_limit = min(1600, max(220, rps * 8))
+            http_conn_limit_per_host = min(1200, max(140, rps * 6))
+            sim_warmup_seconds = compute_warmup_seconds(effective_sim_duration_s)
+
             run_python_script(
                 PROJECT_ROOT / "local" / "sim_client.py",
-                ["--api-url", base_url, "--rps", str(rps), "--duration", str(sim_duration_s)],
+                ["--api-url", base_url, "--rps", str(rps), "--duration", str(effective_sim_duration_s)],
                 env={
                     **auth_env,
                     "SIM_METRICS_PATH": metrics_path,
                     "SIM_REPORT_INTERVAL_S": str(SIM_REPORT_INTERVAL_S),
-                    "SIM_MAX_IN_FLIGHT_WRITES": str(max(120, rps * 3)),
-                    "SIM_MAX_IN_FLIGHT_READS": str(max(60, rps * 2)),
+                    "SIM_WARMUP_SECONDS": str(sim_warmup_seconds),
+                    "SIM_MAX_IN_FLIGHT_WRITES": str(max_in_flight_writes),
+                    "SIM_MAX_IN_FLIGHT_READS": str(max_in_flight_reads),
+                    "SIM_HTTP_CONN_LIMIT": str(http_conn_limit),
+                    "SIM_HTTP_CONN_LIMIT_PER_HOST": str(http_conn_limit_per_host),
                     "SIM_API_PAGE_SIZE": "100",
                 },
-                timeout_seconds=sim_duration_s + 300,
+                timeout_seconds=effective_sim_duration_s + 300,
             )
         finally:
             stop_event.set()
@@ -722,6 +977,9 @@ def ensure_graph_in_s3(bucket_name: str, graph_file: str, graph_location: str) -
 
 def run_deployment(execution_role_arn: str, bucket_name: str) -> None:
     serial_rollout = env_flag("DEPLOY_SERIAL_ROLLOUT", default=False)
+
+    log("Deploy ECS: garantindo service-linked role do ECS")
+    create_infra.ensure_ecs_service_linked_role(REGION)
 
     log("Deploy dados: garantindo bucket S3")
     create_data.setup_s3_bucket(bucket_name)
@@ -1051,24 +1309,17 @@ def wait_for_ecs_service_stable(service_name: str) -> None:
 
 
 def resolve_min_capacities_for_services(service_names: list[str]) -> dict[str, int]:
-    autoscaling = boto3.client("application-autoscaling", region_name=REGION)
-    resource_ids = [f"service/{CLUSTER_NAME}/{name}" for name in service_names]
-    response = autoscaling.describe_scalable_targets(
-        ServiceNamespace="ecs",
-        ResourceIds=resource_ids,
-        ScalableDimension="ecs:service:DesiredCount",
-    )
+    return {
+        service_name: resolve_configured_min_capacity(service_name)
+        for service_name in service_names
+    }
 
-    min_by_service: dict[str, int] = {}
-    for target in response.get("ScalableTargets", []):
-        resource_id = str(target.get("ResourceId", ""))
-        parts = resource_id.split("/")
-        if len(parts) != 3:
-            continue
-        service_name = parts[2]
-        min_by_service[service_name] = int(target.get("MinCapacity", 1))
 
-    return min_by_service
+def resolve_desired_counts_for_services(service_names: list[str]) -> dict[str, int]:
+    return {
+        service_name: resolve_configured_desired_count(service_name)
+        for service_name in service_names
+    }
 
 
 def snapshot_autoscaling_suspension_state(service_names: list[str]) -> dict[str, dict[str, bool]]:
@@ -1146,70 +1397,83 @@ def enforce_clean_start_for_simulation(service_names: list[str]) -> dict[str, di
     poll_seconds = max(3, int(os.getenv("SIM_CLEAN_START_POLL_SECONDS", "10")))
 
     min_by_service = resolve_min_capacities_for_services(service_names)
+    desired_by_service = resolve_desired_counts_for_services(service_names)
+    previous_suspension_state = snapshot_autoscaling_suspension_state(service_names)
     ecs = boto3.client("ecs", region_name=REGION)
     autoscaling = boto3.client("application-autoscaling", region_name=REGION)
-    for service_name in service_names:
-        log(f"Clean start: ajustando {service_name} para min_capacity=4 e desired=4")
-        autoscaling.register_scalable_target(
-            ServiceNamespace="ecs",
-            ResourceId=f"service/{CLUSTER_NAME}/{service_name}",
-            ScalableDimension="ecs:service:DesiredCount",
-            MinCapacity=4,
-        )
-        ecs.update_service(
-            cluster=CLUSTER_NAME,
-            service=service_name,
-            desiredCount=4,
-        )
+    set_autoscaling_suspension_state(service_names, suspended=True)
 
-    started_at = time.time()
-    deadline = started_at + timeout_seconds
-
-    while time.time() < deadline:
-        response = ecs.describe_services(cluster=CLUSTER_NAME, services=service_names)
-        services = response.get("services", [])
-        by_name = {str(item.get("serviceName", "")): item for item in services}
-
-        all_clean = True
+    try:
         for service_name in service_names:
-            service = by_name.get(service_name)
-            if not service:
-                all_clean = False
-                log(f"Clean start: {service_name} ainda nao encontrado no describe_services")
-                continue
-
-            desired = int(service.get("desiredCount", 0))
-            running = int(service.get("runningCount", 0))
-            pending = int(service.get("pendingCount", 0))
-            deployments = service.get("deployments", [])
-            in_progress = [item for item in deployments if item.get("rolloutState") != "COMPLETED"]
-
-            clean = (
-                running == desired
-                and pending == 0
-                and len(in_progress) == 0
-                and len(deployments) == 1
+            min_capacity = int(min_by_service.get(service_name, 1))
+            desired_count = int(desired_by_service.get(service_name, min_capacity))
+            log(
+                f"Clean start: ajustando {service_name} para min_capacity={min_capacity} "
+                f"e desired={desired_count}"
+            )
+            autoscaling.register_scalable_target(
+                ServiceNamespace="ecs",
+                ResourceId=f"service/{CLUSTER_NAME}/{service_name}",
+                ScalableDimension="ecs:service:DesiredCount",
+                MinCapacity=min_capacity,
+            )
+            ecs.update_service(
+                cluster=CLUSTER_NAME,
+                service=service_name,
+                desiredCount=desired_count,
             )
 
-            if not clean:
-                all_clean = False
-                rollout_states = [str(item.get("rolloutState") or "UNKNOWN") for item in deployments]
-                log(
-                    f"Clean start aguardando {service_name}: "
-                    f"running={running}/{desired} pending={pending} deployments={len(deployments)} "
-                    f"rollout={rollout_states}"
+        started_at = time.time()
+        deadline = started_at + timeout_seconds
+
+        while time.time() < deadline:
+            response = ecs.describe_services(cluster=CLUSTER_NAME, services=service_names)
+            services = response.get("services", [])
+            by_name = {str(item.get("serviceName", "")): item for item in services}
+
+            all_clean = True
+            for service_name in service_names:
+                service = by_name.get(service_name)
+                if not service:
+                    all_clean = False
+                    log(f"Clean start: {service_name} ainda nao encontrado no describe_services")
+                    continue
+
+                desired = int(service.get("desiredCount", 0))
+                running = int(service.get("runningCount", 0))
+                pending = int(service.get("pendingCount", 0))
+                deployments = service.get("deployments", [])
+                in_progress = [item for item in deployments if item.get("rolloutState") != "COMPLETED"]
+
+                clean = (
+                    running == desired
+                    and pending == 0
+                    and len(in_progress) == 0
+                    and len(deployments) == 1
                 )
 
-        if all_clean:
-            log("Clean start: servicos estabilizados para inicio da simulacao")
-            return {}
+                if not clean:
+                    all_clean = False
+                    rollout_states = [str(item.get("rolloutState") or "UNKNOWN") for item in deployments]
+                    log(
+                        f"Clean start aguardando {service_name}: "
+                        f"running={running}/{desired} pending={pending} deployments={len(deployments)} "
+                        f"rollout={rollout_states}"
+                    )
 
-        time.sleep(poll_seconds)
+            if all_clean:
+                log("Clean start: servicos estabilizados para inicio da simulacao")
+                return previous_suspension_state
 
-    raise TimeoutError(
-        "Clean start nao convergiu no prazo; tente aumentar SIM_CLEAN_START_TIMEOUT_SECONDS "
-        "ou revisar eventos de deployment no ECS."
-    )
+            time.sleep(poll_seconds)
+
+        raise TimeoutError(
+            "Clean start nao convergiu no prazo; tente aumentar SIM_CLEAN_START_TIMEOUT_SECONDS "
+            "ou revisar eventos de deployment no ECS."
+        )
+    except Exception:
+        restore_autoscaling_suspension_state(previous_suspension_state)
+        raise
 
 
 def test_api_service(base_url: str) -> None:
@@ -1229,7 +1493,43 @@ def test_location_service(base_url: str) -> None:
 
 def run_autoscaling_demo(wait_seconds: int) -> None:
     log("Demo autoscaling: exibindo estado dos servicos ECS")
-    autoscaling_demo.main(["--wait-seconds", str(wait_seconds)])
+    autoscaling_demo.main(["--show-only", "--wait-seconds", str(wait_seconds)])
+    debug_alb_request_alarm_states([SERVICE_NAME, API_SERVICE_NAME, LOCATION_SERVICE_NAME])
+
+
+def debug_alb_request_alarm_states(service_names: list[str]) -> None:
+    cloudwatch = boto3.client("cloudwatch", region_name=REGION)
+    alarm_names: list[str] = []
+    for service_name in service_names:
+        alarm_prefix = service_name.replace("/", "-")
+        alarm_names.append(f"{alarm_prefix}-AlbRequestHigh")
+        alarm_names.append(f"{alarm_prefix}-AlbRequestLow")
+
+    if not alarm_names:
+        return
+
+    response = cloudwatch.describe_alarms(AlarmNames=alarm_names)
+    alarms = response.get("MetricAlarms", [])
+    by_name = {str(alarm.get("AlarmName", "")): alarm for alarm in alarms}
+
+    log("Demo autoscaling: estado dos alarmes AlbRequestHigh/Low")
+    for alarm_name in alarm_names:
+        alarm = by_name.get(alarm_name)
+        if not alarm:
+            log(f"  - {alarm_name}: nao encontrado")
+            continue
+
+        state = str(alarm.get("StateValue", "UNKNOWN"))
+        reason = str(alarm.get("StateReason", "sem motivo"))
+        threshold = alarm.get("Threshold")
+        period = alarm.get("Period")
+        eval_periods = alarm.get("EvaluationPeriods")
+        datapoints_to_alarm = alarm.get("DatapointsToAlarm")
+        log(
+            f"  - {alarm_name}: state={state} threshold={threshold} "
+            f"period={period}s evals={eval_periods} dta={datapoints_to_alarm} "
+            f"reason={reason}"
+        )
 
 
 def run_fault_demo(api_base_url: str, worker_base_url: str, location_base_url: str) -> None:
@@ -1392,6 +1692,12 @@ def main(argv=None) -> int:
         api_base_url = f"http://{api_alb_dns}"
         location_base_url = f"http://{location_alb_dns}"
 
+        if env_flag("SIM_REAPPLY_AUTOSCALING_POLICIES", default=True):
+            log("Autoscaling: reaplicando politicas e alarmes antes da simulacao")
+            reapply_autoscaling_policies_for_simulation(
+                [SERVICE_NAME, API_SERVICE_NAME, LOCATION_SERVICE_NAME]
+            )
+
         log("Clean start: preparando baseline confiavel para simulacao")
         autoscaling_restore_state = enforce_clean_start_for_simulation(
             [SERVICE_NAME, API_SERVICE_NAME, LOCATION_SERVICE_NAME]
@@ -1433,6 +1739,9 @@ def main(argv=None) -> int:
         finally:
             if not simulation_started:
                 restore_autoscaling_suspension_state(autoscaling_restore_state)
+
+        if args.with_autoscaling_demo:
+            run_autoscaling_demo(args.autoscaling_wait_seconds)
 
         log("Fim")
         return 0
@@ -1477,6 +1786,12 @@ def main(argv=None) -> int:
     location_base_url = f"http://{location_alb_dns}"
 
     if args.with_simulation:
+        if env_flag("SIM_REAPPLY_AUTOSCALING_POLICIES", default=True):
+            log("Autoscaling: reaplicando politicas e alarmes antes da simulacao")
+            reapply_autoscaling_policies_for_simulation(
+                [SERVICE_NAME, API_SERVICE_NAME, LOCATION_SERVICE_NAME]
+            )
+
         log("Clean start: preparando baseline confiavel para simulacao")
         autoscaling_restore_state = enforce_clean_start_for_simulation(
             [SERVICE_NAME, API_SERVICE_NAME, LOCATION_SERVICE_NAME]
@@ -1593,4 +1908,8 @@ def main(argv=None) -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except KeyboardInterrupt:
+        log("Execucao interrompida pelo usuario.")
+        raise SystemExit(130)

@@ -22,6 +22,8 @@ API_PASSWORD_ENV = "API_PASSWORD"
 DEFAULT_TOTAL_TIMEOUT_S = float(os.getenv("SIM_HTTP_TOTAL_TIMEOUT", "10"))
 DEFAULT_CONNECT_TIMEOUT_S = float(os.getenv("SIM_HTTP_CONNECT_TIMEOUT", "3"))
 DEFAULT_SOCK_READ_TIMEOUT_S = float(os.getenv("SIM_HTTP_SOCK_READ_TIMEOUT", "5"))
+WRITE_TASK_TIMEOUT_S = float(os.getenv("SIM_WRITE_TASK_TIMEOUT", "2.5"))
+SKIP_ORDER_TRANSITIONS = str(os.getenv("SIM_SKIP_ORDER_TRANSITIONS", "false")).strip().lower() in {"1", "true", "yes", "on"}
 
 DEFAULT_CONN_LIMIT = int(os.getenv("SIM_HTTP_CONN_LIMIT", "100"))
 DEFAULT_CONN_LIMIT_PER_HOST = int(os.getenv("SIM_HTTP_CONN_LIMIT_PER_HOST", "50"))
@@ -30,6 +32,7 @@ REPORT_INTERVAL_S = int(os.getenv("SIM_REPORT_INTERVAL_S", "30"))
 METRICS_PATH = os.getenv("SIM_METRICS_PATH", "/tmp/dijkfood_sim_client_metrics.json")
 WARMUP_SECONDS_DEFAULT = int(os.getenv("SIM_WARMUP_SECONDS", "180"))
 WINDOW_SECONDS = max(5, int(os.getenv("SIM_WINDOW_SECONDS", "30")))
+STEADY_START_SECONDS_DEFAULT = int(os.getenv("SIM_STEADY_START_SECONDS", "120"))
 
 
 _STATUS_ORDER = {
@@ -180,7 +183,7 @@ async def place_order(
         order_id = int(result.get("id", result.get("order_id", 0)) or 0)
         write_latency = time.perf_counter() - start_time
 
-        if order_id:
+        if (not SKIP_ORDER_TRANSITIONS) and order_id:
             transitioned, transition_error = await transition_order_for_dispatch(
                 session,
                 api_url,
@@ -193,6 +196,22 @@ async def place_order(
         return write_latency, order_id, customer_id, None
     except Exception as error:
         return None, None, None, classify_exception(error)
+
+
+async def place_order_with_timeout(
+    session: aiohttp.ClientSession,
+    api_url: str,
+    customer_id: int,
+    merchant_id: int,
+    default_item_id: int,
+) -> tuple[float | None, int | None, int | None, str | None]:
+    try:
+        return await asyncio.wait_for(
+            place_order(session, api_url, customer_id, merchant_id, default_item_id),
+            timeout=max(0.1, WRITE_TASK_TIMEOUT_S),
+        )
+    except asyncio.TimeoutError:
+        return None, None, None, "timeout_fast"
 
 
 async def check_order_status(
@@ -266,13 +285,30 @@ async def run_load_test(
     offered_writes_warmup = 0
     dropped_writes_backpressure = 0
     dropped_writes_backpressure_warmup = 0
+    stalled_writes_backpressure = 0
+    stalled_writes_backpressure_warmup = 0
     write_failure_reasons: Counter[str] = Counter()
     test_start = time.perf_counter()
     last_report = test_start
     deadline = test_start + max(0, int(duration))
-    warmup_seconds = max(0, min(max(0, int(duration) - 30), WARMUP_SECONDS_DEFAULT))
+    warmup_seconds = max(0, min(max(0, int(duration) - 30), STEADY_START_SECONDS_DEFAULT))
     warmup_deadline = test_start + warmup_seconds
-    write_interval = 1.0 / max(1, orders_per_second)
+    ramp_step_seconds = _read_positive_int_env("SIM_RAMP_STEP_SECONDS", 10)
+    ramp_step_rps = _read_positive_int_env("SIM_RAMP_STEP_RPS", 5)
+    ramp_max_seconds = _read_positive_int_env(
+        "SIM_RAMP_MAX_SECONDS",
+        max(ramp_step_seconds, ((max(1, orders_per_second) + ramp_step_rps - 1) // ramp_step_rps) * ramp_step_seconds),
+    )
+
+    def target_rps_at_elapsed(elapsed_seconds: float) -> int:
+        if orders_per_second <= 1:
+            return 1
+        if elapsed_seconds >= ramp_max_seconds:
+            return max(1, orders_per_second)
+        step_index = int(max(0.0, elapsed_seconds) // max(1, ramp_step_seconds)) + 1
+        return max(1, min(orders_per_second, step_index * max(1, ramp_step_rps)))
+
+    write_interval = 1.0 / max(1, target_rps_at_elapsed(0.0))
     next_write_at = test_start
     writes_since_last_read = 0
 
@@ -297,15 +333,24 @@ async def run_load_test(
 
     max_in_flight_writes = _read_positive_int_env(
         "SIM_MAX_IN_FLIGHT_WRITES",
-        max(orders_per_second * 4, DEFAULT_CONN_LIMIT_PER_HOST * 2),
+        max(orders_per_second * 20, DEFAULT_CONN_LIMIT_PER_HOST * 8, 400),
     )
     max_in_flight_reads = _read_positive_int_env(
         "SIM_MAX_IN_FLIGHT_READS",
-        max(20, DEFAULT_CONN_LIMIT_PER_HOST),
+        max(60, orders_per_second * 2),
     )
+    max_write_backlog = _read_positive_int_env(
+        "SIM_MAX_WRITE_BACKLOG",
+        max(max_in_flight_writes * 20, orders_per_second * 180),
+    )
+    backpressure_mode = str(os.getenv("SIM_BACKPRESSURE_MODE", "stall")).strip().lower()
+    drop_on_backpressure = backpressure_mode in {"drop", "discard"}
     drain_grace_seconds = float(os.getenv("SIM_DRAIN_GRACE_SECONDS", "20"))
+    pending_write_schedule: deque[tuple[float, bool]] = deque()
 
-    connector = aiohttp.TCPConnector(limit=DEFAULT_CONN_LIMIT, limit_per_host=DEFAULT_CONN_LIMIT_PER_HOST)
+    connector_limit = min(4000, max(DEFAULT_CONN_LIMIT, max_in_flight_writes + max_in_flight_reads))
+    connector_limit_per_host = min(3000, max(DEFAULT_CONN_LIMIT_PER_HOST, max_in_flight_writes))
+    connector = aiohttp.TCPConnector(limit=connector_limit, limit_per_host=connector_limit_per_host)
     timeout = aiohttp.ClientTimeout(
         total=DEFAULT_TOTAL_TIMEOUT_S,
         connect=DEFAULT_CONNECT_TIMEOUT_S,
@@ -415,11 +460,13 @@ async def run_load_test(
             "write_offered": offered_writes,
             "write_attempts": write_attempts,
             "write_dropped_backpressure": dropped_writes_backpressure,
+            "write_stalled_backpressure": stalled_writes_backpressure,
             "write_success": successful_writes,
             "read_attempts": read_attempts,
             "read_success": successful_reads,
             "in_flight_writes": len(pending_write_tasks),
             "in_flight_reads": len(pending_read_tasks),
+            "write_backlog": len(pending_write_schedule),
             "effective_write_rps": effective_write_rps,
             "effective_read_rps": effective_read_rps,
             "window_seconds": WINDOW_SECONDS,
@@ -457,10 +504,12 @@ async def run_load_test(
         print(
             f"[sim_client] {int(total_elapsed)}/{duration}s "
             f"phase={'steady_state' if now_inner >= warmup_deadline else 'warmup'} "
+            f"target_now={target_rps_at_elapsed(total_elapsed)} "
             f"tasks_ok={successful_writes}/{write_attempts} "
             f"window_ok={len(write_success_events)}/{len(write_attempt_events)} "
             f"offered={offered_writes} drop_bp={dropped_writes_backpressure} "
-            f"inflight_w={len(pending_write_tasks)} "
+            f"stall_bp={stalled_writes_backpressure} "
+            f"inflight_w={len(pending_write_tasks)} backlog_w={len(pending_write_schedule)} "
             f"RPS={effective_write_rps:.2f} "
             f"RPS_{WINDOW_SECONDS}s={effective_write_rps_window:.2f} "
             f"P95_write_ms={(f'{p95_write_ms:.2f}' if p95_write_ms is not None else 'NA')} "
@@ -482,20 +531,32 @@ async def run_load_test(
             max_burst = max(1, orders_per_second)
             while now >= next_write_at and now < deadline and scheduled_now < max_burst:
                 offered_writes += 1
-                if next_write_at < warmup_deadline:
+                is_steady_offer = next_write_at >= warmup_deadline
+                if not is_steady_offer:
                     offered_writes_warmup += 1
 
-                if len(pending_write_tasks) >= max_in_flight_writes:
-                    dropped_writes_backpressure += 1
-                    if next_write_at < warmup_deadline:
-                        dropped_writes_backpressure_warmup += 1
-                    next_write_at += write_interval
-                    scheduled_now += 1
-                    now = time.perf_counter()
-                    continue
+                if len(pending_write_schedule) >= max_write_backlog:
+                    if drop_on_backpressure:
+                        dropped_writes_backpressure += 1
+                        if not is_steady_offer:
+                            dropped_writes_backpressure_warmup += 1
+                    else:
+                        stalled_writes_backpressure += 1
+                        if not is_steady_offer:
+                            stalled_writes_backpressure_warmup += 1
+                else:
+                    pending_write_schedule.append((next_write_at, is_steady_offer))
 
+                elapsed_for_offer = max(0.0, next_write_at - test_start)
+                rps_now = target_rps_at_elapsed(elapsed_for_offer)
+                next_write_at += 1.0 / max(1, rps_now)
+                scheduled_now += 1
+                now = time.perf_counter()
+
+            while pending_write_schedule and len(pending_write_tasks) < max_in_flight_writes:
+                scheduled_at, is_steady_attempt = pending_write_schedule.popleft()
                 write_task = asyncio.create_task(
-                    place_order(
+                    place_order_with_timeout(
                         session,
                         api_url,
                         random.choice(customers),
@@ -504,10 +565,10 @@ async def run_load_test(
                     )
                 )
                 pending_write_tasks.add(write_task)
-                write_task_is_steady[write_task] = next_write_at >= warmup_deadline
+                write_task_is_steady[write_task] = is_steady_attempt
                 write_attempts += 1
-                write_attempt_events.append(next_write_at)
-                if next_write_at >= warmup_deadline:
+                write_attempt_events.append(scheduled_at)
+                if is_steady_attempt:
                     write_attempts_steady += 1
                 writes_since_last_read += 1
 
@@ -517,16 +578,12 @@ async def run_load_test(
                         check_order_status(session, api_url, order_id, owner_customer_id)
                     )
                     pending_read_tasks.add(read_task)
-                    read_task_is_steady[read_task] = next_write_at >= warmup_deadline
+                    read_task_is_steady[read_task] = is_steady_attempt
                     read_attempts += 1
-                    read_attempt_events.append(next_write_at)
-                    if next_write_at >= warmup_deadline:
+                    read_attempt_events.append(scheduled_at)
+                    if is_steady_attempt:
                         read_attempts_steady += 1
                     writes_since_last_read = 0
-
-                next_write_at += write_interval
-                scheduled_now += 1
-                now = time.perf_counter()
 
             pending_all = pending_write_tasks | pending_read_tasks
             wait_timeout = max(0.0, min(0.05, next_write_at - time.perf_counter()))
@@ -541,11 +598,34 @@ async def run_load_test(
 
         # Dá um tempo curto para concluir respostas em voo antes de finalizar as métricas.
         drain_deadline = time.perf_counter() + max(1.0, drain_grace_seconds)
-        while (pending_write_tasks or pending_read_tasks) and time.perf_counter() < drain_deadline:
+        while (pending_write_tasks or pending_read_tasks or pending_write_schedule) and time.perf_counter() < drain_deadline:
+            while pending_write_schedule and len(pending_write_tasks) < max_in_flight_writes:
+                scheduled_at, is_steady_attempt = pending_write_schedule.popleft()
+                write_task = asyncio.create_task(
+                    place_order_with_timeout(
+                        session,
+                        api_url,
+                        random.choice(customers),
+                        random.choice(merchants),
+                        default_item_id,
+                    )
+                )
+                pending_write_tasks.add(write_task)
+                write_task_is_steady[write_task] = is_steady_attempt
+                write_attempts += 1
+                write_attempt_events.append(scheduled_at)
+                if is_steady_attempt:
+                    write_attempts_steady += 1
+
             pending_all = pending_write_tasks | pending_read_tasks
+            if not pending_all:
+                await asyncio.sleep(0.05)
+                continue
             done, _ = await asyncio.wait(pending_all, timeout=0.5, return_when=asyncio.FIRST_COMPLETED)
             if done:
                 process_done_tasks(done)
+
+        pending_write_schedule.clear()
 
         # Evita deixar tarefas órfãs quando o backend está muito lento ou indisponível.
         pending_remaining = pending_write_tasks | pending_read_tasks
@@ -566,9 +646,14 @@ async def run_load_test(
     effective_read_rps_steady = (successful_reads_steady / elapsed_steady) if elapsed_steady > 0 else None
     offered_writes_steady = max(0, offered_writes - offered_writes_warmup)
     dropped_writes_backpressure_steady = max(0, dropped_writes_backpressure - dropped_writes_backpressure_warmup)
+    stalled_writes_backpressure_steady = max(0, stalled_writes_backpressure - stalled_writes_backpressure_warmup)
 
     print(f"\n--- Resumo de Throughput ({orders_per_second} pedidos/s alvo) ---")
-    print(f"Escritas oferecidas: {offered_writes} | descartadas por backpressure: {dropped_writes_backpressure}")
+    print(
+        "Escritas oferecidas: "
+        f"{offered_writes} | descartadas por backpressure: {dropped_writes_backpressure} "
+        f"| pausas por backpressure: {stalled_writes_backpressure}"
+    )
     print(f"Escritas: {successful_writes}/{write_attempts} sucesso | RPS efetivo: {effective_write_rps:.2f}")
     if write_failure_reasons:
         top_failures = ", ".join(f"{reason}={count}" for reason, count in write_failure_reasons.most_common(5))
@@ -581,7 +666,8 @@ async def run_load_test(
     print(f"\n--- Resumo Steady-State (apos warmup de {warmup_seconds}s) ---")
     print(
         "Escritas oferecidas (steady): "
-        f"{offered_writes_steady} | descartadas por backpressure: {dropped_writes_backpressure_steady}"
+        f"{offered_writes_steady} | descartadas por backpressure: {dropped_writes_backpressure_steady} "
+        f"| pausas por backpressure: {stalled_writes_backpressure_steady}"
     )
     print(
         f"Escritas (steady): {successful_writes_steady}/{write_attempts_steady} sucesso | "
@@ -667,4 +753,8 @@ if __name__ == "__main__":
         parser.error(f"--api-url é obrigatório (ou defina {API_URL_ENV}).")
 
     # Passa o controle para a função principal assíncrona
-    asyncio.run(main(args))
+    try:
+        asyncio.run(main(args))
+    except KeyboardInterrupt:
+        print("[sim_client] Execução interrompida pelo usuário.")
+        raise SystemExit(130)
