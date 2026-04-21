@@ -1,4 +1,6 @@
+from collections import Counter
 import json
+import os
 import socket
 import time
 from typing import Callable
@@ -64,6 +66,10 @@ def wait_for_dns_resolution(hostname: str, log: Callable[[str], None] | None = N
 
 
 def wait_for_healthy_targets(elbv2, target_group_name: str, log: Callable[[str], None] | None = None):
+    timeout_seconds = max(60, int(os.getenv("TARGET_HEALTH_TIMEOUT_SECONDS", "600")))
+    poll_seconds = max(3, int(os.getenv("TARGET_HEALTH_POLL_SECONDS", "8")))
+    minimum_healthy = max(1, int(os.getenv("TARGET_HEALTH_MIN_COUNT", "1")))
+
     target_groups = elbv2.describe_target_groups(Names=[target_group_name]).get("TargetGroups", [])
     if not target_groups:
         raise TimeoutError(f"Target group {target_group_name} nao encontrado")
@@ -74,17 +80,26 @@ def wait_for_healthy_targets(elbv2, target_group_name: str, log: Callable[[str],
             item.get("TargetHealth", {}).get("State")
             for item in elbv2.describe_target_health(TargetGroupArn=tg_arn).get("TargetHealthDescriptions", [])
         ]
-        if any(state == "healthy" for state in states):
+        healthy_count = sum(1 for state in states if state == "healthy")
+        if healthy_count >= minimum_healthy:
             return True
         if log:
-            log("Aguardando targets healthy")
+            counts = Counter(state or "unknown" for state in states)
+            summary = ", ".join(f"{state}:{count}" for state, count in sorted(counts.items())) or "sem-targets"
+            log(
+                "Aguardando targets healthy "
+                f"({healthy_count}/{minimum_healthy}) estados=[{summary}]"
+            )
         return False
 
     wait_until(
         has_healthy_target,
-        timeout_seconds=900,
-        poll_seconds=10,
-        timeout_message="Nenhum target ficou healthy dentro do prazo",
+        timeout_seconds=timeout_seconds,
+        poll_seconds=poll_seconds,
+        timeout_message=(
+            "Nao houve targets healthy suficientes dentro do prazo "
+            f"(minimo={minimum_healthy})"
+        ),
         log=log,
     )
 

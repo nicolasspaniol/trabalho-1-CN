@@ -29,6 +29,14 @@ def get_session():
 
 session = get_session()
 
+
+def should_use_multi_az() -> bool:
+    return os.getenv("DB_MULTI_AZ", "true").strip().lower() not in {"0", "false", "no"}
+
+
+def resolve_db_instance_class() -> str:
+    return os.getenv("DB_INSTANCE_CLASS", "db.t3.small").strip() or "db.t3.small"
+
 # SECURITY GROUP
 def setup_security_group(name):
     ec2 = session.client('ec2')
@@ -73,12 +81,14 @@ def fetch_and_store_graph(location_query: str, local_filename: str, s3_bucket: s
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Extração de Grafo Viário para S3")
+    default_location = os.getenv("GRAPH_LOCATION", "").strip() or "Sao Paulo, Sao Paulo, Brazil"
+    default_file = os.getenv("GRAPH_FILE", "").strip() or os.getenv("MAPAS_FILE", "").strip() or "sp_cidade.pkl"
     parser.add_argument("--bucket", required=True, help="Nome do bucket S3 de destino")
     parser.add_argument(
-        "--location", default="Alto de Pinheiros, São Paulo, Brazil", help="Região alvo"
+        "--location", default=default_location, help="Região alvo"
     )
     parser.add_argument(
-        "--file", default="sp_altodepinheiros.pkl", help="Nome do arquivo local"
+        "--file", default=default_file, help="Nome do arquivo local"
     )
     args = parser.parse_args()
 
@@ -135,18 +145,21 @@ def setup_rds(db_instance_id, sg_id):
     """
     rds = session.client('rds')
     db_password = require_db_password()
+    desired_multi_az = should_use_multi_az()
+    desired_instance_class = resolve_db_instance_class()
     
     print(f"🐘 Provisionando instância RDS: {db_instance_id}...")
     try:
         rds.create_db_instance(
             DBInstanceIdentifier=db_instance_id,
             AllocatedStorage=20,
-            DBInstanceClass='db.t3.micro',
+            DBInstanceClass=desired_instance_class,
             Engine='postgres',
             MasterUsername='postgres',
             MasterUserPassword=db_password,
             VpcSecurityGroupIds=[sg_id],
-            PubliclyAccessible=True
+            PubliclyAccessible=True,
+            MultiAZ=desired_multi_az,
         )
         print("⏳ Aguardando RDS ficar disponível (aprox. 10 min)...")
         # O programa "trava" aqui propositalmente até o banco ligar
@@ -161,7 +174,42 @@ def setup_rds(db_instance_id, sg_id):
     except rds.exceptions.DBInstanceAlreadyExistsFault:
         print(f"ℹ️ Instância {db_instance_id} já existe. Recuperando endpoint...")
         desc = rds.describe_db_instances(DBInstanceIdentifier=db_instance_id)
-        return desc['DBInstances'][0]['Endpoint']['Address']
+        db_instance = desc['DBInstances'][0]
+        current_multi_az = bool(db_instance.get('MultiAZ'))
+        current_instance_class = db_instance.get('DBInstanceClass', '')
+        current_sg_ids = [group['VpcSecurityGroupId'] for group in db_instance.get('VpcSecurityGroups', [])]
+
+        needs_update = (
+            current_multi_az != desired_multi_az
+            or sg_id not in current_sg_ids
+            or current_instance_class != desired_instance_class
+        )
+        if needs_update:
+            print(
+                "🛠️ Atualizando configuracao do RDS existente: "
+                f"MultiAZ {current_multi_az} -> {desired_multi_az} | "
+                f"Classe {current_instance_class} -> {desired_instance_class}"
+            )
+            new_sg_ids = current_sg_ids or []
+            if sg_id not in new_sg_ids:
+                new_sg_ids.append(sg_id)
+
+            rds.modify_db_instance(
+                DBInstanceIdentifier=db_instance_id,
+                DBInstanceClass=desired_instance_class,
+                MultiAZ=desired_multi_az,
+                VpcSecurityGroupIds=new_sg_ids,
+                ApplyImmediately=True,
+            )
+            print("⏳ Aguardando modificacao do RDS ficar disponível...")
+            rds.get_waiter('db_instance_available').wait(DBInstanceIdentifier=db_instance_id)
+            desc = rds.describe_db_instances(DBInstanceIdentifier=db_instance_id)
+
+        endpoint = desc['DBInstances'][0]['Endpoint']['Address']
+        print(
+            f"✅ RDS pronto em: {endpoint} | MultiAZ={desc['DBInstances'][0].get('MultiAZ')}"
+        )
+        return endpoint
     except Exception as e:
         print(f"❌ Erro ao provisionar RDS: {e}")
         return None

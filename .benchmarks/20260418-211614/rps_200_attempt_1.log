@@ -1,0 +1,80 @@
+[cycle] Usando credenciais locais em /home/rique/Documents/fgv/5o/CN/trabalho-1-CN/.aws/credentials
+[cycle] Usando config local em /home/rique/Documents/fgv/5o/CN/trabalho-1-CN/.aws/config
+[cycle] Pre-setup ignorado (--skip-pre-setup ou SKIP_PRE_SETUP=1)
+[cycle] DB_PASSWORD nao definido; usando senha padrao gerada para o RDS
+[cycle] Deploy dados: garantindo bucket S3 antes do upload do grafo
+☁️ Verificando/Criando Bucket S3: dijkfood-assets-sp-698294527556...
+✅ Bucket dijkfood-assets-sp-698294527556 criado.
+[cycle] Dados: grafo ja existe no S3; pulando geracao/upload (use FORCE_GRAPH_REBUILD=1 para forcar)
+[cycle] Deploy
+[cycle] Deploy dados: garantindo bucket S3
+☁️ Verificando/Criando Bucket S3: dijkfood-assets-sp-698294527556...
+✅ Bucket dijkfood-assets-sp-698294527556 criado.
+[cycle] Deploy dados: garantindo tabela DynamoDB
+⚡ Criando Tabela DynamoDB: Couriers...
+ℹ️ Tabela DynamoDB já existe.
+[cycle] Deploy dados: garantindo SG e instancia RDS
+🐘 Provisionando instância RDS: dijkfood-postgres...
+ℹ️ Instância dijkfood-postgres já existe. Recuperando endpoint...
+✅ RDS pronto em: dijkfood-postgres.cp8ckas8s49z.us-east-1.rds.amazonaws.com | MultiAZ=False
+[cycle] Deploy dados: aplicacao de schema ignorada (SKIP_DB_SCHEMA_LOAD=1 ou SKIP_SCHEMA_LOAD=1)
+[cycle] Deploy location: criando servico de telemetria
+[cycle] Deploy API: criando servico FastAPI de dominio
+[cycle] ALB worker
+[cycle] DNS worker: alb-routing-worker-1621617168.us-east-1.elb.amazonaws.com
+[cycle] ALB API
+[cycle] DNS API: alb-dijkfood-api-1328251847.us-east-1.elb.amazonaws.com
+[cycle] ALB location
+[cycle] DNS location: alb-dijkfood-location-703641588.us-east-1.elb.amazonaws.com
+[cycle] Readiness dos servicos
+[cycle] ECS stable (Routing-Worker-Service)
+[cycle] ECS stable (DijkFood-Api-Service)
+[cycle] ECS stable (DijkFood-Location-Service)
+[cycle] ECS DijkFood-Api-Service: status=ACTIVE running=12/30 pending=17 deployments=2 primary=IN_PROGRESS (0/0, pend=0) elapsed=0s
+[cycle] ECS evento (DijkFood-Api-Service): (service DijkFood-Api-Service) has started 17 tasks: (task 00aa2097f9764166b234f9cd941cf14e) (task 119b3c0ca9b045fe8fe16cfe407b6463) (task 1e7214005a6d4bbd89b74544d2e77dd7) (task 4b02089bffd34881b79f8305a2591cd7) (task 4faaaf4ce2f742e0ac2dc796af8ad7b4) (task 539872778f1b4e9d88d65d625bd72449) (task 5c2cd716c02247029d0e12f4779bbc77) (task 69fc746261ba48c79d1549d011488aa3) (task 6ac0cdb083c046d48d1940a425fe3877) (task 778ab737a12645fa8039416536b857c5) (task 7a9e3842b2044a96b196e31be151daae) (task 9c3afaadf0274069af981532776b057f) (task b98d65ccce854645976713ccbb8e30be) (task c183048ebeb34242ae45678b0378e4a6) (task c7094a743fde47c984cc6608fa31d840) (task cdc9679b379d4cbda2fd79341d56a972) (task e83ebd9ab601412291baa0d8f667ae32).
+[cycle] ECS Routing-Worker-Service: status=ACTIVE running=31/80 pending=49 deployments=2 primary=IN_PROGRESS (0/1, pend=1) elapsed=0s
+[cycle] ECS evento (Routing-Worker-Service): (service Routing-Worker-Service) has started 1 tasks: (task bffd222cb3a54af2a50e92f7cf2c1395).
+[cycle] ECS DijkFood-Location-Service: status=ACTIVE running=24/60 pending=36 deployments=2 primary=IN_PROGRESS (0/0, pend=0) elapsed=0s
+[cycle] ECS evento (DijkFood-Location-Service): (service DijkFood-Location-Service) has started 36 tasks: (task 004e57a62fff43e88b7c1f3bf4827724) (task 066b828d49624060ace1298a60a10fe4) (task 19b086dd0cee4ccc8f043805f28539da) (task 1a0cec61705f4b50934b15c273fcb5bb) (task 1b4dfb398a1143b19cad9b0b3601aa01) (task 1ece675850ea4dd5891951f3b065d947) (task 249aa1548dad4d48b68c7fe78cb36eb5) (task 252dd33c05e54ea9a4d50781d21f8759) (task 28ce3232dd6d4f0f958f7b7970d22751) (task 3356c0c903e64b749e533c09f8995f3b) (task 358146be1e864e27bac663954a187f04) (task 3b0530eb1f9448d2b30330691d441b64) (task 4cb17c993b2a4e56807b6093c4a75ada) (task 5b3095031b5f404d9b62b28cc936cea4) (task 5f1962f8b0e84f3a95dba3f183dc3a1f) (task 6830cf7e637649caa1f95132022b58d7) (task 6e53634d076041a092f24506fa83eb46) (task 719e843e4b264c28b2695c6c392ea399) (task 73ed6b9e995b433aa17685cee001f31d) (task 7f58b1a511f94d83b45e97094ea4119d) (task 7fb4641cf8964b1086cd91446175719e) (task 8e3491a47ec34a3a9ae52d7820aa8907) (task 921a1adc15cd419fa4cdab14df605457) (task 9a22add25b5546eabede7fc1db4b4fb5) (task 9f8fb857b6fb4be1b48f450f48c48cb4) (task b25d1e16fe4c4df580160480a709f8c7) (task b5b4a64ed98f40bf95bf77ed2d173ac1) (task bcb0359334c84fcc9ebd5d09c7ef12b8) (task bf68a653e5384acab96af8c3c4422dc9) (task c4f593586b0748a1ab5c20972627eb23) (task c9935ae53fbd4df3a2831578f7e708c7) (task d16650c64c64432783c10e920103bbe0) (task d5cedcd499bd428f8e19410151240e48) (task e6545fd96e414a37bbd6cecfb6bb7b7e) (task ec4fdbc8480644939a5fb64fdc953953) (task f5fd71c2f8d149eb8dd11232a1b0829e).
+[cycle] ECS evento (DijkFood-Api-Service): (service DijkFood-Api-Service) was unable to place a task. The reason for failure is You’ve reached the limit on the number of vCPUs you can run concurrently. For more information, see the Troubleshooting section of the Amazon ECS Developer Guide.
+[cycle] ECS DijkFood-Location-Service: status=ACTIVE running=24/60 pending=36 deployments=2 primary=IN_PROGRESS (0/1, pend=0) elapsed=11s
+[cycle] ECS evento (DijkFood-Location-Service): (service DijkFood-Location-Service) was unable to place a task. The reason for failure is You’ve reached the limit on the number of vCPUs you can run concurrently. For more information, see the Troubleshooting section of the Amazon ECS Developer Guide.
+[cycle] ECS Routing-Worker-Service: status=ACTIVE running=55/80 pending=25 deployments=2 primary=IN_PROGRESS (0/1, pend=1) elapsed=11s
+[cycle] ECS evento (Routing-Worker-Service): (service Routing-Worker-Service) registered 35 targets in (target-group arn:aws:elasticloadbalancing:us-east-1:698294527556:targetgroup/tg-routing-worker/75c5326c63e1eb37)
+[cycle] Readiness aguardando (20s): DijkFood-Api-Service, DijkFood-Location-Service, Routing-Worker-Service
+[cycle] ECS Routing-Worker-Service: status=ACTIVE running=75/80 pending=6 deployments=2 primary=IN_PROGRESS (0/80, pend=2) elapsed=22s
+[cycle] ECS evento (Routing-Worker-Service): (service Routing-Worker-Service) has started 1 tasks: (task 00f684b137d04297a7818b11ffa87c65).
+[cycle] ECS DijkFood-Api-Service: status=ACTIVE running=12/30 pending=17 deployments=2 primary=IN_PROGRESS (0/1, pend=0) elapsed=22s
+[cycle] ECS DijkFood-Api-Service: status=ACTIVE running=17/30 pending=12 deployments=2 primary=IN_PROGRESS (0/1, pend=0) elapsed=32s
+[cycle] Readiness aguardando (42s): DijkFood-Api-Service, DijkFood-Location-Service
+[cycle] ECS DijkFood-Api-Service: status=ACTIVE running=28/30 pending=1 deployments=2 primary=IN_PROGRESS (0/1, pend=0) elapsed=43s
+[cycle] ECS DijkFood-Location-Service: status=ACTIVE running=45/60 pending=15 deployments=2 primary=IN_PROGRESS (0/1, pend=0) elapsed=43s
+[cycle] ECS DijkFood-Api-Service: status=ACTIVE running=15/30 pending=1 deployments=2 primary=IN_PROGRESS (0/30, pend=0) elapsed=54s
+[cycle] ECS evento (DijkFood-Api-Service): (service DijkFood-Api-Service) has stopped 13 running tasks: (task e83ebd9ab601412291baa0d8f667ae32) (task 6ac0cdb083c046d48d1940a425fe3877) (task 1e7214005a6d4bbd89b74544d2e77dd7) (task 119b3c0ca9b045fe8fe16cfe407b6463) (task c7094a743fde47c984cc6608fa31d840) (task c183048ebeb34242ae45678b0378e4a6) (task 00aa2097f9764166b234f9cd941cf14e) (task 539872778f1b4e9d88d65d625bd72449) (task b98d65ccce854645976713ccbb8e30be) (task cdc9679b379d4cbda2fd79341d56a972) (task 4faaaf4ce2f742e0ac2dc796af8ad7b4) (task 4b02089bffd34881b79f8305a2591cd7) (task 778ab737a12645fa8039416536b857c5).
+[cycle] ECS DijkFood-Location-Service: status=ACTIVE running=60/60 pending=0 deployments=2 primary=IN_PROGRESS (0/1, pend=0) elapsed=54s
+[cycle] Readiness aguardando (62s): DijkFood-Api-Service, DijkFood-Location-Service
+[cycle] Readiness aguardando (85s): DijkFood-Location-Service
+[cycle] Readiness aguardando (105s): DijkFood-Location-Service
+[cycle] ECS DijkFood-Location-Service: status=ACTIVE running=60/107 pending=0 deployments=2 primary=IN_PROGRESS (0/1, pend=0) elapsed=108s
+[cycle] ECS DijkFood-Location-Service: status=ACTIVE running=60/107 pending=2 deployments=2 primary=IN_PROGRESS (0/1, pend=0) elapsed=118s
+[cycle] Readiness aguardando (125s): DijkFood-Location-Service
+[cycle] ECS DijkFood-Location-Service: status=ACTIVE running=60/107 pending=4 deployments=2 primary=IN_PROGRESS (0/1, pend=0) elapsed=140s
+[cycle] Readiness aguardando (145s): DijkFood-Location-Service
+[cycle] ECS DijkFood-Location-Service: status=ACTIVE running=62/107 pending=2 deployments=2 primary=IN_PROGRESS (0/1, pend=0) elapsed=151s
+Traceback (most recent call last):
+  File "/home/rique/Documents/fgv/5o/CN/trabalho-1-CN/local/deploy.py", line 1105, in <module>
+    raise SystemExit(main())
+                     ~~~~^^
+  File "/home/rique/Documents/fgv/5o/CN/trabalho-1-CN/local/deploy.py", line 1001, in main
+    wait_services_ready(
+    ~~~~~~~~~~~~~~~~~~~^
+        [
+        ^
+    ...<3 lines>...
+        ]
+        ^
+    )
+    ^
+  File "/home/rique/Documents/fgv/5o/CN/trabalho-1-CN/local/deploy.py", line 684, in wait_services_ready
+    raise RuntimeError("Falha no readiness dos servicos: " + " | ".join(errors))
+RuntimeError: Falha no readiness dos servicos: Routing-Worker-Service: Servico ECS Routing-Worker-Service com rollout FAILED: ECS deployment circuit breaker: tasks failed to start. | DijkFood-Api-Service: Servico ECS DijkFood-Api-Service com rollout FAILED: ECS deployment circuit breaker: tasks failed to start. | DijkFood-Location-Service: Servico ECS DijkFood-Location-Service com rollout FAILED: ECS deployment circuit breaker: tasks failed to start.

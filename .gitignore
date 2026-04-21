@@ -5,6 +5,7 @@
 local/cache/
 cache/
 .aws/
+.idea/
 .docker-local/
 .docker-local-test/
 .env

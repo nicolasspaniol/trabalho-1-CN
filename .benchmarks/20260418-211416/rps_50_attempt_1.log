@@ -1,0 +1,33 @@
+[cycle] Usando credenciais locais em /home/rique/Documents/fgv/5o/CN/trabalho-1-CN/.aws/credentials
+[cycle] Usando config local em /home/rique/Documents/fgv/5o/CN/trabalho-1-CN/.aws/config
+[cycle] Pre-setup ignorado (--skip-pre-setup ou SKIP_PRE_SETUP=1)
+[cycle] DB_PASSWORD nao definido; usando senha padrao gerada para o RDS
+[cycle] Deploy dados: garantindo bucket S3 antes do upload do grafo
+☁️ Verificando/Criando Bucket S3: dijkfood-assets-sp-698294527556...
+✅ Bucket dijkfood-assets-sp-698294527556 criado.
+[cycle] Dados: grafo ja existe no S3; pulando geracao/upload (use FORCE_GRAPH_REBUILD=1 para forcar)
+[cycle] Deploy
+[cycle] Deploy dados: garantindo bucket S3
+☁️ Verificando/Criando Bucket S3: dijkfood-assets-sp-698294527556...
+✅ Bucket dijkfood-assets-sp-698294527556 criado.
+[cycle] Deploy dados: garantindo tabela DynamoDB
+⚡ Criando Tabela DynamoDB: Couriers...
+ℹ️ Tabela DynamoDB já existe.
+[cycle] Deploy dados: garantindo SG e instancia RDS
+🐘 Provisionando instância RDS: dijkfood-postgres...
+ℹ️ Instância dijkfood-postgres já existe. Recuperando endpoint...
+✅ RDS pronto em: dijkfood-postgres.cp8ckas8s49z.us-east-1.rds.amazonaws.com | MultiAZ=False
+[cycle] Deploy dados: aplicando schema em /home/rique/Documents/fgv/5o/CN/trabalho-1-CN/local/schema.sql
+🛠️ Conectando ao RDS para carregar o schema: /home/rique/Documents/fgv/5o/CN/trabalho-1-CN/local/schema.sql...
+❌ Erro ao carregar schema no RDS: connection to server at "dijkfood-postgres.cp8ckas8s49z.us-east-1.rds.amazonaws.com" (34.238.61.31), port 5432 failed: FATAL:  remaining connection slots are reserved for roles with privileges of the "rds_reserved" role
+
+Traceback (most recent call last):
+  File "/home/rique/Documents/fgv/5o/CN/trabalho-1-CN/local/deploy.py", line 1102, in <module>
+    raise SystemExit(main())
+                     ~~~~^^
+  File "/home/rique/Documents/fgv/5o/CN/trabalho-1-CN/local/deploy.py", line 977, in main
+    run_deployment(execution_role_arn, bucket_name)
+    ~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/rique/Documents/fgv/5o/CN/trabalho-1-CN/local/deploy.py", line 519, in run_deployment
+    raise RuntimeError("Falha ao carregar schema SQL no RDS")
+RuntimeError: Falha ao carregar schema SQL no RDS

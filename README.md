@@ -1,221 +1,233 @@
-# DijkFood - Trabalho A1 (Computacao em Nuvem)
+# DijkFood - Trabalho de Computacao em Nuvem
 
-Este repositorio implementa a plataforma DijkFood, um sistema de delivery com:
+Projeto de simulacao de um app de delivery com arquitetura em microservicos na AWS.
 
-- API REST para clientes, restaurantes, entregadores e pedidos.
-- Calculo de rotas no grafo viario de Sao Paulo.
-- Ciclo de vida completo do pedido.
-- Deploy automatizado na AWS com simulacao de carga.
+Objetivo principal do trabalho:
+- validar escalabilidade horizontal com ECS/Fargate
+- manter latencia P95 de leitura e escrita abaixo de 500ms em steady-state
+- demonstrar resiliencia e fluxo fim a fim de pedidos
 
-O foco do trabalho (conforme enunciado) e validar disponibilidade, escalabilidade horizontal e latencia P95 abaixo de 500 ms nos cenarios de carga.
-
-## Integrantes do Grupo
+## Integrantes
 - [Gabrielly Chacara](https://github.com/gabriellyepc)
 - [Henrique Coelho](https://github.com/riqueu)
 - [Henrique Gasparelo](https://github.com/HenryGasparelo)
 - [Nícolas Spaniol](https://github.com/nicolasspaniol)
 
-## Resumo rapido
+## Visao geral
 
-- Entrada principal: local/deploy.py
-- Servicos: worker, api, location
-- Infra principal: ECS/Fargate, ALB, RDS, DynamoDB, S3, CloudWatch
-- Simulacao de carga: local/load.py + local/sim_delivery.py
+Servicos:
+- `Routing-Worker-Service` (worker): escolhe courier e calcula rota no grafo
+- `DijkFood-Api-Service` (api): dominio (clientes, merchants, couriers, orders)
+- `DijkFood-Location-Service` (location): atualizacao de localizacao do courier
 
-## Arquitetura
+Dados:
+- RDS PostgreSQL: dados transacionais (`user`, `customer`, `merchant`, `courier`, `order`, `order_event`)
+- DynamoDB: dados de rota/localizacao em tempo real
+- S3: arquivo do grafo viario (`MAPAS_FILE`)
 
-### Componentes
-
-- worker:
-Responsavel por calcular rota e selecionar courier.
-
-- api:
-Servico de dominio (clientes, restaurantes, couriers, pedidos e transicoes de status).
-
-- location:
-Servico para atualizacao/consulta de localizacao de courier durante entrega.
-
-### Dados
-
-- RDS (PostgreSQL)
-Persistencia transacional do dominio: usuarios, restaurantes, couriers, pedidos e eventos.
-
-- DynamoDB
-Dados operacionais de rota e localizacao em tempo real.
-
-- S3
-Armazena o arquivo de grafo usado no calculo de rota.
-
-### Fluxo simplificado
-
-1. Cliente cria pedido na API.
-2. Restaurante aceita e marca pedido como pronto.
-3. API aciona busca assincrona de courier (worker).
-4. Courier executa eventos de entrega e atualiza localizacao.
-5. Cliente consulta estado e progresso do pedido.
+Infra:
+- ECS Fargate + ALB por servico
+- Autoscaling com CPU/Mem + alarmes manuais de ALB RequestCountPerTarget
+- CloudWatch logs/metricas
 
 ## Estrutura do repositorio
 
-- local/: scripts de deploy, setup, validacao e simulacao
-- services/api/: API de dominio (FastAPI)
-- services/worker/: servico de roteamento
-- services/location/: servico de localizacao
-- shared/: modelos compartilhados
+- `local/deploy.py`: orquestrador principal (deploy, simulacao, teardown)
+- `local/create_infra.py`: provisionamento ECS/ALB/autoscaling
+- `local/load.py`: carga inicial de customers/merchants/couriers
+- `local/sim_client.py`: gerador de carga de pedidos/leituras
+- `local/sim_delivery.py`: simulador dos couriers
+- `local/validate_endpoints.py`: preflight de contrato
+- `local/pre_deploy_setup.sh`: build/push das imagens no ECR
+- `local/delete.py`: teardown
+- `local/diagnose_autoscaling_alarms.py`: diagnostico de alarmes/policies
+- `services/api`, `services/worker`, `services/location`: codigo dos servicos
+- `local/schema.sql`: schema aplicado no RDS
 
 ## Pre-requisitos
 
-### 1) Ferramentas locais
-
-- Python 3.13+
-- uv
-- Docker (daemon ativo)
+- Python `>=3.13`
+- `uv`
+- Docker ativo
 - AWS CLI v2
+- Credenciais AWS validas com permissao para IAM, ECS, ECR, EC2/ELBv2, RDS, DynamoDB, S3 e CloudWatch
 
-### 2) Credenciais AWS (obrigatorio)
+Observacoes:
+- Regiao padrao: `us-east-1` (ver `local/constants.py`)
+- Role padrao: `LabRole` (override por `EXECUTION_ROLE_ARN` ou `EXECUTION_ROLE_NAME`)
+- Credenciais podem vir de `.aws/credentials` na raiz, `~/.aws`, ou variaveis `AWS_*`
 
-Voce precisa de credenciais validas com permissao para ECS, ECR, IAM (uso de role), ELBv2, EC2, RDS, DynamoDB, S3 e CloudWatch.
+## Execucao rapida
 
-Formas aceitas no projeto:
-
-- Variaveis de ambiente AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN
-- Arquivos locais .aws/credentials e .aws/config na raiz do repo
-- Configuracao padrao do usuario em ~/.aws
-
-Observacao importante para AWS Academy:
-
-- Use credenciais temporarias com session token.
-- Se expirar, o deploy falha logo no pre-setup.
-
-### 3) Role de execucao
-
-Por padrao o deploy usa a role LabRole.
-Se necessario, ajuste por variavel de ambiente EXECUTION_ROLE_NAME.
-
-## Execucao
-
-### Fluxo recomendado (com simulacao)
+Fluxo completo com simulacao:
 
 ```bash
 uv run --project local local/deploy.py --with-simulation
 ```
 
-Esse comando faz:
-
-1. Pre-setup (ECR login/build/push).
-2. Provisionamento/atualizacao da infraestrutura.
-3. Readiness checks dos 3 servicos.
-4. Preflight de endpoints.
-5. Populacao da base e simulacao de carga.
-6. Smoke tests finais.
-7. Teardown (delete) dos serviços AWS.
-
-### Outros modos uteis
+Fluxo completo sem teardown:
 
 ```bash
-# Deploy + testes sem simulacao + sem teardown
-uv run --project local local/deploy.py --no-delete
+uv run --project local local/deploy.py --with-simulation --no-delete
+```
 
-# Executa apenas teardown
+Apenas teardown:
+
+```bash
 uv run --project local local/deploy.py --only-delete
-
-# Simulacao com cenarios customizados
-uv run --project local local/deploy.py \
-	--with-simulation \
-	--rps-scenarios 10,50,200 \
-	--duration 30 \
-	--cooldown-seconds 5 \
-	--no-delete
 ```
 
-### Parametros frequentes
-
-- --with-simulation: liga validacao + simulador
-- --no-delete: mantem recursos ativos ao final
-- --only-delete: remove recursos
-- --api-username e --api-password: credenciais Basic Auth da API
-- --graph-file e --graph-location: arquivo/regiao do grafo
-- --simulation-api-url: URL alternativa da API para simulacao
-
-### Escopo geografico da simulacao (bairro vs cidade inteira)
-
-Durante os testes iniciais, o projeto usou um grafo menor (Alto de Pinheiros) para reduzir tempo de build e custo.
-Voce pode rodar com Sao Paulo inteira via --graph-location.
-
-Exemplo com bairro (mais rapido e barato):
+Simulacao apenas (infra ja ativa):
 
 ```bash
 uv run --project local local/deploy.py \
-	--with-simulation \
-	--graph-location "Alto de Pinheiros, Sao Paulo, Brazil" \
-	--graph-file sp_altodepinheiros.pkl \
-	--no-delete
+  --simulation-only \
+  --with-simulation \
+  --num-users 1000 \
+  --rps 50 \
+  --sim-duration 300
 ```
 
-Exemplo com cidade inteira (enunciado):
+## Fluxo real do `deploy.py`
+
+Quando roda com deploy:
+1. pre-setup opcional (`local/pre_deploy_setup.sh`) para build/push no ECR
+2. cria/atualiza S3, DynamoDB, RDS e schema SQL
+3. cria/atualiza worker, location e api no ECS/ALB
+4. espera DNS + health dos target groups
+5. (opcional) simulacao de carga
+6. testes finais de health/contrato
+7. teardown, exceto com `--no-delete`
+
+Quando roda com `--simulation-only`:
+1. resolve ALBs existentes
+2. reaplica policies/alarms de autoscaling (por padrao)
+3. executa clean start (min/desired baseline + estabilidade)
+4. roda simulacao e coleta resultados
+
+## Flags principais de CLI
+
+`local/deploy.py`:
+- `--with-simulation`
+- `--simulation-only`
+- `--no-delete`
+- `--only-delete`
+- `--skip-pre-setup`
+- `--num-users`
+- `--rps`
+- `--sim-duration`
+- `--api-username`, `--api-password`
+- `--simulation-api-url`
+- `--graph-file`, `--graph-location`
+- `--with-autoscaling-demo`, `--autoscaling-wait-seconds`
+- `--with-fault-demo`
+
+## Simulacao e metricas
+
+Durante `--with-simulation` o fluxo e:
+1. `load.py` popula base (customers/couriers/merchants)
+2. `sim_delivery.py` roda em background
+3. `sim_client.py` executa carga de pedidos/leitura
+4. `simulation_reporter` escreve CSV periodico em `simulation_results/`
+
+Caracteristicas atuais do `sim_client.py`:
+- timeouts curtos por task de escrita (`SIM_WRITE_TASK_TIMEOUT`)
+- controle de concorrencia (`SIM_MAX_IN_FLIGHT_WRITES`, `SIM_MAX_IN_FLIGHT_READS`)
+- ramp-up progressivo de RPS (`SIM_RAMP_STEP_RPS`, `SIM_RAMP_STEP_SECONDS`, `SIM_RAMP_MAX_SECONDS`)
+- steady-state configuravel (`SIM_STEADY_START_SECONDS`)
+- metricas exportadas em JSON (`SIM_METRICS_PATH`) e agregadas no CSV
+
+## Variaveis de ambiente mais uteis
+
+Infra/deploy:
+- `EXECUTION_ROLE_ARN`, `EXECUTION_ROLE_NAME`
+- `BUCKET_NAME`, `DB_PASSWORD`, `DB_INSTANCE_ID`, `DB_SCHEMA_FILE`
+- `FORCE_GRAPH_REBUILD=1`
+- `DB_SKIP_SCHEMA_LOAD=1`
+- `DEPLOY_SERIAL_ROLLOUT=1`
+
+Autoscaling:
+- `*_AUTOSCALING_MIN_CAPACITY`, `*_AUTOSCALING_MAX_CAPACITY`
+- `*_REQUEST_TARGET`
+- `*_SCALE_OUT_COOLDOWN`, `*_SCALE_IN_COOLDOWN`
+- `*_REQUEST_SCALE_OUT_STEP`, `*_REQUEST_SCALE_IN_STEP`
+- `*_REQUEST_SCALE_OUT_MULTIPLIER`, `*_REQUEST_SCALE_IN_MULTIPLIER`
+- `SIM_REAPPLY_AUTOSCALING_POLICIES=0|1`
+
+Health check ALB/ECS:
+- `ALB_HEALTHCHECK_PATH`
+- `ALB_HEALTHCHECK_INTERVAL_SECONDS`
+- `ALB_HEALTHCHECK_TIMEOUT_SECONDS`
+- `ALB_HEALTHCHECK_HEALTHY_THRESHOLD`
+- `ALB_HEALTHCHECK_UNHEALTHY_THRESHOLD`
+- `ALB_DEREGISTRATION_DELAY_SECONDS`
+- `WORKER_HEALTHCHECK_GRACE_SECONDS`
+- `API_HEALTHCHECK_GRACE_SECONDS`
+- `LOCATION_HEALTHCHECK_GRACE_SECONDS`
+
+Simulacao:
+- `SIM_MIN_DURATION_SECONDS`
+- `SIM_WARMUP_SECONDS`
+- `SIM_STEADY_START_SECONDS`
+- `SIM_RAMP_STEP_RPS`, `SIM_RAMP_STEP_SECONDS`, `SIM_RAMP_MAX_SECONDS`
+- `SIM_MAX_IN_FLIGHT_WRITES`, `SIM_MAX_IN_FLIGHT_READS`
+- `SIM_HTTP_CONN_LIMIT`, `SIM_HTTP_CONN_LIMIT_PER_HOST`
+- `SIM_WRITE_TASK_TIMEOUT`
+- `SIM_CLEAN_START_TIMEOUT_SECONDS`
+- `SIM_SKIP_PREFLIGHT_ON_FAILURE=1`
+
+## Contrato de API esperado pela simulacao
+
+Carga inicial:
+- `GET/POST /customers`
+- `GET/POST /merchants`
+- `GET/POST /couriers`
+- `POST /orders`
+- `GET /orders/{order_id}`
+
+Fluxo de entrega:
+- `GET /couriers/me/order`
+- `POST /orders/{order_id}/accept`
+- `POST /orders/{order_id}/ready`
+- `POST /orders/{order_id}/picked_up`
+- `POST /orders/{order_id}/in_transit`
+- `PUT /couriers/me/location`
+- opcional: `POST /orders/{order_id}/delivered`
+
+## Diagnostico rapido
+
+Estado de autoscaling:
 
 ```bash
-uv run --project local local/deploy.py \
-	--with-simulation \
-	--graph-location "Sao Paulo, Sao Paulo, Brazil" \
-	--graph-file sp_cidade.pkl \
-	--no-delete
+uv run --project local local/autoscaling_demo.py --show-only
 ```
 
-Aviso:
+Diagnostico de alarmes/policies gerados:
 
-- O grafo da cidade inteira pode aumentar bastante tempo de extração/upload e custo de execução.
+```bash
+uv run --project local local/diagnose_autoscaling_alarms.py \
+  --region us-east-1 \
+  --cluster DijkFood-Cluster \
+  --services Routing-Worker-Service,DijkFood-Api-Service,DijkFood-Location-Service \
+  --with-metric-points
+```
 
-## API na interface web
+## Troubleshooting
 
-Quando o deploy finalizar, abra o DNS do ALB da API:
+- `Credenciais AWS invalidas/expiradas`: renove token e valide com `aws sts get-caller-identity`
+- `Falha no pre-setup`: confirme Docker ativo e permissao de push no ECR
+- `Readiness nao converge`: veja eventos ECS e health do target group no ELB
+- `Simulacao sem contrato`: use `--simulation-api-url` apontando para a API de dominio correta
+- `Latencia alta no inicio`: esperado enquanto ECS escala; use janela de steady-state
 
-- Swagger UI: /docs
-- ReDoc: /redoc
-- OpenAPI: /openapi.json
-
-Exemplo real de endpoint:
-
-- http://alb-dijkfood-api-896780006.us-east-1.elb.amazonaws.com/docs
-
-## Observacoes de comportamento
-
-- O endpoint /couriers/me/order existe e e usado no preflight.
-- O aviso de preflight sobre courier sem pedido ativo pode acontecer por assincronia na atribuicao do courier.
-- Esse aviso, isoladamente, nao significa endpoint removido.
-
-## Execucao local com Docker Compose (ambiente de desenvolvimento)
-
-Opcionalmente, voce pode subir componentes locais para desenvolvimento:
+## Execucao local com Docker Compose (dev)
 
 ```bash
 docker compose up --build
 ```
 
-Servicos expostos localmente:
+Endpoints locais:
+- API: `http://localhost:8000/docs`
+- Location: `http://localhost:8050/docs`
+- DynamoDB local: `http://localhost:8020`
 
-- API: http://localhost:8000/docs
-- Location: http://localhost:8050/docs
-- DynamoDB local: http://localhost:8020
-
-## Criterios de validacao do trabalho
-
-Os scripts de simulacao ajudam a demonstrar os pontos do enunciado:
-
-- throughput alvo por cenario
-- latencia P95 de leitura/escrita
-- isolamento de degradacao entre componentes
-- ciclo de entrega com transicoes de status validas
-
-## Troubleshooting rapido
-
-- Erro de credencial AWS
-Verifique token expirado, perfil e permissao de acesso.
-
-- Falha no build/push
-Confirme Docker ativo e permissao para ECR.
-
-- Erro de readiness no ALB
-Verifique logs no CloudWatch e health checks dos target groups.
-
-- Falha em transicao de status
-Confirme sequencia valida: CONFIRMED -> PREPARING -> READY_FOR_PICKUP -> PICKED_UP -> IN_TRANSIT -> DELIVERED.
