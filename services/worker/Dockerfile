@@ -28,6 +28,9 @@ ENV PATH="/app/.venv/bin:$PATH"
 COPY services/worker/app ./app
 COPY shared/shared ./shared
 
+# Copia o grafo para dentro da imagem
+COPY ../../sp_cidade.pkl /app/sp_cidade.pkl
+
 # Define o PYTHONPATH para que os módulos em 'shared' sejam encontrados
 ENV PYTHONPATH="/app"
 EXPOSE 80

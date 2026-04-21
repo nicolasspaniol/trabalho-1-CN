@@ -1,4 +1,3 @@
-import boto3
 import os
 import pickle
 import heapq
@@ -8,6 +7,39 @@ from contextlib import asynccontextmanager
 from psycopg2 import pool
 from fastapi import FastAPI, HTTPException
 from shared.route_models import RouteRequest, RouteResponse
+from datetime import datetime
+
+GRAPH = None
+GRAPH_LOAD_ERROR = None
+DB_POOL = None
+DB_POOL_ERROR = None
+REQUIRED_TABLES = (
+    'courier',
+)
+
+
+def try_load_graph_local() -> bool:
+    global GRAPH, GRAPH_LOAD_ERROR
+    graph_path = "/app/sp_cidade.pkl"
+    try:
+        with open(graph_path, 'rb') as f:
+            GRAPH = pickle.load(f)
+        GRAPH_LOAD_ERROR = None
+        return True
+    except Exception as error:
+        GRAPH = None
+        GRAPH_LOAD_ERROR = str(error)
+        return False
+import os
+import pickle
+import heapq
+import time
+import asyncio
+from contextlib import asynccontextmanager
+from psycopg2 import pool
+from fastapi import FastAPI, HTTPException
+from shared.route_models import RouteRequest, RouteResponse
+from datetime import datetime
 
 GRAPH = None
 GRAPH_LOAD_ERROR = None
@@ -161,11 +193,18 @@ def check_db_health() -> tuple[bool, str | None, list[str]]:
     finally:
         DB_POOL.putconn(conn)
 
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     '''Carrega o grafo da cidade de São Paulo na memória RAM.'''
-    try_load_graph_from_s3()
-
+    start_time = datetime.utcnow()
+    print(f"[STARTUP] Início do worker: {start_time.isoformat()}Z")
+    graph_start = datetime.utcnow()
+    print(f"[STARTUP] Iniciando carregamento do grafo local: {graph_start.isoformat()}Z")
+    try_load_graph_local()
+    graph_end = datetime.utcnow()
+    print(f"[STARTUP] Grafo carregado: {graph_end.isoformat()}Z (duração: {(graph_end - graph_start).total_seconds():.2f}s)")
+    print(f"[STARTUP] Worker pronto para uso: {graph_end.isoformat()}Z (tempo total desde início: {(graph_end - start_time).total_seconds():.2f}s)")
     yield
 
 
@@ -275,7 +314,7 @@ def find_route_with_available_couriers(origin: int, user: int, available_courier
 @app.post("/calculate-route", response_model=RouteResponse)
 async def calculate_route(request: RouteRequest):
     if GRAPH is None:
-        try_load_graph_from_s3()
+        try_load_graph_local()
     if GRAPH is None:
         raise HTTPException(status_code=503, detail="Grafo não disponível: " + (GRAPH_LOAD_ERROR or "Erro desconhecido"))
 
@@ -327,7 +366,7 @@ async def calculate_route(request: RouteRequest):
 @app.get("/health")
 async def health():
     if GRAPH is None:
-        try_load_graph_from_s3()
+        try_load_graph_local()
     db_connected, db_error, missing_tables = check_db_health()
     graph_loaded = GRAPH is not None
 
