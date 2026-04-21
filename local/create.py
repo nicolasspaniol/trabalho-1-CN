@@ -84,7 +84,7 @@ if __name__ == "__main__":
 # dynamodb para os entregadores
 def setup_dynamo(table_name):
     dynamo = session.client('dynamodb')
-    print(f"⚡ Criando Tabela DynamoDB: {table_name}...")
+    print(f"Criando Tabela DynamoDB: {table_name}...")
     try:
         dynamo.create_table(
             TableName=table_name,
@@ -99,9 +99,9 @@ def setup_dynamo(table_name):
             BillingMode="PAY_PER_REQUEST"
         )
         dynamo.get_waiter('table_exists').wait(TableName=table_name)
-        print("✅ DynamoDB Ativo!")
+        print("DynamoDB Ativo!")
     except dynamo.exceptions.ResourceInUseException:
-        print("ℹ️ Tabela DynamoDB já existe.")
+        print("Tabela DynamoDB já existe.")
 
 # RDS
 def setup_rds(db_instance_id, sg_id):
@@ -114,7 +114,7 @@ def setup_rds(db_instance_id, sg_id):
     desired_multi_az = should_use_multi_az()
     desired_instance_class = resolve_db_instance_class()
     
-    print(f"🐘 Provisionando instância RDS: {db_instance_id}...")
+    print(f"Provisionando instância RDS: {db_instance_id}...")
     try:
         rds.create_db_instance(
             DBInstanceIdentifier=db_instance_id,
@@ -127,18 +127,18 @@ def setup_rds(db_instance_id, sg_id):
             PubliclyAccessible=True,
             MultiAZ=desired_multi_az,
         )
-        print("⏳ Aguardando RDS ficar disponível (aprox. 10 min)...")
+        print("Aguardando RDS ficar disponível (aprox. 10 min)...")
         # O programa "trava" aqui propositalmente até o banco ligar
         rds.get_waiter('db_instance_available').wait(DBInstanceIdentifier=db_instance_id)
         
         # Busca o endereço DNS gerado pela AWS
         desc = rds.describe_db_instances(DBInstanceIdentifier=db_instance_id)
         endpoint = desc['DBInstances'][0]['Endpoint']['Address']
-        print(f"✅ RDS está online em: {endpoint}")
+        print(f"RDS está online em: {endpoint}")
         return endpoint
 
     except rds.exceptions.DBInstanceAlreadyExistsFault:
-        print(f"ℹ️ Instância {db_instance_id} já existe. Recuperando endpoint...")
+        print(f"Instância {db_instance_id} já existe. Recuperando endpoint...")
         desc = rds.describe_db_instances(DBInstanceIdentifier=db_instance_id)
         db_instance = desc['DBInstances'][0]
         current_multi_az = bool(db_instance.get('MultiAZ'))
@@ -152,7 +152,7 @@ def setup_rds(db_instance_id, sg_id):
         )
         if needs_update:
             print(
-                "🛠️ Atualizando configuracao do RDS existente: "
+                "Atualizando configuracao do RDS existente: "
                 f"MultiAZ {current_multi_az} -> {desired_multi_az} | "
                 f"Classe {current_instance_class} -> {desired_instance_class}"
             )
@@ -167,17 +167,17 @@ def setup_rds(db_instance_id, sg_id):
                 VpcSecurityGroupIds=new_sg_ids,
                 ApplyImmediately=True,
             )
-            print("⏳ Aguardando modificacao do RDS ficar disponível...")
+            print("Aguardando modificacao do RDS ficar disponível...")
             rds.get_waiter('db_instance_available').wait(DBInstanceIdentifier=db_instance_id)
             desc = rds.describe_db_instances(DBInstanceIdentifier=db_instance_id)
 
         endpoint = desc['DBInstances'][0]['Endpoint']['Address']
         print(
-            f"✅ RDS pronto em: {endpoint} | MultiAZ={desc['DBInstances'][0].get('MultiAZ')}"
+            f"RDS pronto em: {endpoint} | MultiAZ={desc['DBInstances'][0].get('MultiAZ')}"
         )
         return endpoint
     except Exception as e:
-        print(f"❌ Erro ao provisionar RDS: {e}")
+        print(f"Erro ao provisionar RDS: {e}")
         return None
 
 # SQL
@@ -187,7 +187,7 @@ def load_schema_to_rds(db_endpoint, sql_file_path):
     """
     db_password = require_db_password()
     reset_schema = os.getenv("DB_RESET_SCHEMA", "1").strip().lower() not in {"0", "false", "no"}
-    print(f"🛠️ Conectando ao RDS para carregar o schema: {sql_file_path}...")
+    print(f"Conectando ao RDS para carregar o schema: {sql_file_path}...")
     
     try:
         # Conexão com o banco padrão 'postgres'
@@ -200,24 +200,24 @@ def load_schema_to_rds(db_endpoint, sql_file_path):
         cur = conn.cursor()
 
         if reset_schema:
-            print("🧹 Limpando schema public para evitar colunas/tabelas legadas...")
+            print("Limpando schema public para evitar colunas/tabelas legadas...")
             cur.execute("DROP SCHEMA IF EXISTS public CASCADE;")
             cur.execute("CREATE SCHEMA public;")
             cur.execute("GRANT ALL ON SCHEMA public TO postgres;")
             cur.execute("GRANT ALL ON SCHEMA public TO public;")
         
-        print(f"📖 Lendo arquivo SQL...")
+        print(f"Lendo arquivo SQL...")
         with open(sql_file_path, 'r') as f:
             schema_sql = f.read()
             
-        print("🚀 Executando comandos SQL no banco...")
+        print("Executando comandos SQL no banco...")
         cur.execute(schema_sql)
         
         conn.commit()
         cur.close()
         conn.close()
-        print("✅ Tabelas e índices criados com sucesso!")
+        print("Tabelas e índices criados com sucesso!")
         return True
     except Exception as e:
-        print(f"❌ Erro ao carregar schema no RDS: {e}")
+        print(f"Erro ao carregar schema no RDS: {e}")
         return False
