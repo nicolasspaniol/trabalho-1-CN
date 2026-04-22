@@ -7,9 +7,9 @@ set -euo pipefail
 
 # Credenciais podem ser fornecidas via:
 # 1. Variáveis de ambiente: AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN
-# 2. Arquivos ./.aws/credentials e ./.aws/config (na raiz do projeto)
-# 3. Arquivos ~/.aws/credentials e ~/.aws/config
-# 4. Executar: aws configure
+# 2. Arquivos ~/.aws/credentials e ~/.aws/config
+# 3. Executar: aws configure
+# 4. (Opcional) Arquivos ./.aws/credentials e ./.aws/config com USE_PROJECT_AWS_FILES=true
 # Para AWS Academy, use session token (disponível em Learn.aws)
 
 # Preencha os campos abaixo antes de executar.
@@ -23,6 +23,7 @@ EXECUTION_ROLE_ARN="${EXECUTION_ROLE_ARN:-}"
 ECR_AUTO_CREATE_REPO="${ECR_AUTO_CREATE_REPO:-false}"
 DEPLOY_TARGETS="${DEPLOY_TARGETS:-worker,api,location}"
 NO_CACHE_TARGETS="${NO_CACHE_TARGETS:-}"
+USE_PROJECT_AWS_FILES="${USE_PROJECT_AWS_FILES:-false}"
 
 WORKDIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BUILDER_NAME="xbuilder"
@@ -46,6 +47,30 @@ run_aws() {
     AWS_PAGER="" aws --profile "$AWS_PROFILE" "$@"
   else
     AWS_PAGER="" aws "$@"
+  fi
+}
+
+configure_aws_credentials_source() {
+  local project_creds_file="$WORKDIR/.aws/credentials"
+  local project_config_file="$WORKDIR/.aws/config"
+
+  if [[ "$USE_PROJECT_AWS_FILES" == "true" ]]; then
+    if [[ -f "$project_creds_file" ]]; then
+      export AWS_SHARED_CREDENTIALS_FILE="$project_creds_file"
+      log "Usando credenciais locais em $AWS_SHARED_CREDENTIALS_FILE"
+    fi
+
+    if [[ -f "$project_config_file" ]]; then
+      export AWS_CONFIG_FILE="$project_config_file"
+      log "Usando config local em $AWS_CONFIG_FILE"
+    fi
+
+    if [[ ! -f "$project_creds_file" && ! -f "$project_config_file" ]]; then
+      log "USE_PROJECT_AWS_FILES=true, mas ./.aws nao foi encontrado. Mantendo resolucao padrao (~/.aws e AWS_*)."
+    fi
+  else
+    log "Usando resolucao padrao de credenciais AWS (AWS_* e ~/.aws)."
+    log "Para usar ./.aws, exporte USE_PROJECT_AWS_FILES=true antes de executar."
   fi
 }
 
@@ -171,15 +196,7 @@ cd "$WORKDIR"
 
 ensure_docker_daemon
 
-if [[ -f "$WORKDIR/.aws/credentials" ]]; then
-  export AWS_SHARED_CREDENTIALS_FILE="$WORKDIR/.aws/credentials"
-  log "Usando credenciais locais em $AWS_SHARED_CREDENTIALS_FILE"
-fi
-
-if [[ -f "$WORKDIR/.aws/config" ]]; then
-  export AWS_CONFIG_FILE="$WORKDIR/.aws/config"
-  log "Usando config local em $AWS_CONFIG_FILE"
-fi
+configure_aws_credentials_source
 
 log "Validando credenciais AWS"
 if ! run_aws sts get-caller-identity >/dev/null 2>&1; then

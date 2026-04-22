@@ -55,7 +55,8 @@ Infra:
 Observacoes:
 - Regiao padrao: `us-east-1` (ver `local/constants.py`)
 - Role padrao: `LabRole` (override por `EXECUTION_ROLE_ARN` ou `EXECUTION_ROLE_NAME`)
-- Credenciais podem vir de `.aws/credentials` na raiz, `~/.aws`, ou variaveis `AWS_*`
+- Credenciais devem ficar fora do repositorio; por padrao o fluxo usa `~/.aws` e/ou variaveis `AWS_*`
+- Uso de `./.aws` local e opcional no fluxo local com `USE_PROJECT_AWS_FILES=true`
 
 ## Execucao rapida
 

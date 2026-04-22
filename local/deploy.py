@@ -462,6 +462,12 @@ def append_results_csv_row(
 def configure_aws_files() -> None:
     credentials_file = PROJECT_ROOT / ".aws" / "credentials"
     config_file = PROJECT_ROOT / ".aws" / "config"
+    use_project_aws_files = env_flag("USE_PROJECT_AWS_FILES", default=False)
+
+    if not use_project_aws_files:
+        log("Usando resolucao padrao de credenciais AWS (AWS_* e ~/.aws).")
+        log("Para usar ./.aws, exporte USE_PROJECT_AWS_FILES=true antes de executar.")
+        return
 
     if credentials_file.exists():
         os.environ["AWS_SHARED_CREDENTIALS_FILE"] = str(credentials_file)
@@ -470,6 +476,9 @@ def configure_aws_files() -> None:
     if config_file.exists():
         os.environ["AWS_CONFIG_FILE"] = str(config_file)
         log(f"Usando config local em {config_file}")
+
+    if not credentials_file.exists() and not config_file.exists():
+        log("USE_PROJECT_AWS_FILES=true, mas ./.aws nao foi encontrado. Mantendo resolucao padrao (~/.aws e AWS_*).")
 
 
 def resolve_account_id() -> str:
